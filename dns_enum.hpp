@@ -1,45 +1,5 @@
 #pragma once
-//
-// dns_enum.hpp — Project Shiva DNS enumeration subsystem (--dns-enum)
-//
-// Combines:
-//   ACTIVE  : direct queries against authoritative/recursive resolvers —
-//             full record-type sweep (now fired as one concurrent wave via
-//             a shared async query engine instead of N serial round trips),
-//             zone transfer (AXFR) attempts, wildcard-aware subdomain brute
-//             force with wordlist mutation, DNSSEC presence + NSEC zone
-//             walking, email-security record collection (SPF/DKIM/DMARC/
-//             BIMI/MTA-STS/TLS-RPT), SRV/TLSA discovery, CNAME-chain
-//             subdomain-takeover fingerprinting, and reverse PTR sweep
-//             (single-host + optional whole-prefix).
-//   PASSIVE : no packets sent to the target's nameservers at all — pulls
-//             from third-party datasets (crt.sh + certspotter CT logs,
-//             Wayback Machine CDX index, RDAP for WHOIS, Team Cymru bulk
-//             whois for ASN + RIPEstat network-info/as-overview as a
-//             secondary ASN source that fills gaps Cymru leaves and
-//             enriches AS holder names, bgpview.io for sibling prefixes,
-//             hackertarget/rapiddns/AlienVault OTX passive-DNS aggregators,
-//             urlscan.io, and Google Custom Search JSON API dorking) to
-//             widen the subdomain/infra picture beyond what active probing
-//             can safely or legally reach.
-//
-//             Dorking is now a first-class *subdomain discovery* source,
-//             not just a leak-hunting pass: dedicated "site:*.{domain}"
-//             style queries are included in the template set, and every
-//             hit's URL (and, as a fallback, its title/snippet text) is
-//             parsed for in-scope hostnames and merged into the same
-//             `hosts` map as crt.sh/AXFR/brute-force results, tagged
-//             DiscoverySource::PassiveDork. When `prefer_dork_for_subdomains`
-//             is set (and Google API credentials are configured), the
-//             active wordlist brute-force + mutation passes are skipped
-//             entirely in favor of this passive, non-intrusive path.
-//
-// Reuses shiv's existing primitives: raw UDP/TCP sockets + io_uring-style
-// batching, libcurl + nlohmann::json (already linked in scan.cpp) for
-// passive HTTP(S) lookups, and the g_dns_servers / g_dns_tls_servers
-// globals from handler.hpp so --dns-servers / --dns-servers-tls
-// transparently apply to --dns-enum as well.
-//
+
 #include <string>
 #include <vector>
 #include <unordered_map>

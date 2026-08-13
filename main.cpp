@@ -37,6 +37,7 @@
 #include <openssl/x509.h>
 #include "handler.hpp"
 #include "dns_enum.hpp"
+#include <sys/utsname.h>
 
 
 namespace color {
@@ -51,6 +52,34 @@ namespace color {
     const std::string cyan    = "\033[36m";    
     const std::string bright_cyan = "\033[96m";
     
+}
+
+static std::string shiv_get_os_pretty_name() {
+    std::ifstream f("/etc/os-release");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("PRETTY_NAME=", 0) == 0) {
+            std::string val = line.substr(12);
+            if (!val.empty() && val.front() == '"') val.erase(0, 1);
+            if (!val.empty() && val.back() == '"') val.pop_back();
+            return val;
+        }
+    }
+    return "Unknown";
+}
+
+static std::string shiv_get_kernel_release() {
+    struct utsname uts{};
+    if (uname(&uts) == 0) return std::string(uts.release);
+    return "Unknown";
+}
+
+static bool shiv_kernel_supports_io_uring(const std::string& release) {
+    int major = 0, minor = 0;
+    if (sscanf(release.c_str(), "%d.%d", &major, &minor) != 2) return false;
+    if (major > 5) return true;
+    if (major == 5 && minor >= 1) return true;
+    return false;
 }
 
 static std::string shiv_enum_timestamp() {
@@ -1971,25 +2000,29 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (ips.empty()) {
-        std::cerr << color::bold;
-        print_typewriter(std::cerr, kMantra);
-        std::cerr << color::reset << "\n";
+        std::string os_name         = shiv_get_os_pretty_name();
+        std::string kernel_release  = shiv_get_kernel_release();
+        bool io_uring_supported     = shiv_kernel_supports_io_uring(kernel_release);
 
-        std::cerr                                    
-            << color::yellow << "Damn!!:" << color::reset
-            << " no target specified\n\n"
-            << color::yellow << "Usage:" << color::reset << "\n"
-            << "  " << color::green
-            << "shiv <target> -p <ports> [options]"
-            << color::reset << "\n\n"
-            << color::yellow << "Examples:" << color::reset << "\n"
-            << "  " << color::green
-            << "shiv 192.168.1.1 -p 22,80,443"
+        std::cerr
+            << "\nOS             : " << color::green << os_name << color::reset << "\n"
+            << "Kernel           : " << color::green << kernel_release << color::reset << "\n"
+            << "IO_URING         : "
+            << (io_uring_supported ? color::green : color::red)
+            << (io_uring_supported ? "yes (Supported)" : "no (Not Supported)")
             << color::reset << "\n"
-            << "  " << color::green
-            << "shiv example.com -p 1-1000 -sS"
-            << color::reset << "\n\n"
-            << color::yellow << "Help:" << color::reset << "\n"
+            << "Async I/O        : " << color::green << "IO_URING" << color::reset << "\n"
+            << "Queue            : " << color::green << "moodycamel::ConcurrentQueue" << color::reset << "\n"
+            << "SIMD             : " << color::green << "SSE2/AVX (intrinsics)" << color::reset << "\n"
+            << "Memory           : " << color::green << "RAII" << color::reset << "\n"
+            << "LinkLayer        : " << color::green << "yes" << color::reset << "\n"
+            << "Sockets          : " << color::green << "Raw" << color::reset << "\n"
+            << "IP-Stack         : " << color::green << "Dual" << color::reset << "\n"
+            << "Isolation        : " << color::green << "Namespaces (CLONE_NEWNET)" << color::reset << "\n"
+            << "Signals          : " << color::green << "SIGINT" << color::reset << "\n"
+            << "Incident         : " << color::green << "checkpoints" << color::reset << "\n"
+            << "VersionDetection : " << color::green << "Dual staged" << color::reset << "\n\n"
+            << "Help:\n"
             << "  Run "
             << color::green << "shiv --help" << color::reset
             << " for more information and unleash the power.\n";
