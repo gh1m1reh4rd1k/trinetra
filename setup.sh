@@ -93,7 +93,8 @@ install_dependencies() {
                 libcurl4-openssl-dev \
                 nlohmann-json3-dev \
                 libpugixml-dev \
-                pkg-config
+                pkg-config \
+                libpcre2-dev
             ;;
         arch)
             # Sync package databases
