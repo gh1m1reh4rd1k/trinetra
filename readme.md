@@ -1,4 +1,4 @@
-# Project-shiva
+# Trinetra
 
 
 <img src="https://github.com/gh1m1reh4rd1k/trinetra/blob/main/images/io_uring.jpeg" />
