@@ -91,7 +91,8 @@ constexpr size_t MAX_EXPANDED_IPS_PER_CIDR = 1000000;
 constexpr size_t MAX_TOTAL_IPS             = 50000000;    
 constexpr size_t MAX_INPUT_TOKEN_LEN       = 2048;
 constexpr size_t TARGETS_PER_QUEUE = 1000;
-
+constexpr size_t MAX_IL_FILE_LINES         = 2000000;
+constexpr size_t MAX_IL_FILE_BYTES         = 256ull * 1024 * 1024;
 
 std::unordered_map<std::string, std::string> mac_vendor_map;
 std::unordered_map<std::string, std::string> ip_to_domain_map;
@@ -1976,6 +1977,18 @@ bool resolve_ptr_via_configured_dns(const std::string& ip, std::string& out_doma
 bool read_ips_from_file(const std::string& filename,
                         std::vector<std::string>& ips)
 {
+    struct stat st{};
+    if (stat(filename.c_str(), &st) != 0) {
+        std::cerr << "Failed to open IP file: " << filename << "\n";
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        std::cerr << "Error: '" << filename << "' is not a regular file "
+                   << "(-iL requires a plain text file of targets, not a "
+                   << "device, pipe, or socket).\n";
+        return false;
+    }
+
     std::ifstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Failed to open IP file: " << filename << "\n";
@@ -1985,7 +1998,20 @@ bool read_ips_from_file(const std::string& filename,
     std::vector<std::string> tokens;
     tokens.reserve(4096);
     std::string line;
+    size_t bytes_read = 0;
     while (std::getline(file, line)) {
+        bytes_read += line.size() + 1;
+        if (bytes_read > MAX_IL_FILE_BYTES) {
+            std::cerr << "Error: '" << filename << "' exceeds the "
+                      << (MAX_IL_FILE_BYTES / (1024 * 1024))
+                      << "MB limit for -iL target files.\n";
+            return false;
+        }
+        if (tokens.size() >= MAX_IL_FILE_LINES) {
+            std::cerr << "Error: '" << filename << "' exceeds the "
+                      << MAX_IL_FILE_LINES << "-line limit for -iL target files.\n";
+            return false;
+        }
         tokens.emplace_back(std::move(line));
     }
 
@@ -3447,9 +3473,4 @@ void print_full_help() {
 		          << color::yellow << "strack" << color::reset
 		          << "   Show State-transition output, Ports marked as filtered by initial syn may be get discover when retry\n\n";
 }
-
-// Defined in control.cpp: loads user-editable header/tag/regex signatures
-// from signatures.conf at startup (see the top of that file's config-driven
-// signature section for the file format). Declared here directly rather
-// than in scan.hpp/utils.hpp since those aren't part of this change.
 void load_signature_config(const std::string &path);
