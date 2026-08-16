@@ -380,8 +380,7 @@ void print_output(PrintOutputType type,
 	    if (state == "unfiltered") {
 	        extra = "ACK";
 	    } else if (state == "confused") {
-	        if (!scan_name.empty() && scan_name != "SYN" && scan_name != "ACK")
-		    extra = scan_name;
+	        // extra intentionally left empty — scan type no longer shown next to service
 	    } else if (window_size > 0) {
 	        extra = "WINDOW:" + std::to_string(window_size);
 	    }
@@ -6558,14 +6557,15 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
 		        break;
                 }
             }
+            std::string fport_state = PacketTask::expects_rst_response(scan_type) ? "confused" : "filtered";
             if (is_threaded) {
                 result.output_buffer += capture_output(PrintOutputType::PORT_RESULT,
-                    "", fport, "filtered", fsvc, scan_name,
+                    "", fport, fport_state, fsvc, scan_name,
                     0, 0, 0, 0, 0, 0, "", "", 0.0,
                     icmp_note, false, true);
             } else {
                 print_output(PrintOutputType::PORT_RESULT,
-                    "", fport, "filtered", fsvc, scan_name,
+                    "", fport, fport_state, fsvc, scan_name,
                     0, 0, 0, 0, 0, 0, "", "", 0.0,
                     icmp_note, false, true);
             }
