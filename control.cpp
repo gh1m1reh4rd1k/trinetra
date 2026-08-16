@@ -1228,7 +1228,16 @@ PlatformSignatureSet PlatformSignatureSet::loadFromFile(const std::string &path)
             }
             SuppressRule r;
             r.trigger_platform    = trim(f[0].substr(0, ge));
-            r.trigger_min_score   = std::atoi(trim(f[0].substr(ge + 2)).c_str());
+            {
+	        const std::string num = trim(f[0].substr(ge + 2));
+	        char *endp = nullptr;
+	        long v = std::strtol(num.c_str(), &endp, 10);
+	        if (endp == num.c_str() || *endp != '\0') {
+		    throw std::runtime_error(path + ":" + std::to_string(lineno) +
+		                              ": [suppress] score must be a valid integer");
+	        }
+	        r.trigger_min_score = static_cast<int>(v);
+	    }
             r.suppressed_platform = trim(f[1]);
             sigs.suppress_rules.push_back(std::move(r));
         }
@@ -1242,7 +1251,16 @@ PlatformSignatureSet PlatformSignatureSet::loadFromFile(const std::string &path)
             std::string kind_str = trim(f[0]);
             PlatformRule rule;
             rule.arg    = f[1]; // preserve as-is; some args (attrs) are meaningfully space-sensitive
-            rule.weight = std::atoi(trim(f[2]).c_str());
+            {
+	        const std::string num = trim(f[2]);
+	        char *endp = nullptr;
+	        long v = std::strtol(num.c_str(), &endp, 10);
+	        if (endp == num.c_str() || *endp != '\0') {
+		    throw std::runtime_error(path + ":" + std::to_string(lineno) +
+		                              ": platform rule weight must be a valid integer");
+	        }
+	        rule.weight = static_cast<int>(v);
+	    }
 
             if      (kind_str == "path_contains")           rule.kind = PlatformRule::Kind::PathContains;
             else if (kind_str == "jsglobal_eq")              rule.kind = PlatformRule::Kind::JsGlobalEq;
