@@ -894,7 +894,9 @@ void ServiceProbe::setProbablePorts(ServiceTunnel tunnel,
 }
 
 void ServiceProbe::setRarity(const char *val, int lineno) {
-    int r = atoi(val);
+    char *endp = nullptr;
+    long r = strtol(val, &endp, 10);
+    if (endp == val || *endp != '\0') fatal("Rarity on line %d must be a valid integer", lineno);
     if (r < 1 || r > 9) fatal("Rarity on line %d must be 1–9", lineno);
     rarity_ = r;
 }
@@ -1218,10 +1220,23 @@ void ServiceNFO::resetProbes(bool freeFP) {
 }
 
 void ServiceNFO::appendResponse(const u8 *data, int len) {
-    currentresp_ = (u8 *)realloc(currentresp_, currentresplen_ + len);
-    if (!currentresp_) throw std::bad_alloc();
+    if (len <= 0) return;
+
+    const size_t old_len = static_cast<size_t>(currentresplen_);
+    const size_t add_len = static_cast<size_t>(len);
+    const size_t new_len = old_len + add_len;
+
+    static constexpr size_t kMaxResponseBytes = 16 * 1024 * 1024; // 16 MB safety cap
+    if (new_len < old_len || new_len > kMaxResponseBytes) {
+        // wraparound or response grew past a sane cap -- stop accepting more
+        return;
+    }
+
+    u8 *grown = (u8 *)realloc(currentresp_, new_len);
+    if (!grown) throw std::bad_alloc();
+    currentresp_ = grown;
     memcpy(currentresp_ + currentresplen_, data, len);
-    currentresplen_ += len;
+    currentresplen_ = static_cast<int>(new_len);
 }
 
 u8 *ServiceNFO::getResponse(int *lenout) {
