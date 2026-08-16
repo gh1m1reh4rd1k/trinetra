@@ -1,4 +1,4 @@
- #!/bin/bash
+#!/bin/bash
 
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
@@ -94,7 +94,10 @@ install_dependencies() {
                 nlohmann-json3-dev \
                 libpugixml-dev \
                 pkg-config \
-                libpcre2-dev
+                libpcre2-dev \
+                libssl-dev \
+                zlib1g-dev \
+                liburing-dev
             ;;
         arch)
             # Sync package databases
@@ -105,7 +108,7 @@ install_dependencies() {
             pacman -S --needed --noconfirm base-devel cmake git curl pkg-config
             
             # Install individual libraries
-            pacman -S --needed --noconfirm pugixml nlohmann-json pcre2
+            pacman -S --needed --noconfirm pugixml nlohmann-json openssl zlib liburing
             # libcurl is part of curl package on Arch, already installed above
             ;;
         *)
