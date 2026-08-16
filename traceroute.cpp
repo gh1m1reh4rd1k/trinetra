@@ -143,6 +143,13 @@ GeoIspInfo geoip_lookup(const std::string& ip) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 1500L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 800L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    #if CURL_AT_LEAST_VERSION(7, 85, 0)
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+    #else
+        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    #endif
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     const CURLcode res = curl_easy_perform(curl);
