@@ -96,8 +96,7 @@ install_dependencies() {
                 pkg-config \
                 libpcre2-dev \
                 libssl-dev \
-                zlib1g-dev \
-                liburing-dev
+                zlib1g-dev
             ;;
         arch)
             # Sync package databases
@@ -108,7 +107,7 @@ install_dependencies() {
             pacman -S --needed --noconfirm base-devel cmake git curl pkg-config
             
             # Install individual libraries
-            pacman -S --needed --noconfirm pugixml nlohmann-json openssl zlib liburing
+            pacman -S --needed --noconfirm pugixml nlohmann-json openssl zlib
             # libcurl is part of curl package on Arch, already installed above
             ;;
         *)
