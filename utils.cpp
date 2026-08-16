@@ -1041,7 +1041,12 @@ unsigned __int128 ipv6_to_u128(const unsigned char* b16) {
 void add_cidr_range(const std::string& cidr, const std::string& label) {
     size_t slash = cidr.find('/');
     std::string addr = (slash == std::string::npos) ? cidr : cidr.substr(0, slash);
-    int prefix = (slash == std::string::npos) ? -1 : std::atoi(cidr.c_str() + slash + 1);
+    int prefix = -1;
+    if (slash != std::string::npos) {
+        char *endp = nullptr;
+        long v = std::strtol(cidr.c_str() + slash + 1, &endp, 10);
+        prefix = (endp != cidr.c_str() + slash + 1 && *endp == '\0') ? static_cast<int>(v) : -1;
+    }
 
     in_addr a4{};
     if (inet_pton(AF_INET, addr.c_str(), &a4) == 1) {
