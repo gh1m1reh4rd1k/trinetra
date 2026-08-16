@@ -1,4 +1,4 @@
-#!/bin/bash
+ #!/bin/bash
 
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
@@ -105,7 +105,7 @@ install_dependencies() {
             pacman -S --needed --noconfirm base-devel cmake git curl pkg-config
             
             # Install individual libraries
-            pacman -S --needed --noconfirm pugixml nlohmann-json
+            pacman -S --needed --noconfirm pugixml nlohmann-json pcre2
             # libcurl is part of curl package on Arch, already installed above
             ;;
         *)
