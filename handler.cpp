@@ -2708,10 +2708,11 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                 [&](uint16_t a, uint16_t b) { return rank(a) < rank(b); });
 
             int shown_filtered = 0;
+            std::string sorted_filtered_state = PacketTask::expects_rst_response(scan_type) ? "confused" : "filtered";
             for (size_t idx = 0; idx < filtered_sorted.size() && shown_filtered < want_filtered; ++idx, ++shown_filtered) {
                 uint16_t p = filtered_sorted[idx];
                 std::string svc = service_map.count(p) ? service_map.at(p) : "unknown";
-                print_output(PrintOutputType::PORT_RESULT, "", p, "filtered", svc, scan_name,
+                print_output(PrintOutputType::PORT_RESULT, "", p, sorted_filtered_state, svc, scan_name,
                              0, 0, 0, 0, 0, 0, "", "", 0.0, "", false, true);
             }
             int shown_closed = 0;
