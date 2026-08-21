@@ -6,6 +6,7 @@
 
 **Warning**: This scanner uses raw packet manipulation and may crash or destabilize target TCP/IP stacks. Use with caution.
 
+- **Development Approach**: Networking concepts, performance strategy, and optimization design were self-directed; AI-assisted implementation is used to translate design into C++ code.
 - **Usage Scope**: Strictly for educational purposes, home labs, or authorized testing environments only.
 - **Reverse Approach**: Focuses on implementation first, then learning concepts by analyzing real packet behavior.
 - **Low-Level Control**: Provides advanced raw packet access and customization.
