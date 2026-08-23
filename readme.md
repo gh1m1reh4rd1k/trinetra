@@ -1,7 +1,7 @@
 # Project-shiva
 
 
-<img src="https://github.com/HardikGhimire1/shiva/blob/main/images/uring.jpeg" />
+<img src="https://github.com/gh1m1reh4rd1k/trinetra/blob/main/images/io_uring.jpeg" />
 
 
 **Warning**: This scanner uses raw packet manipulation and may crash or destabilize target TCP/IP stacks. Use with caution.
