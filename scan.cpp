@@ -4359,179 +4359,179 @@ void display_packet_details(const PacketDetails& d, bool debug_enabled) {
                             : rst_set             ? color::red
                             :                       color::yellow;
 
-    std::lock_guard<std::mutex> lock(cout_mutex);
-    std::cout << "\n";
-    std::cout << color::cyan << "╔══════════════════════════════════════════════════════\n";
-    std::cout << color::cyan << "║ 📦 Packet Details for Port " << d.port << "/tcp"
+    std::ostringstream oss;
+    oss << "\n";
+    oss << color::cyan << "╔══════════════════════════════════════════════════════\n";
+    oss << color::cyan << "║ 📦 Packet Details for Port " << d.port << "/tcp"
               << color::reset << "\n";
-    std::cout << color::cyan << "╚══════════════════════════════════════════════════════\n"
+    oss << color::cyan << "╚══════════════════════════════════════════════════════\n"
               << color::reset;
 
     // ── Section 1: Endpoint Info ───────────────────────────────────────────
-    std::cout << color::cyan << "🌐 Endpoints\n" << color::reset;
-    std::cout << "Src IP:Port  : " << color::yellow << d.src_ip << ":" << d.src_port << color::reset << "\n";
-    std::cout << "Dst IP:Port  : " << color::yellow << d.dst_ip << ":" << d.dst_port << color::reset << "\n";
+    oss << color::cyan << "🌐 Endpoints\n" << color::reset;
+    oss << "Src IP:Port  : " << color::yellow << d.src_ip << ":" << d.src_port << color::reset << "\n";
+    oss << "Dst IP:Port  : " << color::yellow << d.dst_ip << ":" << d.dst_port << color::reset << "\n";
 
     // ── Section 2: IP Header ───────────────────────────────────────────────
-    std::cout << color::cyan << "🔵 IP Header\n" << color::reset;
-    std::cout << "IP ID        : " << color::yellow << d.ip_id         << color::reset << "\n";
-    std::cout << "Total Length : " << color::yellow << d.ip_total_length << " B" << color::reset << "\n";
-    std::cout << "Header Len   : " << color::yellow << static_cast<int>(d.ip_header_len) << " B" << color::reset << "\n";
-    std::cout << "TTL          : " << color::yellow << static_cast<int>(d.ttl) << color::reset << "\n";
-    std::cout << "Protocol     : " << color::yellow << static_cast<int>(d.ip_protocol) << color::reset << "\n";
-    std::cout << "TOS          : " << color::yellow << hex8(d.ip_tos)  << color::reset << "\n";
-    std::cout << "DF Flag      : " << set_notset(d.df_flag)            << "\n";
-    std::cout << "MF Flag      : " << set_notset(d.ip_mf_flag)         << "\n";
-    std::cout << "Frag Offset  : " << color::yellow << (d.ip_frag_off_raw & 0x1FFF) << color::reset << "\n";
-    std::cout << "Checksum     : " << color::yellow << hex16(d.ip_checksum) << color::reset
+    oss << color::cyan << "🔵 IP Header\n" << color::reset;
+    oss << "IP ID        : " << color::yellow << d.ip_id         << color::reset << "\n";
+    oss << "Total Length : " << color::yellow << d.ip_total_length << " B" << color::reset << "\n";
+    oss << "Header Len   : " << color::yellow << static_cast<int>(d.ip_header_len) << " B" << color::reset << "\n";
+    oss << "TTL          : " << color::yellow << static_cast<int>(d.ttl) << color::reset << "\n";
+    oss << "Protocol     : " << color::yellow << static_cast<int>(d.ip_protocol) << color::reset << "\n";
+    oss << "TOS          : " << color::yellow << hex8(d.ip_tos)  << color::reset << "\n";
+    oss << "DF Flag      : " << set_notset(d.df_flag)            << "\n";
+    oss << "MF Flag      : " << set_notset(d.ip_mf_flag)         << "\n";
+    oss << "Frag Offset  : " << color::yellow << (d.ip_frag_off_raw & 0x1FFF) << color::reset << "\n";
+    oss << "Checksum     : " << color::yellow << hex16(d.ip_checksum) << color::reset
               << "  valid=" << yn(d.ip_checksum_valid) << "\n";
-    std::cout << "Hop Distance : " << color::yellow << d.hop_distance_est << " hops" << color::reset << "\n";
+    oss << "Hop Distance : " << color::yellow << d.hop_distance_est << " hops" << color::reset << "\n";
 
     // ── Section 3: TCP Header ──────────────────────────────────────────────
-    std::cout << color::cyan << "🟢 TCP Header\n" << color::reset;
-    std::cout << "Src Port     : " << color::yellow << d.src_port      << color::reset << "\n";
-    std::cout << "Flags        : " << color::yellow << tcp_flags_str(d.tcp_flags)
+    oss << color::cyan << "🟢 TCP Header\n" << color::reset;
+    oss << "Src Port     : " << color::yellow << d.src_port      << color::reset << "\n";
+    oss << "Flags        : " << color::yellow << tcp_flags_str(d.tcp_flags)
               << " (" << hex8(d.tcp_flags) << ")" << color::reset << "\n";
-    std::cout << "Seq Num      : " << color::yellow << d.seq_num       << color::reset << "\n";
-    std::cout << "Ack Num      : " << color::yellow << d.ack_num       << color::reset << "\n";
-    std::cout << "Window       : " << color::yellow << d.window_size   << color::reset << "\n";
-    std::cout << "Header Len   : " << color::yellow << static_cast<int>(d.tcp_header_len) << " B" << color::reset << "\n";
-    std::cout << "Data Offset  : " << color::yellow << static_cast<int>(d.tcp_data_offset) << color::reset << "\n";
-    std::cout << "URG Ptr      : " << color::yellow << d.tcp_urg_ptr   << color::reset << "\n";
-    std::cout << "Checksum     : " << color::yellow << hex16(d.checksum) << color::reset
+    oss << "Seq Num      : " << color::yellow << d.seq_num       << color::reset << "\n";
+    oss << "Ack Num      : " << color::yellow << d.ack_num       << color::reset << "\n";
+    oss << "Window       : " << color::yellow << d.window_size   << color::reset << "\n";
+    oss << "Header Len   : " << color::yellow << static_cast<int>(d.tcp_header_len) << " B" << color::reset << "\n";
+    oss << "Data Offset  : " << color::yellow << static_cast<int>(d.tcp_data_offset) << color::reset << "\n";
+    oss << "URG Ptr      : " << color::yellow << d.tcp_urg_ptr   << color::reset << "\n";
+    oss << "Checksum     : " << color::yellow << hex16(d.checksum) << color::reset
               << "  valid=" << yn(d.tcp_checksum_valid) << "\n";
 
     // ── Section 4: TCP Options ─────────────────────────────────────────────
-    std::cout << color::cyan << "⚙️  TCP Options\n" << color::reset;
-    std::cout << "Layout       : " << color::yellow
+    oss << color::cyan << "⚙️  TCP Options\n" << color::reset;
+    oss << "Layout       : " << color::yellow
               << (d.tcp_option_layout.empty() ? "(none)" : d.tcp_option_layout)
               << color::reset << "\n";
-    std::cout << "MSS          : "
+    oss << "MSS          : "
               << (d.has_mss ? color::yellow + std::to_string(d.mss_value) + color::reset
                             : color::dim + std::string("N/A") + color::reset) << "\n";
-    std::cout << "Window Scale : "
+    oss << "Window Scale : "
               << (d.has_window_scale
                     ? color::yellow + std::to_string(static_cast<int>(d.window_scale)) + color::reset
                     : color::dim + std::string("N/A") + color::reset) << "\n";
-    std::cout << "SACK-OK      : " << yn(d.sack_permitted) << "\n";
-    std::cout << "SACK Blocks  : " << yn(d.has_sack_blocks);
+    oss << "SACK-OK      : " << yn(d.sack_permitted) << "\n";
+    oss << "SACK Blocks  : " << yn(d.has_sack_blocks);
     if (d.has_sack_blocks && !d.sack_blocks.empty()) {
-        std::cout << "  [";
+        oss << "  [";
         for (size_t i = 0; i < d.sack_blocks.size(); ++i) {
-            std::cout << d.sack_blocks[i].first << "-" << d.sack_blocks[i].second;
-            if (i + 1 < d.sack_blocks.size()) std::cout << ", ";
+            oss << d.sack_blocks[i].first << "-" << d.sack_blocks[i].second;
+            if (i + 1 < d.sack_blocks.size()) oss << ", ";
         }
-        std::cout << "]";
+        oss << "]";
     }
-    std::cout << "\n";
-    std::cout << "Timestamp    : " << yn(d.has_timestamp)
+    oss << "\n";
+    oss << "Timestamp    : " << yn(d.has_timestamp)
               << "  TSval=" << color::yellow << d.tsval << color::reset
               << "  TSecr=" << color::yellow << d.tsecr << color::reset << "\n";
-    std::cout << "TFO          : " << yn(d.has_tfo)
+    oss << "TFO          : " << yn(d.has_tfo)
               << (d.has_tfo ? ("  data=" + color::yellow + d.tfo_data + color::reset) : "") << "\n";
-    std::cout << "NOPs         : " << yn(d.has_nops) << "  count=" << d.nop_count << "\n";
-    std::cout << "EOL          : " << yn(d.has_eol)
+    oss << "NOPs         : " << yn(d.has_nops) << "  count=" << d.nop_count << "\n";
+    oss << "EOL          : " << yn(d.has_eol)
               << (d.has_eol ? "  offset=" + std::to_string(d.eol_offset) : "") << "\n";
-    std::cout << "Unknown Opts : " << yn(d.has_unknown_options);
+    oss << "Unknown Opts : " << yn(d.has_unknown_options);
     if (d.has_unknown_options) {
-        std::cout << "  kinds=[";
+        oss << "  kinds=[";
         for (size_t i = 0; i < d.unknown_option_kinds.size(); ++i) {
-            std::cout << static_cast<int>(d.unknown_option_kinds[i]);
-            if (i + 1 < d.unknown_option_kinds.size()) std::cout << ",";
+            oss << static_cast<int>(d.unknown_option_kinds[i]);
+            if (i + 1 < d.unknown_option_kinds.size()) oss << ",";
         }
-        std::cout << "]";
+        oss << "]";
     }
-    std::cout << "\n";
+    oss << "\n";
 
     // ── Section 5: Payload ─────────────────────────────────────────────────
-    std::cout << color::cyan << "📄 Payload\n" << color::reset;
-    std::cout << "Length       : " << color::yellow << d.payload_len << " B" << color::reset << "\n";
-    std::cout << "Has Payload  : " << yn(d.has_payload) << "\n";
-    std::cout << "Preview      : ";
+    oss << color::cyan << "📄 Payload\n" << color::reset;
+    oss << "Length       : " << color::yellow << d.payload_len << " B" << color::reset << "\n";
+    oss << "Has Payload  : " << yn(d.has_payload) << "\n";
+    oss << "Preview      : ";
     if (d.payload.empty()) {
-        std::cout << color::dim << "(empty)" << color::reset;
+        oss << color::dim << "(empty)" << color::reset;
     } else {
-        std::cout << color::yellow << d.payload.substr(0, 64)
+        oss << color::yellow << d.payload.substr(0, 64)
                   << (d.payload.size() > 64 ? "..." : "") << color::reset;
     }
-    std::cout << "\n";
-    std::cout << "Raw Hex (first 16 B): ";
+    oss << "\n";
+    oss << "Raw Hex (first 16 B): ";
     {
         size_t show = std::min(d.tcp_payload_raw.size(), size_t(16));
         for (size_t i = 0; i < show; ++i) {
-            std::cout << color::yellow;
+            oss << color::yellow;
             char hx[3]; std::snprintf(hx, sizeof(hx), "%02X", d.tcp_payload_raw[i]);
-            std::cout << hx << (i+1 < show ? " " : "") << color::reset;
+            oss << hx << (i+1 < show ? " " : "") << color::reset;
         }
-        if (d.tcp_payload_raw.size() > 16) std::cout << " ...";
-        std::cout << "\n";
+        if (d.tcp_payload_raw.size() > 16) oss << " ...";
+        oss << "\n";
     }
 
     // ── Section 6: Timing ─────────────────────────────────────────────────
-    std::cout << color::cyan << "⏱️  Timing\n" << color::reset;
-    std::cout << "Capture Epoch   : " << color::yellow << d.capture_epoch_us << " µs" << color::reset << "\n";
-    std::cout << "Kernel RX TS    : " << color::yellow << d.kernel_rx_ts_us  << " µs" << color::reset << "\n";
-    std::cout << "User RX TS      : " << color::yellow << d.user_rx_ts_us    << " µs" << color::reset << "\n";
-    std::cout << "TX TS           : " << color::yellow << d.tx_ts_us         << " µs" << color::reset << "\n";
-    std::cout << "RTT             : " << color::yellow << std::fixed << std::setprecision(3) << d.rtt_ms   << " ms" << color::reset << "\n";
-    std::cout << "RTT EWMA        : " << color::yellow << std::fixed << std::setprecision(3) << d.rtt_ewma_ms << " ms" << color::reset << "\n";
-    std::cout << "RTT Jitter      : " << color::yellow << std::fixed << std::setprecision(3) << d.rtt_jitter_ms << " ms" << color::reset << "\n";
-    std::cout << "RTT Outlier     : " << yn(d.rtt_outlier) << "\n";
-    std::cout << "TTL Outlier     : " << yn(d.ttl_outlier) << "\n";
+    oss << color::cyan << "⏱️  Timing\n" << color::reset;
+    oss << "Capture Epoch   : " << color::yellow << d.capture_epoch_us << " µs" << color::reset << "\n";
+    oss << "Kernel RX TS    : " << color::yellow << d.kernel_rx_ts_us  << " µs" << color::reset << "\n";
+    oss << "User RX TS      : " << color::yellow << d.user_rx_ts_us    << " µs" << color::reset << "\n";
+    oss << "TX TS           : " << color::yellow << d.tx_ts_us         << " µs" << color::reset << "\n";
+    oss << "RTT             : " << color::yellow << std::fixed << std::setprecision(3) << d.rtt_ms   << " ms" << color::reset << "\n";
+    oss << "RTT EWMA        : " << color::yellow << std::fixed << std::setprecision(3) << d.rtt_ewma_ms << " ms" << color::reset << "\n";
+    oss << "RTT Jitter      : " << color::yellow << std::fixed << std::setprecision(3) << d.rtt_jitter_ms << " ms" << color::reset << "\n";
+    oss << "RTT Outlier     : " << yn(d.rtt_outlier) << "\n";
+    oss << "TTL Outlier     : " << yn(d.ttl_outlier) << "\n";
 
     // ── Section 7: Probe Context ───────────────────────────────────────────
-    std::cout << color::cyan << "🔬 Sent Probe\n" << color::reset;
-    std::cout << "Retry Index  : " << color::yellow << d.retry_index << color::reset << "\n";
-    std::cout << "Flags        : " << color::yellow << tcp_flags_str(d.sent_flags)
+    oss << color::cyan << "🔬 Sent Probe\n" << color::reset;
+    oss << "Retry Index  : " << color::yellow << d.retry_index << color::reset << "\n";
+    oss << "Flags        : " << color::yellow << tcp_flags_str(d.sent_flags)
               << " (" << hex8(d.sent_flags) << ")" << color::reset << "\n";
-    std::cout << "TTL          : " << color::yellow << static_cast<int>(d.sent_ttl) << color::reset << "\n";
-    std::cout << "Window Scale : " << color::yellow << static_cast<int>(d.sent_ws)  << color::reset << "\n";
-    std::cout << "TSval        : " << color::yellow << d.sent_tsval       << color::reset << "\n";
-    std::cout << "MSS          : " << color::yellow << d.sent_mss         << color::reset << "\n";
-    std::cout << "Seq          : " << color::yellow << d.sent_seq         << color::reset << "\n";
-    std::cout << "Ack          : " << color::yellow << d.sent_ack         << color::reset << "\n";
-    std::cout << "Window Size  : " << color::yellow << d.sent_window_size << color::reset << "\n";
-    std::cout << "DSCP         : " << color::yellow << static_cast<int>(d.sent_dscp)   << color::reset << "\n";
-    std::cout << "IP TOS       : " << color::yellow << hex8(d.sent_ip_tos) << color::reset << "\n";
-    std::cout << "DF           : " << yn(d.sent_df)           << "\n";
-    std::cout << "SACK-OK      : " << yn(d.sent_sack_permitted) << "\n";
+    oss << "TTL          : " << color::yellow << static_cast<int>(d.sent_ttl) << color::reset << "\n";
+    oss << "Window Scale : " << color::yellow << static_cast<int>(d.sent_ws)  << color::reset << "\n";
+    oss << "TSval        : " << color::yellow << d.sent_tsval       << color::reset << "\n";
+    oss << "MSS          : " << color::yellow << d.sent_mss         << color::reset << "\n";
+    oss << "Seq          : " << color::yellow << d.sent_seq         << color::reset << "\n";
+    oss << "Ack          : " << color::yellow << d.sent_ack         << color::reset << "\n";
+    oss << "Window Size  : " << color::yellow << d.sent_window_size << color::reset << "\n";
+    oss << "DSCP         : " << color::yellow << static_cast<int>(d.sent_dscp)   << color::reset << "\n";
+    oss << "IP TOS       : " << color::yellow << hex8(d.sent_ip_tos) << color::reset << "\n";
+    oss << "DF           : " << yn(d.sent_df)           << "\n";
+    oss << "SACK-OK      : " << yn(d.sent_sack_permitted) << "\n";
 
     // ── Section 8: Classification ──────────────────────────────────────────
-    std::cout << color::cyan << "🏷️  Classification\n" << color::reset;
-    std::cout << "Flow Hash    : " << color::yellow << hex32(d.flow_hash) << color::reset << "\n";
-    std::cout << "Probe ID     : " << color::yellow << d.probe_id         << color::reset << "\n";
-    std::cout << "Resp Index   : " << color::yellow << d.response_index   << color::reset << "\n";
-    std::cout << "Duplicate    : " << yn(d.duplicate_response)           << "\n";
-    std::cout << "Retransmit?  : " << yn(d.retransmission_suspect)       << "\n";
-    std::cout << "Reason       : " << color::yellow
+    oss << color::cyan << "🏷️  Classification\n" << color::reset;
+    oss << "Flow Hash    : " << color::yellow << hex32(d.flow_hash) << color::reset << "\n";
+    oss << "Probe ID     : " << color::yellow << d.probe_id         << color::reset << "\n";
+    oss << "Resp Index   : " << color::yellow << d.response_index   << color::reset << "\n";
+    oss << "Duplicate    : " << yn(d.duplicate_response)           << "\n";
+    oss << "Retransmit?  : " << yn(d.retransmission_suspect)       << "\n";
+    oss << "Reason       : " << color::yellow
               << (d.classification_reason.empty() ? "(none)" : d.classification_reason)
               << color::reset << "\n";
-    std::cout << "Anomaly Score: " << color::yellow << d.anomaly_score     << color::reset << "\n";
-    std::cout << "Confidence   : " << color::yellow << std::fixed << std::setprecision(2)
+    oss << "Anomaly Score: " << color::yellow << d.anomaly_score     << color::reset << "\n";
+    oss << "Confidence   : " << color::yellow << std::fixed << std::setprecision(2)
               << d.anomaly_confidence << color::reset << "\n";
-    std::cout << "Tags         : ";
+    oss << "Tags         : ";
     if (d.signature_tags.empty()) {
-        std::cout << color::dim << "(none)" << color::reset;
+        oss << color::dim << "(none)" << color::reset;
     } else {
         for (size_t i = 0; i < d.signature_tags.size(); ++i) {
-            std::cout << color::yellow << d.signature_tags[i] << color::reset;
-            if (i + 1 < d.signature_tags.size()) std::cout << ", ";
+            oss << color::yellow << d.signature_tags[i] << color::reset;
+            if (i + 1 < d.signature_tags.size()) oss << ", ";
         }
     }
-    std::cout << "\n";
+    oss << "\n";
 
     // ── Section 9: Raw Packet Hex Dump ─────────────────────────────────────
-    std::cout << color::cyan << "🧮 Raw Packet (first 64 B)\n" << color::reset;
+    oss << color::cyan << "🧮 Raw Packet (first 64 B)\n" << color::reset;
     {
         size_t show = std::min(d.raw_packet.size(), size_t(64));
         for (size_t i = 0; i < show; ++i) {
-            if (i % 16 == 0) std::cout << "│   ";
+            if (i % 16 == 0) oss << "│   ";
             char hx[3]; std::snprintf(hx, sizeof(hx), "%02X", d.raw_packet[i]);
-            std::cout << color::dim << hx << color::reset;
-            std::cout << (((i+1) % 16 == 0 || i+1 == show) ? "\n" : " ");
+            oss << color::dim << hx << color::reset;
+            oss << (((i+1) % 16 == 0 || i+1 == show) ? "\n" : " ");
         }
         if (d.raw_packet.size() > 64)
-            std::cout << "│   ... (" << d.raw_packet.size() << " B total)\n";
+            oss << "│   ... (" << d.raw_packet.size() << " B total)\n";
     }
 
     {
@@ -4556,11 +4556,11 @@ void display_packet_details(const PacketDetails& d, bool debug_enabled) {
                              std::snprintf(b, sizeof(b), "0x%02X", d.tcp_flags);
                              return std::string(b); }();
 
-        std::cout << color::cyan << "├─ 🧮 Raw Packet (flag context)" << color::reset << "\n";
-        std::cout << "│   ";
+        oss << color::cyan << "├─ 🧮 Raw Packet (flag context)" << color::reset << "\n";
+        oss << "│   ";
 
         if (flag_byte_idx == SIZE_MAX || flag_byte_idx >= d.raw_packet.size()) {
-            std::cout << color::dim << "(unavailable)" << color::reset << "\n";
+            oss << color::dim << "(unavailable)" << color::reset << "\n";
         } else {
             const size_t window_before = 4;
             const size_t window_after  = 4;
@@ -4574,23 +4574,25 @@ void display_packet_details(const PacketDetails& d, bool debug_enabled) {
                 std::snprintf(hx, sizeof(hx), "%02X", d.raw_packet[i]);
 
                 if (i == flag_byte_idx) {
-                    std::cout << color::bold << flag_color << "[" << hx << "]" << color::reset;
+                    oss << color::bold << flag_color << "[" << hx << "]" << color::reset;
                 } else {
-                    std::cout << color::white << hx << color::reset;
+                    oss << color::white << hx << color::reset;
                 }
 
-                if (i + 1 < end) std::cout << " ";
+                if (i + 1 < end) oss << " ";
             }
 
-            std::cout << "  " << flag_color << color::bold
+            oss << "  " << flag_color << color::bold
                       << "← " << flag_label << color::reset << "\n";
         }
     }
 
-    std::cout << color::cyan << "📈 Summary" << color::reset << "\n";
-    std::cout << "    State: " << state_color << state_text << color::reset
+    oss << color::cyan << "📈 Summary" << color::reset << "\n";
+    oss << "    State: " << state_color << state_text << color::reset
               << " (" << color::yellow << __builtin_popcount(d.tcp_flags) << color::reset << " flags active)\n\n";
 
+    std::lock_guard<std::mutex> lock(cout_mutex);
+    std::cout << oss.str();
 }
 
 void display_sent_packet_details(const SentPacketDetails& d, bool debug_enabled) {
@@ -4612,46 +4614,46 @@ void display_sent_packet_details(const SentPacketDetails& d, bool debug_enabled)
         return s;
     };
 
-    std::lock_guard<std::mutex> lock(cout_mutex);
-    std::cout << "\n";
-    std::cout << color::cyan << "╔══════════════════════════════════════════════════════\n";
-    std::cout << color::cyan << "║ 🚀 Sent Packet — " << d.dst_ip << ":" << d.dst_port
+    std::ostringstream oss;
+    oss << "\n";
+    oss << color::cyan << "╔══════════════════════════════════════════════════════\n";
+    oss << color::cyan << "║ 🚀 Sent Packet — " << d.dst_ip << ":" << d.dst_port
               << " (src " << d.src_port << ")" << color::reset << "\n";
-    std::cout << color::cyan << "╚══════════════════════════════════════════════════════\n" << color::reset;
+    oss << color::cyan << "╚══════════════════════════════════════════════════════\n" << color::reset;
 
     if (d.is_ipv6) {
-        std::cout << color::cyan << "🔵 IPv6 Header\n" << color::reset;
-        std::cout << "Payload Len  : " << color::yellow << d.ip_total_length << " B" << color::reset << "\n";
-        std::cout << "Header Len   : " << color::yellow << (int)d.ip_header_len << " B"
+        oss << color::cyan << "🔵 IPv6 Header\n" << color::reset;
+        oss << "Payload Len  : " << color::yellow << d.ip_total_length << " B" << color::reset << "\n";
+        oss << "Header Len   : " << color::yellow << (int)d.ip_header_len << " B"
                   << " (incl. ext headers)" << color::reset << "\n";
-        std::cout << "Hop Limit    : " << color::yellow << (int)d.ttl << color::reset << "\n";
-        std::cout << "Traffic Class: " << color::yellow << hex16(d.traffic_class) << color::reset << "\n";
-        std::cout << "Flow Label   : " << color::yellow << hex16(static_cast<uint16_t>(d.flow_label))
+        oss << "Hop Limit    : " << color::yellow << (int)d.ttl << color::reset << "\n";
+        oss << "Traffic Class: " << color::yellow << hex16(d.traffic_class) << color::reset << "\n";
+        oss << "Flow Label   : " << color::yellow << hex16(static_cast<uint16_t>(d.flow_label))
                   << " (0x" << std::hex << d.flow_label << std::dec << ")" << color::reset << "\n";
-        std::cout << "Next Header  : " << color::yellow << (int)d.next_header << color::reset << "\n";
+        oss << "Next Header  : " << color::yellow << (int)d.next_header << color::reset << "\n";
     } else {
-        std::cout << color::cyan << "🔵 IP Header\n" << color::reset;
-        std::cout << "IP ID        : " << color::yellow << d.ip_id << color::reset << "\n";
-        std::cout << "Total Length : " << color::yellow << d.ip_total_length << " B" << color::reset << "\n";
-        std::cout << "Header Len   : " << color::yellow << (int)d.ip_header_len << " B" << color::reset << "\n";
-        std::cout << "TTL          : " << color::yellow << (int)d.ttl << color::reset << "\n";
-        std::cout << "TOS          : " << color::yellow << hex16(d.ip_tos) << color::reset << "\n";
-        std::cout << "DF/MF        : " << yn(d.df_flag) << " / " << yn(d.mf_flag)
+        oss << color::cyan << "🔵 IP Header\n" << color::reset;
+        oss << "IP ID        : " << color::yellow << d.ip_id << color::reset << "\n";
+        oss << "Total Length : " << color::yellow << d.ip_total_length << " B" << color::reset << "\n";
+        oss << "Header Len   : " << color::yellow << (int)d.ip_header_len << " B" << color::reset << "\n";
+        oss << "TTL          : " << color::yellow << (int)d.ttl << color::reset << "\n";
+        oss << "TOS          : " << color::yellow << hex16(d.ip_tos) << color::reset << "\n";
+        oss << "DF/MF        : " << yn(d.df_flag) << " / " << yn(d.mf_flag)
                   << "  frag_off=" << d.ip_frag_off_raw << "\n";
-        std::cout << "IP Checksum  : " << color::yellow << hex16(d.ip_checksum) << color::reset << "\n";
+        oss << "IP Checksum  : " << color::yellow << hex16(d.ip_checksum) << color::reset << "\n";
     }
 
-    std::cout << color::cyan << "🟢 TCP Header\n" << color::reset;
-    std::cout << "Flags        : " << color::yellow << tcp_flags_str(d.tcp_flags) << color::reset << "\n";
-    std::cout << "Seq/Ack      : " << color::yellow << d.seq_num << " / " << d.ack_num << color::reset << "\n";
-    std::cout << "Window       : " << color::yellow << d.window_size << color::reset << "\n";
-    std::cout << "Header Len   : " << color::yellow << (int)d.tcp_header_len << " B"
+    oss << color::cyan << "🟢 TCP Header\n" << color::reset;
+    oss << "Flags        : " << color::yellow << tcp_flags_str(d.tcp_flags) << color::reset << "\n";
+    oss << "Seq/Ack      : " << color::yellow << d.seq_num << " / " << d.ack_num << color::reset << "\n";
+    oss << "Window       : " << color::yellow << d.window_size << color::reset << "\n";
+    oss << "Header Len   : " << color::yellow << (int)d.tcp_header_len << " B"
               << " (options=" << d.options_len << " B)" << color::reset << "\n";
-    std::cout << "Checksum     : " << color::yellow << hex16(d.checksum) << color::reset
+    oss << "Checksum     : " << color::yellow << hex16(d.checksum) << color::reset
               << "  mode=" << color::yellow << d.checksum_mode << color::reset << "\n";
 
-    std::cout << color::cyan << "⚙️  TCP Options\n" << color::reset;
-    std::cout << "MSS=" << yn(d.has_mss) << "(" << d.mss_value << ")"
+    oss << color::cyan << "⚙️  TCP Options\n" << color::reset;
+    oss << "MSS=" << yn(d.has_mss) << "(" << d.mss_value << ")"
               << "  WS=" << yn(d.has_window_scale) << "(" << (int)d.window_scale << ")"
               << "  SACK=" << yn(d.sack_permitted)
               << "  TS=" << yn(d.has_timestamp)
@@ -4659,25 +4661,28 @@ void display_sent_packet_details(const SentPacketDetails& d, bool debug_enabled)
               << "  MPTCP=" << yn(d.has_mptcp)
               << "  TCP-AO=" << yn(d.has_tcp_ao) << "\n";
 
-    std::cout << color::cyan << "📄 Payload / Sizing\n" << color::reset;
-    std::cout << "Payload Len  : " << color::yellow << d.payload_len << " B" << color::reset << "\n";
-    std::cout << "Total Pkt    : " << color::yellow << d.total_packet_len << " B" << color::reset << "\n";
-    if (!d.payload_preview.empty()) {
-        std::cout << "Preview Hex  : ";
-        for (auto b : d.payload_preview) {
-            char hx[3]; std::snprintf(hx, sizeof(hx), "%02X", b);
-            std::cout << color::yellow << hx << color::reset << " ";
+    oss << color::cyan << "📄 Payload / Sizing\n" << color::reset;
+    oss << "Payload Len  : " << color::yellow << d.payload_len << " B" << color::reset << "\n";
+    oss << "Total Pkt    : " << color::yellow << d.total_packet_len << " B" << color::reset << "\n";
+        if (d.payload_len > 0) {
+        oss << "Preview Hex  : ";
+        for (size_t i = 0; i < std::min<size_t>(d.payload_len, 16); ++i) {
+            char hx[3]; std::snprintf(hx, sizeof(hx), "%02X", d.payload_preview[i]);
+            oss << color::yellow << hx << color::reset << " ";
         }
-        std::cout << "\n";
+        oss << "\n";
     }
 
-    std::cout << color::cyan << "🧩 Fragmentation / Flags\n" << color::reset;
-    std::cout << "Fragmented   : " << yn(d.fragmented)
-              << (d.fragmented ? "  step=" + std::to_string(d.frag_step) : "") << "\n";
-    std::cout << "Malformed    : " << yn(d.intentional_malformed) << "\n";
+    oss << color::cyan << "🧩 Fragmentation / Flags\n" << color::reset;
+    oss << "Fragmented   : " << yn(d.fragmented)
+              << (d.fragmented ? "  (frag_step=" + std::to_string(d.frag_step) + ")" : "") << "\n";
+    oss << "Malformed    : " << yn(d.intentional_malformed) << "\n";
     if (d.packet_length_adjusted)
-        std::cout << "--packet-length target=" << d.packet_length_target
+        oss << "--packet-length target=" << d.packet_length_target
                   << "  actual=" << d.total_packet_len << "\n";
+
+    std::lock_guard<std::mutex> lock(cout_mutex);
+    std::cout << oss.str();
 }
 
 void flush_sent_packet_debug() {
@@ -6585,4 +6590,3 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
     }
 
 }
-
