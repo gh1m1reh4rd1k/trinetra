@@ -6497,7 +6497,10 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
         if (!batch_result.mac_address.empty() && result.mac_address.empty()) {
             result.mac_address = batch_result.mac_address;
         }
-        result.packet_details.insert(batch_result.packet_details.begin(), batch_result.packet_details.end());
+                result.packet_details.insert(batch_result.packet_details.begin(), batch_result.packet_details.end());
+        if (result.received_ttl == 0 && batch_result.received_ttl != 0) {
+            result.received_ttl = batch_result.received_ttl;
+        }
         if (batch_result.learned_rtt_ms > result.learned_rtt_ms) {
             result.learned_rtt_ms = batch_result.learned_rtt_ms;
         }
