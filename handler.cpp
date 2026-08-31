@@ -2847,8 +2847,8 @@ void thread_worker(const std::vector<std::string>& thread_ips,
             }
 	    if (!multi_ip) {
 	        if (debug_rtt && !result.rtt_debug_entries.empty()) {
-		    std::lock_guard<std::mutex> lock(cout_mutex);
-		    std::cout << "\nRTT Debug      : \n";
+		    std::ostringstream rtt_oss;
+		    rtt_oss << "\nRTT Debug      : \n";
 
 		    const auto& entries = result.rtt_debug_entries;
 		    const size_t INLINE_THRESHOLD = 10;
@@ -2875,7 +2875,7 @@ void thread_worker(const std::vector<std::string>& thread_ips,
 		        int rtt_int = static_cast<int>(open_entries[i].second);
 		        if (open_entries[i].second > 0 && rtt_int == 0) rtt_int = 1;
 		    
-		        std::cout << "    " << color::green << std::left << std::setw(7) << "open" << color::reset
+		        rtt_oss << "    " << color::green << std::left << std::setw(7) << "open" << color::reset
 		                  << " " << std::setw(10) << (std::to_string(open_entries[i].first) + "/tcp")
 		                  << ": ewma=" << std::fixed << std::setprecision(3)
 		                  << open_entries[i].second << "ms → int=" << rtt_int << "ms\n";
@@ -2890,7 +2890,7 @@ void thread_worker(const std::vector<std::string>& thread_ips,
 		                int rtt_int = static_cast<int>(other_entries[i].second);
 		                if (other_entries[i].second > 0 && rtt_int == 0) rtt_int = 1;
 		            
-		                std::cout << "    " << color::red << std::left << std::setw(7) << "closed" << color::reset
+		                rtt_oss << "    " << color::red << std::left << std::setw(7) << "closed" << color::reset
 		                          << " " << std::setw(10) << (std::to_string(other_entries[i].first) + "/tcp")
 		                          << ": ewma=" << std::fixed << std::setprecision(3)
 		                          << other_entries[i].second << "ms → int=" << rtt_int << "ms\n";
@@ -2935,21 +2935,25 @@ void thread_worker(const std::vector<std::string>& thread_ips,
 		            int avg_int = static_cast<int>(avg_closest); 
 		            if (avg_closest > 0 && avg_int == 0) avg_int = 1;
 
-		            std::cout << "    " << color::red << std::left << std::setw(7) << "closed" << color::reset
+		            rtt_oss << "    " << color::red << std::left << std::setw(7) << "closed" << color::reset
 		                      << " " << other_entries.size() << " ports sampled\n";
-		            std::cout << "    Min ewma       "
+		            rtt_oss << "    Min ewma       "
 		                      << " " << std::setw(10) << (std::to_string(min_port) + "/tcp")
 		                      << ": ewma=" << std::fixed << std::setprecision(3) << min_rtt << "ms"
 		                      << " → int=" << min_int << "ms\n";
-		            std::cout << "    Avg ewma       "
+		            rtt_oss << "    Avg ewma       "
 		                      << " " << std::setw(10) << (std::to_string(avg_port) + "/tcp")
 		                      << ": ewma=" << std::fixed << std::setprecision(3) << avg_closest << "ms"
 		                      << " → int=" << avg_int << "ms\n";
-		            std::cout << "    Max ewma       "
+		            rtt_oss << "    Max ewma       "
 		                      << " " << std::setw(10) << (std::to_string(max_port) + "/tcp")
 		                      << ": ewma=" << std::fixed << std::setprecision(3) << max_rtt << "ms"
 		                      << " → int=" << max_int << "ms\n";
 		        }
+		    }
+		    {
+		        std::lock_guard<std::mutex> lock(cout_mutex);
+		        std::cout << rtt_oss.str();
 		    }
 	        }
 	    }
