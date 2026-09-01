@@ -37,6 +37,7 @@
 #include <openssl/x509.h>
 #include "handler.hpp"
 #include "dns_enum.hpp"
+#include "server.hpp"
 #include <sys/utsname.h>
 
 
@@ -98,6 +99,9 @@ static void print_shiv_enum_banner(const std::string& scan_name) {
 }
 
 int main(int argc, char *argv[]) {
+    if (argc > 1 && std::string(argv[1]) == "--server") {
+        return server::run(argc, argv);
+    }
 
     mallopt(M_ARENA_MAX, 2);          
     mallopt(M_MMAP_THRESHOLD, 1 << 20);
