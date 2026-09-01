@@ -78,6 +78,10 @@ check_sudo() {
 }
 
 # Install system dependencies based on OS
+# NOTE: this is the single place all installation is handled -- including
+# stunnel + openssl, which `shiv --server` needs for its TLS front-end.
+# server.cpp only checks whether stunnel is present at runtime; it never
+# installs packages itself.
 install_dependencies() {
     log_info "Installing system dependencies..."
     
@@ -96,6 +100,8 @@ install_dependencies() {
                 pkg-config \
                 libpcre2-dev \
                 libssl-dev \
+                openssl \
+                stunnel4 \
                 zlib1g-dev 
             ;;
         arch)
@@ -107,7 +113,7 @@ install_dependencies() {
             pacman -S --needed --noconfirm base-devel cmake git curl pkg-config
             
             # Install individual libraries
-            pacman -S --needed --noconfirm pugixml nlohmann-json openssl zlib
+            pacman -S --needed --noconfirm pugixml nlohmann-json openssl zlib stunnel
             # libcurl is part of curl package on Arch, already installed above
             ;;
         *)
@@ -362,8 +368,17 @@ verify_installation() {
     fi
     ((checks++))
     
+    # Check stunnel (needed by `shiv --server` for its TLS front-end)
+    if command -v stunnel >/dev/null 2>&1 || command -v stunnel4 >/dev/null 2>&1; then
+        log_info "✓ stunnel found"
+        ((passed++))
+    else
+        log_warn "✗ stunnel not found"
+    fi
+    ((checks++))
+    
     # Check data files
-    if [ -f "/usr/share/shiv/mac-vendors.txt" ] && [ -f "/usr/share/shiv/ports.txt" ] && [ -f "/usr/share/shiv/signatures.conf" ] ; then
+    if [ -f "/usr/share/shiv/mac-vendors.txt" ] && [ -f "/usr/share/shiv/ports.txt" ] && [ -f "/usr/share/shiv/services" ] && [ -f "/usr/share/shiv/signatures.conf" ] ; then
         log_info "✓ Data files found in /usr/share/shiv/"
         ((passed++))
     else
