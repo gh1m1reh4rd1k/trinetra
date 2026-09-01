@@ -3046,7 +3046,17 @@ static void print_result(const ScanResult                  &result,
     for (const auto &v : filled_slots) out_parts.push_back(v);
     if (out_parts.size() > kMaxSlots) out_parts.resize(kMaxSlots);
 
-    if (!out_parts.empty()) {
+        bool is_websocket_status = false;
+    for (const auto &fp : http_fps) {
+        if (fp.status_code == 101 || fp.status_code == 501) {
+            is_websocket_status = true;
+            break;
+        }
+    }
+
+    if (is_websocket_status) {
+        std::cout << "\033[32mwebsocket\033[0m\n";
+    } else if (!out_parts.empty()) {
         for (size_t i = 0; i < out_parts.size(); ++i) {
             if (i) std::cout << " | ";
             std::cout << "\033[32m" << out_parts[i] << "\033[0m";
@@ -3059,7 +3069,6 @@ static void print_result(const ScanResult                  &result,
     } else {
         std::cout << "?\n";
     }
-    // Suppress unused-variable warnings for probe_emit (kept for potential future use)
     (void)probe_emit;
     (void)seen_keys;
     (void)val_lc;
