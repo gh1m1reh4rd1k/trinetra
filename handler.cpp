@@ -3477,5 +3477,13 @@ void print_full_help() {
 		std::cerr << "         "
 		          << color::yellow << "strack" << color::reset
 		          << "   Show State-transition output, Ports marked as filtered by initial syn may be get discover when retry\n\n";
+		          
+		std::cerr << color::green << "Server Options:\n" << color::reset;
+		std::cerr << color::yellow << " --server" << color::reset << " Start shiv as a LAN control-panel server (open a browser to run scans remotely)\n";
+		std::cerr << color::yellow << " --server-port" << color::reset << " <port> Public HTTPS port clients connect to (default: 8443). TLS is handled automatically via stunnel\n";
+		std::cerr << color::yellow << " --server-token" << color::reset << " <token> Use a fixed auth token instead of a randomly generated one\n";
+		std::cerr << "                                            For eg: shiv --server (starts on the default port, prints a ready-to-use https link)\n";
+		std::cerr << "                                            For eg: shiv --server --server-port 9443\n\n";
 }
+
 void load_signature_config(const std::string &path);
