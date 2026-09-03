@@ -39,6 +39,8 @@
 #include "dns_enum.hpp"
 #include "server.hpp"
 #include <sys/utsname.h>
+#include "dns_enum.hpp"
+#include "ssl_enum.hpp"
 
 
 namespace color {
@@ -272,6 +274,7 @@ int main(int argc, char *argv[]) {
                    sv_tls_cert, sv_tls_key, sv_tls_sni, sv_host_override;
        EthArpOptions eth_opts;
        bool dns_enum_enabled = false;
+       bool ssl_enum_enabled = false;
    } config;
    
     std::vector<std::string> ips;
@@ -409,7 +412,7 @@ int main(int argc, char *argv[]) {
                 if (!tok.empty()) modules.push_back(tok);
             }
             if (modules.empty()) {
-                std::cerr << "--enum requires at least one of: shodan, dns, trail:<key> (e.g. --enum shodan,dns,trail:mykey)\n";
+                std::cerr << "--enum requires at least one of: shodan, dns, trail:<key> (e.g. --enum shodan,ssl,dns,trail:mykey)\n";
                 exit(1);
             }
             for (const auto& mod : modules) {
@@ -422,8 +425,10 @@ int main(int argc, char *argv[]) {
                 if (mod == "shodan") {
                     config.use_shodan_enum = true;
                 } else if (mod == "dns") {
-                    config.dns_enum_enabled = true;
-                } else if (mod.rfind("trail:", 0) == 0) {
+		    config.dns_enum_enabled = true;
+		} else if (mod == "ssl") {
+		    config.ssl_enum_enabled = true;
+		} else if (mod.rfind("trail:", 0) == 0) {
                     std::string key = mod.substr(6);
                     if (key.empty()) {
                         std::cerr << "--enum trail requires a key, e.g. --enum trail:<api-key>\n";
@@ -1967,6 +1972,30 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     
+     auto run_ssl_enum_step = [&]() {
+        if (ips.empty()) {
+            std::cerr << color::yellow
+                      << "--enum ssl needs at least one resolved target IP.\n"
+                      << color::reset;
+            return;
+        }
+        std::vector<SslTarget> ssl_targets;
+        ssl_targets.reserve(ips.size());
+        for (const auto& ip : ips) {
+            std::string hostname;
+            auto it = ip_to_domain_map.find(ip);
+            if (it != ip_to_domain_map.end()) hostname = it->second;
+            ssl_targets.push_back({ip, hostname});
+        }
+
+        SslEnumOptions opts;
+        opts.ports = !config.parsed_ports.empty() ? config.parsed_ports : std::vector<int>{443};
+
+        print_shiv_enum_banner("SSL");
+        auto results = run_ssl_enum_batch(ssl_targets, opts);
+        for (auto& r : results) print_ssl_enum_result(r, opts);
+    };
+    
     auto run_dns_enum_step = [&]() {
         if (ip_to_domain_map.empty()) {
             std::cerr << color::yellow
@@ -1995,6 +2024,11 @@ int main(int argc, char *argv[]) {
 
     if (config.dns_enum_enabled && !config.scan_type_specified) {
         run_dns_enum_step();
+        return 0;
+    }
+    
+    if (config.ssl_enum_enabled && !config.scan_type_specified) {
+        run_ssl_enum_step();
         return 0;
     }
 
@@ -2833,6 +2867,9 @@ int main(int argc, char *argv[]) {
     
     if (config.dns_enum_enabled && config.scan_type_specified) {
         run_dns_enum_step();
+    }
+    if (config.ssl_enum_enabled && config.scan_type_specified) {
+        run_ssl_enum_step();
     }
 
     return 0;
