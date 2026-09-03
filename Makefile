@@ -31,7 +31,7 @@ LIBS := -luring -lcurl -lpthread
 LIB_DIRS := -L/usr/lib/x86_64-linux-gnu
 
 # Source files and directories
-SRCS := scan.cpp main.cpp utils.cpp public_db.cpp anomaly_analysis.cpp probe.cpp control.cpp async_io.cpp netns_split.cpp traceroute.cpp parser.cpp handler.cpp arp_handler.cpp debug.cpp dns_enum.cpp server.cpp
+SRCS := scan.cpp main.cpp utils.cpp public_db.cpp anomaly_analysis.cpp probe.cpp control.cpp async_io.cpp netns_split.cpp traceroute.cpp parser.cpp handler.cpp arp_handler.cpp debug.cpp dns_enum.cpp server.cpp ssl_enum.cpp
 OBJ_DIR := object
 TARGET := shiv
 
