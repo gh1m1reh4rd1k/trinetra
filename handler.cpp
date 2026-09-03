@@ -3379,6 +3379,7 @@ void print_full_help() {
 		std::cerr << color::green << "Enumeration Options\n" << color::reset;
 		std::cerr << color::yellow << " --enum" << color::reset << " <module,module,...> Run one or more OSINT/enumeration modules, comma-separated, any order\n";
 		std::cerr << "                                      shodan        Query Shodan InternetDB for target info\n";
+		std::cerr << "                                      ssl           SSL/TLS enumeration (chain, SANs, key strength, expiry, OCSP/CT, SNI variance)\n";
 		std::cerr << "                                      dns           Passive+active DNS/OSINT enumeration (records, AXFR , email-security posture, DNSSEC , Wayback/RDAP/ASN)\n";
 		std::cerr << "                                      trail:<key>   Use security trials API to fetch subdomains\n\n";
 		std::cerr << "                                      For eg: shiv  abc.com --enum trail:<api-key> (only perform trail)\n";
