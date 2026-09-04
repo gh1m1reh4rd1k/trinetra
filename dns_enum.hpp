@@ -9,9 +9,6 @@
 #include <chrono>
 #include <openssl/evp.h>
 
-// ---------------------------------------------------------------------
-// Record model
-// ---------------------------------------------------------------------
 
 enum class DnsRRType : uint16_t {
     A      = 1,
@@ -76,6 +73,11 @@ enum class DiscoverySource {
     PassiveUrlscan,
     PassiveDork,           // Google Custom Search JSON API — hit URL/snippet parsed for hosts
     PassiveRipestat,       // RIPEstat network-info — secondary ASN/prefix source, fills Cymru gaps
+
+    // ---- Stage 2 sources (see Stage2SubdomainResult below) ----
+    PassiveThcIp,           // ip.thc.org/sb/<domain>
+    PassiveSubdomainCenter, // api.subdomain.center
+    PassiveDomainee,        // api.domainee.dev
 };
 
 struct DiscoveredHost {
@@ -136,9 +138,6 @@ struct ZoneTransferAttempt {
     std::string error; // populated when !succeeded
 };
 
-// CNAME chain that terminates on a known dangling-service pattern
-// (S3, GitHub Pages, Heroku, Azure, Netlify, ...), optionally confirmed by
-// an HTTP fingerprint match against the still-live orphaned endpoint.
 struct TakeoverFinding {
     std::string hostname;
     std::vector<std::string> cname_chain;   // hostname -> ... -> final target
@@ -191,8 +190,6 @@ struct DorkHit {
     std::string snippet;
 };
 
-// Per-query outcome for the dork phase, so a rate limit or key/quota
-// problem is visible in the report instead of silently returning nothing.
 struct DorkQueryStatus {
     std::string query;
     long http_status = 0;
@@ -201,9 +198,6 @@ struct DorkQueryStatus {
     size_t result_count = 0;
 };
 
-// Generic pass/fail + why, for every passive data source that was queried
-// this run — makes bans/timeouts/schema-changes visible instead of just
-// silently contributing zero hosts.
 struct PassiveSourceStatus {
     std::string source_name;
     bool ok = false;
@@ -216,6 +210,23 @@ struct BgpSiblingPrefix {
     std::string asn;
     std::string prefix;
     std::string description;
+};
+
+struct Stage2SourceStatus {
+    std::string source_name;   // "thc.org" | "subdomain.center" | "domainee.dev"
+    bool ok = false;
+    std::string detail;        // "ok", or error/http-status text on failure
+    size_t items_found = 0;    // new in-scope hostnames contributed by this source
+};
+
+struct Stage2SubdomainResult {
+    bool attempted = false;
+    std::vector<std::string> hostnames;              // unique, in-scope, normalized, sorted
+    std::unordered_map<std::string, std::unordered_set<std::string>> host_ips; // hostname -> resolved A/AAAA
+    std::vector<std::string> unresolved;              // no authoritative answer at all (timeout/unreachable)
+    std::vector<Stage2SourceStatus> source_status;
+    std::chrono::milliseconds duration{0};            // source-fetch phase
+    std::chrono::milliseconds resolve_duration{0};    // A/AAAA resolution phase (vectorized, like stage 1)
 };
 
 struct DnsEnumResult {
@@ -252,12 +263,10 @@ struct DnsEnumResult {
 
     std::chrono::milliseconds active_duration{0};
     std::chrono::milliseconds passive_duration{0};
-};
 
-// ---------------------------------------------------------------------
-// Options — mirrors the sv_* (version-detection) option block style
-// already used in main.cpp's Config struct.
-// ---------------------------------------------------------------------
+    // Populated only when the stage-2 pass (see below) was run.
+    Stage2SubdomainResult stage2;
+};
 
 struct DnsEnumOptions {
     bool enabled       = false;
@@ -276,20 +285,8 @@ struct DnsEnumOptions {
     std::string wordlist_file;         // optional; falls back to built-in list
     bool use_edns0            = true;  // advertise a 4096B UDP payload to cut TCP fallbacks
 
-    // Wordlist mutation (altdns/gotator-style): once real subdomains are
-    // known (brute force + passive), generate env/number/hyphen permutations
-    // and re-resolve them.
     bool   mutate_wordlist       = true;
     size_t mutation_max_candidates = 2000; // hard cap so this can't blow up on a big result set
-
-    // When true (and google_dork is usable — see below), the active
-    // wordlist brute-force + mutation passes are skipped entirely and
-    // subdomain discovery relies on passive sources (dork, crt.sh,
-    // certspotter, wayback, hackertarget, rapiddns, otx, urlscan) instead —
-    // no packets sent to the target's own nameservers for enumeration.
-    // Falls back to active brute force automatically if dorking isn't
-    // usable (google_dork=false or no credentials configured), so this is
-    // safe to leave on.
     bool   prefer_dork_for_subdomains = false;
 
     // Email-security / DKIM selector tuning
@@ -328,11 +325,6 @@ struct DnsEnumOptions {
     bool   query_otx          = true;
     bool   query_urlscan      = true;
     size_t wayback_sample_cap = 50;
-
-    // Google dorking via the Custom Search JSON API — off by default because
-    // it needs credentials; scraping google.com directly is not done by this
-    // tool (against Google's ToS and it gets you CAPTCHA'd/banned fast).
-    // Get a free-tier key+cx at https://programmablesearchengine.google.com/
     bool        google_dork = false;
     std::string google_api_key;
     std::string google_cx;
@@ -340,48 +332,37 @@ struct DnsEnumOptions {
     int         dork_results_per_query = 10;
     int         dork_max_queries_per_run = 12;      // safety cap on API quota burn
 
-    // Parse every dork hit's URL (host component) and, as a fallback, its
-    // title/snippet text for in-scope hostnames, merging them into the same
-    // subdomain map crt.sh/AXFR/brute-force feed — turns dorking into an
-    // active subdomain-discovery source instead of just a leak-hunting pass.
     bool        dork_discover_subdomains = true;
+
+    bool run_stage2          = true;
+    int  stage2_timeout_ms   = 10000;
 
     // Output
     bool verbose      = false;
     std::string save_json_file; // empty = don't save
 };
 
-// ---------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------
-
-// Runs whichever of active/passive is enabled in `opts` and returns the
-// merged result. Honors g_dns_servers / g_dns_tls_servers (handler.hpp)
-// for the active phase when the user supplied --dns-servers[-tls].
 DnsEnumResult run_dns_enum(const std::string& domain, const DnsEnumOptions& opts);
-
-// Pretty, colorized console report (uses the same color:: palette as the
-// rest of shiv's output).
 void print_dns_enum_result(const DnsEnumResult& result, const DnsEnumOptions& opts);
-
-// Writes the full result (including the uncapped host map) as JSON.
 bool save_dns_enum_result(const DnsEnumResult& result, const std::string& path);
 
-// Exposed individually so other subsystems (e.g. version-detection) can
-// reuse a single generic query instead of the old A/AAAA/PTR-only helpers
-// in handler.cpp.
+Stage2SubdomainResult run_stage2_subdomain_enum(const std::string& domain, int timeout_ms,
+                                                 std::unordered_map<std::string, DiscoveredHost>* merge_into = nullptr,
+                                                 int resolve_concurrency = 300,
+                                                 bool use_edns0 = true,
+                                                 int retries = 2);
+
+
+void print_stage2_subdomain_result(const Stage2SubdomainResult& result, bool show_subdomain_list = true);
+
+DnsEnumResult run_dns_enum_two_stage(const std::string& domain, const DnsEnumOptions& opts);
+
 bool dns_query_generic(const std::string& qname, DnsRRType qtype,
                         const std::vector<std::string>& servers,
                         int timeout_ms, int retries,
                         std::vector<DnsRecord>& out_records,
                         std::string* used_server = nullptr);
 
-// Fires many (qname, qtype) lookups against `servers` concurrently over a
-// small reused socket pool instead of one blocking round trip each. This is
-// the shared engine behind the apex sweep, DNSSEC checks, DKIM selector
-// scan, SRV/TLSA discovery, AXFR-NS resolution, PTR sweep, and subdomain
-// brute force (including mutated wordlist entries) — replacing what used to
-// be dozens of serial dns_query_generic() calls.
 struct AsyncDnsJob {
     std::string qname;
     DnsRRType   qtype;
