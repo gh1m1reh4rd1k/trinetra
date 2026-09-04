@@ -18,12 +18,19 @@
 #include <thread>
 #include <iomanip>
 #include <map>
+#include <atomic>
 #include <netdb.h>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 
 using json = nlohmann::json;
+
+extern std::atomic<bool> terminate_flag;
+
+static inline bool dns_enum_interrupted() {
+    return terminate_flag.load(std::memory_order_relaxed);
+}
 
 namespace color {
     const std::string reset   = "\033[0m";
@@ -423,11 +430,13 @@ bool dns_query_generic(const std::string& qname, DnsRRType qtype,
                         int timeout_ms, int retries,
                         std::vector<DnsRecord>& out_records,
                         std::string* used_server) {
-    if (servers.empty()) return false;
+    if (servers.empty() || dns_enum_interrupted()) return false;
     std::mt19937 rng(std::random_device{}());
 
     for (int attempt = 0; attempt <= retries; ++attempt) {
+        if (dns_enum_interrupted()) return false;
         for (const auto& srv : servers) {
+            if (dns_enum_interrupted()) return false;
             int fam = family_of(srv);
             if (fam < 0) continue;
             int fd = make_udp_socket(fam);
@@ -567,11 +576,11 @@ std::vector<AsyncDnsResult> dns_query_batch(const std::vector<AsyncDnsJob>& jobs
         return false;
     };
 
-    while (static_cast<int>(inflight.size()) < concurrency && launch_one()) {}
+    while (static_cast<int>(inflight.size()) < concurrency && !dns_enum_interrupted() && launch_one()) {}
 
     auto batch_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
-    while (!inflight.empty()) {
+    while (!inflight.empty() && !dns_enum_interrupted()) {
         std::vector<pollfd> pfds;
         pfds.reserve(inflight.size());
         for (auto& f : inflight) pfds.push_back({f.fd, POLLIN, 0});
@@ -666,10 +675,21 @@ std::vector<AsyncDnsResult> dns_query_batch(const std::vector<AsyncDnsJob>& jobs
             launch_one();
         }
 
-        if (pr <= 0 && inflight.size() == pfds.size()) {
+         if (pr <= 0 && inflight.size() == pfds.size() && next_job < jobs.size()) {
+            // Only extend while jobs are still waiting on a free socket to even
+            // be sent — once everything has been dispatched at least once,
+            // let the real deadline above finish off any stragglers instead of
+            // sliding forever on a single non-responding query.
             batch_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         }
     }
+
+    // On a normal finish, inflight is already empty here — everything
+    // was moved into free_sockets as each job completed. If we broke out
+    // early because of an interrupt, whatever's still in inflight was
+    // never released, so close those fds directly to avoid leaking them.
+    for (auto& f : inflight) close(f.fd);
+    inflight.clear();
 
     for (auto& [fam, fds] : free_sockets) for (int fd : fds) close(fd);
     (void)answered;
@@ -723,6 +743,7 @@ ZoneTransferAttempt try_axfr(const std::string& domain, const std::string& ns_ho
     size_t soa_seen = 0;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms * 3);
     while (std::chrono::steady_clock::now() < deadline) {
+        if (dns_enum_interrupted()) break;
         pollfd pfd{fd, POLLIN, 0};
         int remaining_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             deadline - std::chrono::steady_clock::now()).count());
@@ -1163,6 +1184,7 @@ void check_takeovers(const std::unordered_map<std::string, DiscoveredHost>& host
                       const std::vector<std::string>& servers, int timeout_ms,
                       std::vector<TakeoverFinding>& out) {
     for (auto& [name, h] : hosts) {
+        if (dns_enum_interrupted()) break;
         auto chain = chase_cname_chain(name, servers, timeout_ms);
         if (chain.empty()) continue;
         const std::string& final_target = chain.back();
@@ -1270,9 +1292,26 @@ size_t curl_write_cb(void* contents, size_t size, size_t nmemb, std::string* s) 
     return n;
 }
 
+// Wired up via CURLOPT_XFERINFOFUNCTION (with CURLOPT_NOPROGRESS off) on
+// every curl handle in this file. libcurl calls this periodically during
+// DNS resolution, connect, and transfer — returning non-zero tells it to
+// abort immediately (curl_easy_perform() then returns
+// CURLE_ABORTED_BY_CALLBACK). Without this, a Ctrl+C mid-request would sit
+// until CURLOPT_TIMEOUT_MS elapsed on its own, which for the passive/stage2
+// sources can be tens of seconds.
+int curl_abort_cb(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    return dns_enum_interrupted() ? 1 : 0;
+}
+
+void curl_apply_abort_on_interrupt(CURL* eh) {
+    curl_easy_setopt(eh, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(eh, CURLOPT_XFERINFOFUNCTION, curl_abort_cb);
+}
+
 } 
 
 bool http_get(const std::string& url, std::string& out, long timeout_ms, long* http_code) {
+    if (dns_enum_interrupted()) return false;
     CURL* curl = curl_easy_init();
     if (!curl) return false;
     out.clear();
@@ -1284,14 +1323,7 @@ bool http_get(const std::string& url, std::string& out, long timeout_ms, long* h
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "shiv-dns-enum/1.0");
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-#if CURL_AT_LEAST_VERSION(7, 85, 0)
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
-#else
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
+    curl_apply_abort_on_interrupt(curl);
     CURLcode rc = curl_easy_perform(curl);
     long code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -1324,7 +1356,7 @@ std::vector<ParallelFetchResult> parallel_http_get(const std::vector<ParallelFet
                                                     long timeout_ms, int concurrency) {
     std::vector<ParallelFetchResult> results(reqs.size());
     for (size_t i = 0; i < reqs.size(); ++i) { results[i].tag = reqs[i].tag; results[i].url = reqs[i].url; }
-    if (reqs.empty()) return results;
+    if (reqs.empty() || dns_enum_interrupted()) return results;
 
     CURLM* multi = curl_multi_init();
     if (!multi) return results;
@@ -1345,14 +1377,7 @@ std::vector<ParallelFetchResult> parallel_http_get(const std::vector<ParallelFet
         curl_easy_setopt(eh, CURLOPT_MAXREDIRS, 5L);
         curl_easy_setopt(eh, CURLOPT_USERAGENT, "shiv-dns-enum/1.0");
         curl_easy_setopt(eh, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(eh, CURLOPT_SSL_VERIFYHOST, 2L);
-#if CURL_AT_LEAST_VERSION(7, 85, 0)
-        curl_easy_setopt(eh, CURLOPT_PROTOCOLS_STR, "http,https");
-        curl_easy_setopt(eh, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
-#else
-        curl_easy_setopt(eh, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-        curl_easy_setopt(eh, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
+        curl_apply_abort_on_interrupt(eh);
         curl_easy_setopt(eh, CURLOPT_PRIVATE, reinterpret_cast<void*>(idx));
         handles[idx] = eh;
         curl_multi_add_handle(multi, eh);
@@ -1361,7 +1386,7 @@ std::vector<ParallelFetchResult> parallel_http_get(const std::vector<ParallelFet
     for (; next < reqs.size() && static_cast<int>(next) < concurrency; ++next) add_handle(next);
 
     curl_multi_perform(multi, &still_running);
-    while (still_running > 0 || next < reqs.size()) {
+    while ((still_running > 0 || next < reqs.size()) && !dns_enum_interrupted()) {
         int numfds = 0;
         curl_multi_wait(multi, nullptr, 0, 200, &numfds);
         curl_multi_perform(multi, &still_running);
@@ -1651,7 +1676,7 @@ void extract_hosts_from_dork_hits(const std::string& domain, const std::vector<D
 
 std::vector<AsnInfo> passive_asn_lookup_bulk(const std::vector<std::string>& ips, int timeout_ms) {
     std::vector<AsnInfo> out;
-    if (ips.empty()) return out;
+    if (ips.empty() || dns_enum_interrupted()) return out;
 
     int fam = AF_INET;
     for (auto& ip : ips) if (family_of(ip) == AF_INET6) { fam = AF_INET6; break; }
@@ -1979,7 +2004,7 @@ DnsEnumResult run_dns_enum(const std::string& domain, const DnsEnumOptions& opts
             }
         }
 
-        if (opts.attempt_axfr) {
+        if (opts.attempt_axfr && !dns_enum_interrupted()) {
             std::vector<std::string> ns_names;
             for (auto& r : result.records) if (r.type == DnsRRType::NS) ns_names.push_back(r.value);
 
@@ -1995,6 +2020,7 @@ DnsEnumResult run_dns_enum(const std::string& domain, const DnsEnumOptions& opts
             }
 
             for (auto& ns_name : ns_names) {
+                if (dns_enum_interrupted()) break;
                 auto it = ns_ip.find(ns_name);
                 if (it == ns_ip.end() || it->second.empty()) continue;
 
@@ -2016,7 +2042,8 @@ DnsEnumResult run_dns_enum(const std::string& domain, const DnsEnumOptions& opts
                 }
             }
         }
-        if (!skip_active_subdomain_enum && (!result.wildcard_dns || opts.skip_wildcard_filter)) {
+        if (!skip_active_subdomain_enum && !dns_enum_interrupted() &&
+            (!result.wildcard_dns || opts.skip_wildcard_filter)) {
             std::vector<std::string> words = builtin_subdomain_wordlist();
             if (!opts.wordlist_file.empty()) {
                 std::ifstream f(opts.wordlist_file);
@@ -2037,36 +2064,42 @@ DnsEnumResult run_dns_enum(const std::string& domain, const DnsEnumOptions& opts
         }
 
         // 5. Email security + DNSSEC + SRV + TLSA — each its own batched wave.
-        collect_email_security_batched(domain, servers, opts.timeout_ms, opts.retries,
-                                        opts.active_concurrency, opts.extra_dkim_selectors,
-                                        opts.use_edns0, result.mail_security);
-        collect_dnssec_batched(domain, servers, opts.timeout_ms, opts.retries,
-                                opts.active_concurrency, opts.use_edns0, result.dnssec);
-        if (opts.query_srv)
-            collect_srv_batched(domain, servers, opts.timeout_ms, opts.retries,
-                                 opts.active_concurrency, opts.use_edns0, result.srv_findings);
-        if (opts.query_tlsa)
-            collect_tlsa_batched(domain, opts.tlsa_ports, servers, opts.timeout_ms, opts.retries,
-                                  opts.active_concurrency, opts.use_edns0, result.tlsa_findings);
-        if (opts.query_sshfp)
-            collect_sshfp_batched(domain, servers, opts.timeout_ms, opts.retries,
-                                   opts.active_concurrency, opts.use_edns0, result.sshfp_findings);
-                                   
-        if (opts.query_email_crypto) {
-            std::vector<std::string> locals = builtin_email_locals();
-            locals.insert(locals.end(), opts.extra_email_locals.begin(), opts.extra_email_locals.end());
-            collect_email_crypto_batched(domain, locals, servers, opts.timeout_ms, opts.retries,
-                                          opts.active_concurrency, opts.use_edns0, result.records);
-        }
+        //    Skipped wholesale on interrupt: individually each collector's
+        //    own dns_query_batch()/batch_with_retry() call would already bail
+        //    out fast, but there's no reason to even build+launch six more
+        //    waves of queries once a Ctrl+C has already been seen.
+        if (!dns_enum_interrupted()) {
+            collect_email_security_batched(domain, servers, opts.timeout_ms, opts.retries,
+                                            opts.active_concurrency, opts.extra_dkim_selectors,
+                                            opts.use_edns0, result.mail_security);
+            collect_dnssec_batched(domain, servers, opts.timeout_ms, opts.retries,
+                                    opts.active_concurrency, opts.use_edns0, result.dnssec);
+            if (opts.query_srv)
+                collect_srv_batched(domain, servers, opts.timeout_ms, opts.retries,
+                                     opts.active_concurrency, opts.use_edns0, result.srv_findings);
+            if (opts.query_tlsa)
+                collect_tlsa_batched(domain, opts.tlsa_ports, servers, opts.timeout_ms, opts.retries,
+                                      opts.active_concurrency, opts.use_edns0, result.tlsa_findings);
+            if (opts.query_sshfp)
+                collect_sshfp_batched(domain, servers, opts.timeout_ms, opts.retries,
+                                       opts.active_concurrency, opts.use_edns0, result.sshfp_findings);
 
-        if (opts.nsec_walk && result.dnssec.dnskey_present)
-            result.nsec_walk = run_nsec_walk(domain, servers, opts.timeout_ms, opts.nsec_walk_max_steps);
+            if (opts.query_email_crypto) {
+                std::vector<std::string> locals = builtin_email_locals();
+                locals.insert(locals.end(), opts.extra_email_locals.begin(), opts.extra_email_locals.end());
+                collect_email_crypto_batched(domain, locals, servers, opts.timeout_ms, opts.retries,
+                                              opts.active_concurrency, opts.use_edns0, result.records);
+            }
+
+            if (opts.nsec_walk && result.dnssec.dnskey_present)
+                result.nsec_walk = run_nsec_walk(domain, servers, opts.timeout_ms, opts.nsec_walk_max_steps);
+        }
 
         result.active_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0);
     }
 
-    if (opts.do_passive) {
+    if (opts.do_passive && !dns_enum_interrupted()) {
         auto t0 = std::chrono::steady_clock::now();
 
         // Fire every HTTP-based passive source concurrently in one wave.
@@ -2125,7 +2158,7 @@ DnsEnumResult run_dns_enum(const std::string& domain, const DnsEnumOptions& opts
             st.detail = "ok";
             result.passive_source_status.push_back(std::move(st));
         }
-        if (opts.query_asn) {
+        if (opts.query_asn && !dns_enum_interrupted()) {
             std::unordered_set<std::string> unique_ips;
             for (auto& [name, h] : result.hosts) for (auto& ip : h.ips) unique_ips.insert(ip);
             for (auto& r : result.records)
@@ -2175,7 +2208,7 @@ DnsEnumResult run_dns_enum(const std::string& domain, const DnsEnumOptions& opts
             }
         }
 
-        {
+        if (!dns_enum_interrupted()) {
             PassiveSourceStatus dork_status;
             run_google_dork(domain, opts, result.dork_hits, result.dork_query_status, dork_status);
             if (opts.google_dork) {
@@ -2191,16 +2224,68 @@ DnsEnumResult run_dns_enum(const std::string& domain, const DnsEnumOptions& opts
         result.passive_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0);
     }
-    if (opts.do_active) {
-        if (!skip_active_subdomain_enum && opts.mutate_wordlist &&
+    if (opts.do_active && !dns_enum_interrupted()) {
+        // Resolve every host discovered passively (crt.sh, certspotter, wayback,
+        // rapiddns, dork, ...) that came back with no address at all. Sources
+        // like hackertarget/OTX embed an IP straight from their own cached
+        // answer, which is only ever as fresh/accurate as their last crawl —
+        // we don't touch those. For anything with an empty `ips` set we do a
+        // real, current lookup ourselves through the same concurrent/vectorized
+        // batch resolver used everywhere else in this file, rather than
+        // reporting a subdomain the report can't back up with a live address.
+        {
+            std::vector<AsyncDnsJob> resolve_jobs;
+            resolve_jobs.reserve(result.hosts.size() * 2);
+            for (auto& [name, h] : result.hosts) {
+                if (!h.ips.empty()) continue;
+                resolve_jobs.push_back({name, DnsRRType::A, name});
+                resolve_jobs.push_back({name, DnsRRType::AAAA, name});
+            }
+            if (!resolve_jobs.empty()) {
+                auto resolved = dns_query_batch(resolve_jobs, servers, opts.timeout_ms,
+                                                 opts.active_concurrency, opts.use_edns0);
+
+                // Track, per hostname, whether the resolver gave a real, positive
+                // answer for it (this covers a definitive NXDOMAIN too — see the
+                // `answered` semantics on AsyncDnsResult) versus never getting a
+                // usable reply at all (timeout / unreachable server).
+                std::unordered_set<std::string> got_authoritative_reply;
+                for (auto& res : resolved) {
+                    auto it = result.hosts.find(res.tag);
+                    if (it == result.hosts.end()) continue;
+                    for (auto& rec : res.records)
+                        if (rec.type == DnsRRType::A || rec.type == DnsRRType::AAAA)
+                            it->second.ips.insert(rec.value);
+                    if (res.answered) got_authoritative_reply.insert(res.tag);
+                }
+
+                // A name a nameserver positively answered for — even with a bare
+                // NXDOMAIN — but that never produced an address record does not
+                // currently exist. Passive sources (crt.sh SANs, urlscan, dork
+                // hits, wayback URLs, altdns-style guesses baked into a wordlist)
+                // can surface names that were never actually provisioned, so drop
+                // those confirmed-dead entries instead of listing them as
+                // "unresolved", which would wrongly suggest we just haven't
+                // checked yet or hit a transient failure. Anything that never got
+                // an authoritative reply at all (real timeout / unreachable
+                // resolver) is left in place — we genuinely don't know its state.
+                for (auto& tag : got_authoritative_reply) {
+                    auto it = result.hosts.find(tag);
+                    if (it != result.hosts.end() && it->second.ips.empty())
+                        result.hosts.erase(it);
+                }
+            }
+        }
+
+        if (!skip_active_subdomain_enum && opts.mutate_wordlist && !dns_enum_interrupted() &&
             (!result.wildcard_dns || opts.skip_wildcard_filter))
             run_mutation_pass(domain, result.hosts, servers, opts.timeout_ms, opts.active_concurrency,
                                opts.use_edns0, opts.mutation_max_candidates);
 
-        if (opts.check_takeovers)
+        if (opts.check_takeovers && !dns_enum_interrupted())
             check_takeovers(result.hosts, servers, opts.timeout_ms, result.takeover_findings);
 
-        if (opts.ptr_sweep_self || opts.ptr_sweep_prefix) {
+        if ((opts.ptr_sweep_self || opts.ptr_sweep_prefix) && !dns_enum_interrupted()) {
             std::unordered_set<std::string> all_ips;
             for (auto& [name, h] : result.hosts) for (auto& ip : h.ips) all_ips.insert(ip);
             for (auto& r : result.records)
@@ -2261,233 +2346,326 @@ std::string sanitize_echo(const std::string& s) {
 
 }
 
-void print_dns_enum_result(const DnsEnumResult& r, const DnsEnumOptions& opts) {
-    std::cout << "\n" << color::bold << color::cyan << "DNS Enumeration: " << color::reset
-              << color::white << r.domain << color::reset << "\n";
+namespace {
 
-    std::cout << color::bold << "\n:: Apex records\n" << color::reset;
+// ---- small local helpers for the compact report (kept file-local so they
+// can't collide with anything else in the binary) -----------------------
+
+std::string report_date_only(const std::string& iso) {
+    auto pos = iso.find('T');
+    return pos == std::string::npos ? iso : iso.substr(0, pos);
+}
+
+std::string report_thousands(long long v) {
+    std::string s = std::to_string(v);
+    bool neg = !s.empty() && s[0] == '-';
+    std::string digits = neg ? s.substr(1) : s;
+    std::string out;
+    int cnt = 0;
+    for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+        if (cnt && cnt % 3 == 0) out.push_back(',');
+        out.push_back(*it);
+        ++cnt;
+    }
+    std::reverse(out.begin(), out.end());
+    return (neg ? "-" : "") + out;
+}
+
+void report_section(const std::string& title) {
+    std::cout << "\n" << color::bold << color::green << title << color::reset << "\n"
+               << std::string(72, '-') << "\n";
+}
+
+void report_columns(const std::vector<std::string>& names, const std::string& fg = "",
+                     size_t max_cols = 4, size_t gap = 2, size_t width_cap = 30) {
+    if (names.empty()) return;
+    size_t cols = std::max<size_t>(1, std::min(max_cols, names.size()));
+
+    std::vector<size_t> col_width(cols, 0);
+    for (size_t i = 0; i < names.size(); ++i)
+        col_width[i % cols] = std::max(col_width[i % cols], std::min(names[i].size(), width_cap));
+
+    for (size_t i = 0; i < names.size(); ++i) {
+        size_t c = i % cols;
+        if (fg.empty()) std::cout << names[i];
+        else std::cout << fg << names[i] << color::reset;
+        bool last_in_row = (c + 1 == cols) || (i + 1 == names.size());
+        if (!last_in_row) {
+            size_t pad = names[i].size() < col_width[c] ? (col_width[c] - names[i].size()) : 0;
+            std::cout << std::string(pad + gap, ' ');
+        }
+        if ((i + 1) % cols == 0) std::cout << "\n";
+    }
+    if (names.size() % cols != 0) std::cout << "\n";
+}
+
+int report_mx_priority(const std::string& value) {
+    // value is rendered as "<priority> <target>"
+    try { return std::stoi(value); } catch (...) { return 0; }
+}
+
+} // namespace
+
+void print_dns_enum_result(const DnsEnumResult& r_in, const DnsEnumOptions& opts) {
+    // Work on a local mutable copy. Previously stage 2 was fetched and
+    // merged at the very END of this function (see the trailing block
+    // below) — but the CLI's normal call path is run_dns_enum() followed
+    // directly by print_dns_enum_result(), not run_dns_enum_two_stage().
+    // That meant every real run printed APEX/EMAIL/.../SUBDOMAINS/STATISTICS
+    // using stage-1-only data first, THEN made the slow stage 2 HTTP calls,
+    // THEN printed a second "STAGE 2" section — a visible two-part report
+    // instead of one combined pass, and the SUBDOMAINS count/grid never
+    // included stage 2's finds at all (only the later, separate section did).
+    //
+    // Fetching + merging stage 2 here, before any section is printed, means
+    // SUBDOMAINS below reflects the true combined unique count/grid, and
+    // both call sites (direct CLI use and run_dns_enum_two_stage(), which
+    // already merges stage 2 into r_in before calling this function) behave
+    // identically: if stage 2 was already attempted, this is a no-op.
+    DnsEnumResult r = r_in;
+    if (opts.run_stage2 && !r.stage2.attempted && !dns_enum_interrupted()) {
+        r.stage2 = run_stage2_subdomain_enum(r.domain, opts.stage2_timeout_ms, &r.hosts,
+                                              opts.active_concurrency, opts.use_edns0,
+                                              opts.retries);
+    }
+
+    auto flag = [](bool b) { return b ? (color::green + "Yes" + color::reset)
+                                       : (color::red + "No" + color::reset); };
+
+    std::cout << "\n" << color::bold << color::cyan << "DNS ENUMERATION: " << color::reset
+               << color::white << r.domain << color::reset << "\n";
+
+    // ---- Apex records -----------------------------------------------
+    report_section("APEX RECORDS");
+    std::vector<std::string> ns_names;
+    std::vector<std::string> mx_values;
     for (auto& rec : r.records) {
         if (rec.source.rfind("axfr", 0) == 0) continue; // shown separately
-        std::cout << "  " << color::yellow << dns_rrtype_name(rec.type) << color::reset
-                  << "\t" << rec.name << "\t" << sanitize_echo(rec.value)
-                  << color::dim << "  (ttl=" << rec.ttl << ")" << color::reset << "\n";
+        if (rec.type == DnsRRType::NS) { ns_names.push_back(rec.value); continue; }
+        if (rec.type == DnsRRType::MX) { mx_values.push_back(rec.value); continue; }
+    }
+    std::sort(ns_names.begin(), ns_names.end());
+    ns_names.erase(std::unique(ns_names.begin(), ns_names.end()), ns_names.end());
+    std::sort(mx_values.begin(), mx_values.end(), [](const std::string& a, const std::string& b) {
+        int pa = report_mx_priority(a), pb = report_mx_priority(b);
+        return pa != pb ? pa < pb : a < b;
+    });
+
+    for (auto& rec : r.records) {
+        if (rec.source.rfind("axfr", 0) == 0) continue;
+        if (rec.type == DnsRRType::NS || rec.type == DnsRRType::MX) continue;
+        std::cout << color::yellow << std::left << std::setw(8) << dns_rrtype_name(rec.type)
+                   << color::reset << ": " << sanitize_echo(rec.value);
+        if (rec.type == DnsRRType::A || rec.type == DnsRRType::AAAA)
+            std::cout << color::dim << " (ttl=" << rec.ttl << ")" << color::reset;
+        std::cout << "\n";
+    }
+    if (!ns_names.empty()) {
+        std::cout << color::yellow << std::left << std::setw(8) << "NS" << color::reset << ": ";
+        for (size_t i = 0; i < ns_names.size(); ++i) std::cout << (i ? ", " : "") << ns_names[i];
+        std::cout << "\n";
+    }
+    if (!mx_values.empty()) {
+        std::cout << color::yellow << std::left << std::setw(8) << "MX" << color::reset << ": ";
+        for (size_t i = 0; i < mx_values.size(); ++i) std::cout << (i ? ", " : "") << mx_values[i];
+        std::cout << "\n";
     }
 
     if (r.wildcard_dns) {
-        std::cout << color::bold << "\n:: Wildcard DNS detected" << color::reset
-                  << " -> " << r.wildcard_ip_sample
-                  << color::dim << "  (brute-force hits matching this IP are flagged wildcard_suspect)"
-                  << color::reset << "\n";
+        std::cout << "\n" << color::bold << color::yellow << "WILDCARD DETECTED: " << color::reset
+                   << "*." << r.domain << " -> " << r.wildcard_ip_sample << "\n";
     }
 
-    if (!r.axfr_attempts.empty()) {
-        std::cout << color::bold << "\n:: Zone transfer (AXFR) attempts\n" << color::reset;
-        for (auto& a : r.axfr_attempts) {
-            if (a.succeeded) {
-                std::cout << "  " << color::red << color::bold << "SUCCEEDED" << color::reset
-                          << " against " << a.ns_host << " (" << a.ns_ip << ") — "
-                          << a.records_pulled << " records pulled. Full zone contents exposed.\n";
-            } else {
-                std::cout << "  " << color::green << "refused" << color::reset
-                          << "  " << a.ns_host << " (" << a.ns_ip << "): " << a.error << "\n";
-            }
-        }
+    // ---- Email security -----------------------------------------------
+    report_section("EMAIL SECURITY");
+    std::cout << "SPF      : " << flag(r.mail_security.has_spf);
+    if (r.mail_security.has_spf) {
+        std::string low = r.mail_security.spf_record;
+        std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+        if (low.find("google") != std::string::npos) std::cout << color::dim << " (includes Google)" << color::reset;
     }
-
-    size_t brute = 0, mutated = 0, axfr = 0, cert = 0, certsp = 0, wb = 0, rdap_h = 0,
-           ht = 0, rdns = 0, otx = 0, urlscan_h = 0, dork = 0, ptr_h = 0, nsec_h = 0, wc = 0;
-    for (auto& [name, h] : r.hosts) {
-        for (auto s : h.sources) {
-            switch (s) {
-                case DiscoverySource::ActiveBruteForce: ++brute; break;
-                case DiscoverySource::ActiveMutatedBruteForce: ++mutated; break;
-                case DiscoverySource::ActiveZoneTransfer: ++axfr; break;
-                case DiscoverySource::PassiveCertLog: ++cert; break;
-                case DiscoverySource::PassiveCertspotter: ++certsp; break;
-                case DiscoverySource::PassiveWayback: ++wb; break;
-                case DiscoverySource::PassiveHackertarget: ++ht; break;
-                case DiscoverySource::PassiveRapidDns: ++rdns; break;
-                case DiscoverySource::PassiveOtx: ++otx; break;
-                case DiscoverySource::PassiveUrlscan: ++urlscan_h; break;
-                case DiscoverySource::PassiveDork: ++dork; break;
-                case DiscoverySource::ActivePtrSweep: ++ptr_h; break;
-                case DiscoverySource::ActiveNsecWalk: ++nsec_h; break;
-                default: break;
-            }
-        }
-        if (h.wildcard_suspect) ++wc;
-    }
-    (void)rdap_h;
-    std::cout << color::bold << "\n:: Subdomains — " << r.hosts.size() << " unique host(s)"
-              << color::reset << "\n"
-              << "  brute-force: " << brute << "   mutated: " << mutated << "   axfr: " << axfr
-              << "   crt.sh: " << cert << "   certspotter: " << certsp << "   wayback: " << wb << "\n"
-              << "  hackertarget: " << ht << "   rapiddns: " << rdns << "   otx: " << otx
-              << "   urlscan: " << urlscan_h << "   dork: " << dork
-              << (wc ? ("   " + color::dim + "wildcard_suspect: " + std::to_string(wc) + color::reset) : "")
-              << "\n";
-    {
-        std::vector<std::string> names;
-        names.reserve(r.hosts.size());
-        for (auto& [name, h] : r.hosts) names.push_back(name);
-        std::sort(names.begin(), names.end());
-        for (auto& name : names) {
-            const auto& h = r.hosts.at(name);
-            std::cout << "    " << (h.wildcard_suspect ? color::dim : color::white) << name << color::reset;
-            if (!h.ips.empty()) {
-                std::cout << "  -> ";
-                bool first = true;
-                for (auto& ip : h.ips) { if (!first) std::cout << ", "; std::cout << ip; first = false; }
-            }
-            std::cout << "\n";
-        }
-    }
-
-    if (!r.takeover_findings.empty()) {
-        std::cout << color::bold << color::red << "\n:: Possible subdomain takeovers\n" << color::reset;
-        for (auto& f : r.takeover_findings) {
-            std::cout << "  " << color::red << color::bold << f.hostname << color::reset
-                      << " -> " << f.matched_service
-                      << (f.http_confirmed ? (color::red + "  [HTTP-CONFIRMED]" + color::reset)
-                                            : (color::dim + "  [CNAME match only, unconfirmed]" + color::reset))
-                      << "\n";
-            std::cout << "    chain: ";
-            for (size_t i = 0; i < f.cname_chain.size(); ++i) {
-                if (i) std::cout << " -> ";
-                std::cout << f.cname_chain[i];
-            }
-            std::cout << "\n";
-        }
-    }
-
-    if (!r.srv_findings.empty()) {
-        std::cout << color::bold << "\n:: SRV records\n" << color::reset;
-        for (auto& s : r.srv_findings)
-            std::cout << "  " << s.service << "  " << s.target << ":" << s.port
-                       << color::dim << "  (priority=" << s.priority << ", weight=" << s.weight << ")"
-                       << color::reset << "\n";
-    }
-
-    if (!r.tlsa_findings.empty()) {
-        std::cout << color::bold << "\n:: TLSA (DANE) records\n" << color::reset;
-        for (auto& t : r.tlsa_findings)
-            std::cout << "  " << t.service << "  usage=" << (int)t.cert_usage
-                       << " selector=" << (int)t.selector << " matching=" << (int)t.matching_type
-                       << "  " << t.data_hex.substr(0, 24) << (t.data_hex.size() > 24 ? "..." : "") << "\n";
-    }
-    
-    if (!r.sshfp_findings.empty()) {
-        std::cout << color::bold << "\n:: SSHFP records\n" << color::reset;
-        for (auto& f : r.sshfp_findings)
-            std::cout << "  algo=" << (int)f.algorithm << " fptype=" << (int)f.fp_type
-                       << "  " << f.fingerprint_hex << "\n";
-    }
-
-    std::cout << color::bold << "\n:: Email security posture\n" << color::reset;
-    auto flag = [](bool b) { return b ? (color::green + "yes" + color::reset)
-                                       : (color::red + "no" + color::reset); };
-    std::cout << "  SPF: " << flag(r.mail_security.has_spf);
-    if (r.mail_security.has_spf) std::cout << "  " << color::dim << sanitize_echo(r.mail_security.spf_record) << color::reset;
-    std::cout << "\n  DMARC: " << flag(r.mail_security.has_dmarc);
-    if (r.mail_security.has_dmarc) std::cout << "  " << color::dim << sanitize_echo(r.mail_security.dmarc_record) << color::reset;
-    std::cout << "\n  BIMI: " << flag(r.mail_security.has_bimi)
-               << "   MTA-STS: " << flag(r.mail_security.has_mta_sts_dns)
-               << "   TLS-RPT: " << flag(r.mail_security.has_tls_rpt) << "\n";
-    if (!r.mail_security.dkim_selectors_found.empty()) {
-        std::cout << "  DKIM selectors found: ";
+    std::cout << "\nDMARC    : " << flag(r.mail_security.has_dmarc)
+               << "\nDKIM     : ";
+    if (r.mail_security.dkim_selectors_found.empty()) {
+        std::cout << color::red << "No" << color::reset;
+    } else {
         bool first = true;
-        for (auto& [sel, val] : r.mail_security.dkim_selectors_found) {
-            if (!first) std::cout << ", ";
-            std::cout << sel; first = false;
-        }
-        std::cout << "\n";
+        for (auto& [sel, val] : r.mail_security.dkim_selectors_found) { std::cout << (first ? "" : ", ") << sel; first = false; }
     }
+    std::cout << "\nBIMI     : " << flag(r.mail_security.has_bimi)
+               << "\nMTA-STS  : " << flag(r.mail_security.has_mta_sts_dns)
+               << "\nTLS-RPT  : " << flag(r.mail_security.has_tls_rpt) << "\n";
 
-    std::cout << color::bold << "\n:: DNSSEC\n" << color::reset
-              << "  DNSKEY: " << flag(r.dnssec.dnskey_present)
-              << " (" << r.dnssec.dnskey_count << ")"
-              << "   RRSIG observed: " << flag(r.dnssec.rrsig_seen) << "\n"
-              << "  DS at parent: " << flag(r.dnssec.ds_present_at_parent)
-              << "   NSEC3PARAM: " << flag(r.dnssec.nsec3param_present) << "\n"
-              << "  CDS (rollover): " << flag(r.dnssec.cds_present)
-              << "   CDNSKEY (rollover): " << flag(r.dnssec.cdnskey_present) << "\n";
-    if (r.nsec_walk.attempted) {
-        std::cout << "  NSEC walk: " << flag(r.nsec_walk.zone_signed)
-                   << "  names discovered: " << r.nsec_walk.names_from_bitmap_gaps.size()
-                   << (r.nsec_walk.wrapped ? "  (completed full loop)" : "")
-                   << color::dim << (r.nsec_walk.note.empty() ? "" : ("  " + r.nsec_walk.note)) << color::reset << "\n";
-    }
+    // ---- DNSSEC ---------------------------------------------------------
+    report_section("DNSSEC");
+    std::cout << "DNSKEY   : " << flag(r.dnssec.dnskey_present)
+               << "\nRRSIG    : " << flag(r.dnssec.rrsig_seen)
+               << "\nDS       : " << flag(r.dnssec.ds_present_at_parent) << "\n";
+    if (r.dnssec.nsec3param_present) std::cout << "NSEC3    : " << flag(true) << "\n";
+    if (r.dnssec.cds_present || r.dnssec.cdnskey_present)
+        std::cout << "ROLLOVER : CDS/CDNSKEY published\n";
+    if (r.nsec_walk.attempted && r.nsec_walk.zone_signed && !r.nsec_walk.names_from_bitmap_gaps.empty())
+        std::cout << "NSEC walk: " << r.nsec_walk.names_from_bitmap_gaps.size() << " name(s) discovered"
+                   << (r.nsec_walk.wrapped ? " (full loop)" : "") << "\n";
 
+    // ---- WHOIS ------------------------------------------------------------
     if (r.domain_whois.found) {
-        std::cout << color::bold << "\n:: WHOIS / RDAP\n" << color::reset
-                  << "  registrar: " << r.domain_whois.registrar << "\n"
-                  << "  created:   " << r.domain_whois.created << "\n"
-                  << "  updated:   " << r.domain_whois.updated << "\n"
-                  << "  expires:   " << r.domain_whois.expires << "\n";
+        report_section("WHOIS");
+        std::cout << "Registrar   " << r.domain_whois.registrar << "\n"
+                   << "Created     " << report_date_only(r.domain_whois.created) << "\n"
+                   << "Updated     " << report_date_only(r.domain_whois.updated) << "\n"
+                   << "Expires     " << report_date_only(r.domain_whois.expires) << "\n";
     }
 
+    // ---- Infrastructure (grouped by ASN) -----------------------------------
     if (!r.asn_lookups.empty()) {
-        std::cout << color::bold << "\n:: ASN / infrastructure\n" << color::reset;
-        for (auto& a : r.asn_lookups)
-            std::cout << "  " << a.ip << "  AS" << a.asn << " " << a.as_name
-                       << "  (" << a.prefix << ", " << a.country << ")"
-                       << color::dim << "  [" << a.source << "]" << color::reset << "\n";
+        std::map<std::string, std::string> asn_name;   // asn -> as_name (first seen)
+        std::map<std::string, std::vector<const AsnInfo*>> by_asn;
+        for (auto& a : r.asn_lookups) {
+            by_asn[a.asn].push_back(&a);
+            if (!asn_name.count(a.asn)) asn_name[a.asn] = a.as_name;
+        }
+        for (auto& [asn, items] : by_asn) {
+            report_section("INFRASTRUCTURE (AS" + asn + (asn_name[asn].empty() ? "" : (" - " + asn_name[asn])) + ")");
+            for (auto* a : items) {
+                std::cout << a->ip << std::string(a->ip.size() < 16 ? 16 - a->ip.size() : 2, ' ');
+                if (!a->prefix.empty()) {
+                    std::cout << "(" << a->prefix;
+                    if (!a->country.empty()) std::cout << ", " << a->country;
+                    std::cout << ")";
+                }
+                std::cout << "\n";
+            }
+        }
+        if (!r.sibling_prefixes.empty()) {
+            std::cout << color::dim << "Sibling prefixes: ";
+            for (size_t i = 0; i < r.sibling_prefixes.size(); ++i)
+                std::cout << (i ? ", " : "") << "AS" << r.sibling_prefixes[i].asn << " " << r.sibling_prefixes[i].prefix;
+            std::cout << color::reset << "\n";
+        }
     }
 
-    if (!r.sibling_prefixes.empty()) {
-        std::cout << color::bold << "\n:: Sibling BGP prefixes (same ASN)\n" << color::reset;
-        for (auto& p : r.sibling_prefixes)
-            std::cout << "  AS" << p.asn << "  " << p.prefix
-                       << (p.description.empty() ? "" : ("  " + color::dim + p.description + color::reset)) << "\n";
+    // ---- Subdomains, grouped by resolved IP --------------------------------
+    report_section("SUBDOMAINS (" + std::to_string(r.hosts.size()) + " unique)");
+    {
+        std::map<std::string, std::vector<std::string>> by_ip;   // ip -> hostnames
+        std::vector<std::string> unresolved;
+        for (auto& [name, h] : r.hosts) {
+            if (h.ips.empty()) { unresolved.push_back(name); continue; }
+            for (auto& ip : h.ips) by_ip[ip].push_back(name);
+        }
+        std::vector<std::pair<std::string, std::vector<std::string>>> groups(by_ip.begin(), by_ip.end());
+        std::sort(groups.begin(), groups.end(), [](auto& a, auto& b) {
+            return a.second.size() != b.second.size() ? a.second.size() > b.second.size() : a.first < b.first;
+        });
+        for (auto& [ip, names] : groups) {
+            std::sort(names.begin(), names.end());
+            std::cout << color::bold << "IP: " << color::reset << color::cyan << ip << color::reset
+                       << " (" << names.size() << (names.size() == 1 ? " host)" : " hosts)") << "\n";
+            report_columns(names, color::yellow);
+            std::cout << "\n";
+        }
+        if (!unresolved.empty()) {
+            std::sort(unresolved.begin(), unresolved.end());
+            std::cout << color::dim << "Unresolved (" << unresolved.size()
+                       << (unresolved.size() == 1 ? " host):" : " hosts):") << color::reset << "\n";
+            report_columns(unresolved, color::yellow);
+        }
     }
 
-    if (r.ptr_sweep.attempted) {
-        std::cout << color::bold << "\n:: Reverse PTR sweep\n" << color::reset
-                  << "  hosts checked: " << r.ptr_sweep.hosts_checked
-                  << "   PTR records found: " << r.ptr_sweep.ptrs.size();
-        if (!r.ptr_sweep.prefix_swept.empty()) std::cout << "   prefixes: " << r.ptr_sweep.prefix_swept;
-        std::cout << "\n";
-        if (opts.verbose)
-            for (auto& [ip, name] : r.ptr_sweep.ptrs) std::cout << "    " << ip << "  -> " << name << "\n";
+    // ---- Takeovers (always shown in full — this is the highest-severity
+    // finding this scan can produce, never summarize it away) --------------
+    if (!r.takeover_findings.empty()) {
+        report_section("POSSIBLE SUBDOMAIN TAKEOVERS");
+        for (auto& f : r.takeover_findings) {
+            std::cout << color::red << color::bold << f.hostname << color::reset
+                       << " -> " << f.matched_service
+                       << (f.http_confirmed ? (color::red + "  [HTTP-CONFIRMED]" + color::reset)
+                                             : (color::dim + "  [unconfirmed]" + color::reset)) << "\n";
+            std::cout << "  chain: ";
+            for (size_t i = 0; i < f.cname_chain.size(); ++i) std::cout << (i ? " -> " : "") << f.cname_chain[i];
+            std::cout << "\n";
+        }
     }
 
-    if (!r.wayback_urls_sample.empty()) {
-        std::cout << color::bold << "\n:: Wayback Machine sample (" << r.wayback_urls_sample.size()
-                   << " of possibly more)\n" << color::reset;
-        for (auto& u : r.wayback_urls_sample) std::cout << "  " << u << "\n";
+    // ---- Compact one-liners for the less commonly relevant findings -------
+    if (!r.srv_findings.empty() || !r.tlsa_findings.empty() || !r.sshfp_findings.empty()) {
+        report_section("SERVICE RECORDS");
+        for (auto& s : r.srv_findings)
+            std::cout << "SRV   " << s.service << " -> " << s.target << ":" << s.port
+                       << color::dim << " (prio=" << s.priority << ")" << color::reset << "\n";
+        for (auto& t : r.tlsa_findings)
+            std::cout << "TLSA  " << t.service << " usage=" << (int)t.cert_usage << "\n";
+        for (auto& f : r.sshfp_findings)
+            std::cout << "SSHFP algo=" << (int)f.algorithm << " " << f.fingerprint_hex << "\n";
     }
 
     if (!r.dork_hits.empty()) {
-        std::cout << color::bold << color::magenta << "\n:: Google dork hits\n" << color::reset;
-        for (auto& h : r.dork_hits)
-            std::cout << "  [" << h.query << "] " << h.title << "\n    " << h.url << "\n";
+        report_section("GOOGLE DORK HITS");
+        for (auto& h : r.dork_hits) std::cout << "[" << h.query << "] " << h.title << " - " << h.url << "\n";
     }
-    if (!r.dork_query_status.empty()) {
-        size_t blocked = 0;
-        for (auto& s : r.dork_query_status) if (s.blocked) ++blocked;
-        if (blocked > 0) {
-            std::cout << color::yellow << "\n  " << blocked << "/" << r.dork_query_status.size()
-                       << " dork queries were blocked/rate-limited:" << color::reset << "\n";
-            for (auto& s : r.dork_query_status)
-                if (s.blocked) std::cout << "    \"" << s.query << "\": " << s.block_reason << "\n";
+
+    // ---- Zone transfer ------------------------------------------------------
+    if (!r.axfr_attempts.empty()) {
+        report_section("ZONE TRANSFER (AXFR)");
+        size_t succeeded = 0;
+        for (auto& a : r.axfr_attempts) if (a.succeeded) ++succeeded;
+        if (succeeded == 0) {
+            std::cout << "All " << r.axfr_attempts.size() << " nameserver(s) refused or returned empty zone\n";
+        } else {
+            for (auto& a : r.axfr_attempts) {
+                if (a.succeeded)
+                    std::cout << color::red << color::bold << "SUCCEEDED" << color::reset << " against "
+                               << a.ns_host << " (" << a.ns_ip << ") - " << a.records_pulled
+                               << " records pulled. Full zone contents exposed.\n";
+                else
+                    std::cout << color::green << "refused" << color::reset << "  " << a.ns_host
+                               << " (" << a.ns_ip << ")\n";
+            }
         }
     }
 
-    if (!r.passive_source_status.empty()) {
-        std::cout << color::bold << "\n:: Passive source status\n" << color::reset;
-        for (auto& s : r.passive_source_status) {
-            std::string tag = s.rate_limited ? (color::yellow + "RATE-LIMITED" + color::reset)
-                             : s.ok           ? (color::green + "ok" + color::reset)
-                                              : (color::red + "failed" + color::reset);
-            std::cout << "  " << s.source_name << ": " << tag
-                       << "  (" << s.items_found << " item(s))"
-                       << (s.detail.empty() ? "" : ("  " + color::dim + s.detail + color::reset)) << "\n";
-        }
+    if (!r.ptr_sweep.ptrs.empty() && opts.verbose) {
+        report_section("REVERSE PTR SWEEP");
+        for (auto& [ip, name] : r.ptr_sweep.ptrs) std::cout << ip << " -> " << name << "\n";
     }
 
-    std::cout << color::dim << "\nactive phase: " << r.active_duration.count()
-              << "ms   passive phase: " << r.passive_duration.count() << "ms"
-              << color::reset << "\n";
+    // ---- Statistics -----------------------------------------------------
+    report_section("STATISTICS");
+    std::unordered_set<std::string> unique_ips;
+    for (auto& [name, h] : r.hosts) for (auto& ip : h.ips) unique_ips.insert(ip);
+    std::cout << std::left << std::setw(18) << "Total Subdomains" << ": " << r.hosts.size() << "\n"
+               << std::left << std::setw(18) << "Unique IPs" << ": " << unique_ips.size() << "\n";
+
+    std::vector<std::string> src_parts;
+    std::vector<std::string> issue_parts;
+    for (auto& s : r.passive_source_status) {
+        if (s.ok && s.items_found > 0) src_parts.push_back(s.source_name + "(" + std::to_string(s.items_found) + ")");
+        if (!s.ok || s.rate_limited) issue_parts.push_back(s.source_name + ": " + s.detail);
+    }
+    if (!src_parts.empty()) {
+        std::cout << std::left << std::setw(18) << "Sources" << ": ";
+        for (size_t i = 0; i < src_parts.size(); ++i) std::cout << (i ? ", " : "") << src_parts[i];
+        std::cout << "\n";
+    }
+    if (!issue_parts.empty()) {
+        std::cout << std::left << std::setw(18) << "Passive issues" << ": " << color::dim;
+        for (size_t i = 0; i < issue_parts.size(); ++i) std::cout << (i ? ", " : "") << issue_parts[i];
+        std::cout << color::reset << "\n";
+    }
+    std::cout << std::left << std::setw(18) << "Active Phase" << ": " << r.active_duration.count() << "ms\n"
+               << std::left << std::setw(18) << "Passive Phase" << ": " << report_thousands(r.passive_duration.count()) << "ms\n";
+
+    // ---- Stage 2: passive subdomain sources (ip.thc.org / subdomain.center
+    // / domainee.dev) --------------------------------------------------
+    // By this point r.stage2 is always populated and already merged into
+    // r.hosts (either by the block at the top of this function, or by the
+    // caller via run_dns_enum_two_stage() before it called us) — so
+    // SUBDOMAINS above already reflects the combined finds. Only the source
+    // status + timing need printing here; the subdomain grid itself would
+    // just repeat what SUBDOMAINS already showed.
+    if (opts.run_stage2)
+        print_stage2_subdomain_result(r.stage2, /*show_subdomain_list=*/false);
 }
 
 bool save_dns_enum_result(const DnsEnumResult& r, const std::string& path) {
@@ -2534,6 +2712,9 @@ bool save_dns_enum_result(const DnsEnumResult& r, const std::string& path) {
                 case DiscoverySource::PassiveUrlscan: srcs.push_back("passive_urlscan"); break;
                 case DiscoverySource::PassiveDork: srcs.push_back("passive_dork"); break;
                 case DiscoverySource::PassiveRipestat: srcs.push_back("passive_ripestat"); break;
+                case DiscoverySource::PassiveThcIp: srcs.push_back("passive_thc_ip"); break;
+                case DiscoverySource::PassiveSubdomainCenter: srcs.push_back("passive_subdomain_center"); break;
+                case DiscoverySource::PassiveDomainee: srcs.push_back("passive_domainee"); break;
             }
         }
         hj["sources"] = srcs;
@@ -2622,10 +2803,352 @@ bool save_dns_enum_result(const DnsEnumResult& r, const std::string& path) {
                                                 {"items_found", s.items_found}});
 
     j["wayback_sample"] = r.wayback_urls_sample;
-    j["timing_ms"] = {{"active", r.active_duration.count()}, {"passive", r.passive_duration.count()}};
+    j["timing_ms"] = {{"active", r.active_duration.count()}, {"passive", r.passive_duration.count()},
+                       {"stage2", r.stage2.duration.count()}};
+
+    j["stage2"] = {{"attempted", r.stage2.attempted}, {"hostnames", r.stage2.hostnames}};
+    json stage2_status = json::array();
+    for (auto& s : r.stage2.source_status)
+        stage2_status.push_back({{"source", s.source_name}, {"ok", s.ok},
+                                  {"detail", s.detail}, {"items_found", s.items_found}});
+    j["stage2"]["source_status"] = stage2_status;
 
     std::ofstream out(path);
     if (!out) return false;
     out << j.dump(2);
     return true;
+}
+
+// =======================================================================
+// Stage 2 — passive subdomain sources reproduced from sub.cpp
+// (ip.thc.org, api.subdomain.center, api.domainee.dev). Uses the same
+// libcurl plumbing as the rest of this file (curl_write_cb, the
+// shiv-dns-enum/1.0 UA, TLS verification) instead of sub.cpp's raw-socket
+// reproducer — this is the "real" integration, sub.cpp was just the
+// standalone repro used to nail down each source's request shape.
+// =======================================================================
+
+namespace {
+
+// Same as http_get() above but with optional extra request headers
+// (subdomain.center wants a Referer/Origin or it can 403). Kept local to
+// this stage since it's the only caller that needs custom headers.
+struct Stage2FetchResult {
+    bool ok = false;
+    long http_code = 0;
+    std::string body;
+    std::string error;
+};
+
+Stage2FetchResult stage2_http_get(const std::string& url,
+                                   const std::vector<std::pair<std::string, std::string>>& headers,
+                                   long timeout_ms) {
+    Stage2FetchResult out;
+    if (dns_enum_interrupted()) { out.error = "interrupted"; return out; }
+    CURL* curl = curl_easy_init();
+    if (!curl) { out.error = "curl_easy_init failed"; return out; }
+
+    curl_slist* hdr_list = nullptr;
+    for (auto& [k, v] : headers) {
+        std::string line = k + ": " + v;
+        hdr_list = curl_slist_append(hdr_list, line.c_str());
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "shiv-dns-enum/1.0");
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_apply_abort_on_interrupt(curl);
+    if (hdr_list) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdr_list);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    out.http_code = code;
+    out.ok = (rc == CURLE_OK && code >= 200 && code < 400);
+    if (rc != CURLE_OK) out.error = curl_easy_strerror(rc);
+    else if (!out.ok) out.error = "http " + std::to_string(code);
+
+    if (hdr_list) curl_slist_free_all(hdr_list);
+    curl_easy_cleanup(curl);
+    return out;
+}
+
+// ---- per-source parsers (mirrors parse_thcip/parse_subdomain_center/
+// parse_domainee in sub.cpp exactly) ------------------------------------
+
+std::vector<std::string> stage2_parse_thcip(const std::string& body) {
+    std::vector<std::string> out;
+    std::istringstream ss(body);
+    std::string line;
+    while (std::getline(ss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+            line.pop_back();
+        if (line.empty()) continue;
+        if (line.rfind(";;", 0) == 0) continue; // metadata/comment lines
+        out.push_back(line);
+    }
+    return out;
+}
+
+std::vector<std::string> stage2_parse_subdomain_center(const std::string& body) {
+    std::vector<std::string> out;
+    json j = json::parse(body, nullptr, false);
+    if (j.is_discarded() || !j.is_array()) return out;
+    for (auto& e : j) if (e.is_string()) out.push_back(e.get<std::string>());
+    return out;
+}
+
+std::vector<std::string> stage2_parse_domainee(const std::string& body) {
+    std::vector<std::string> out;
+    json j = json::parse(body, nullptr, false);
+    if (j.is_discarded() || j.value("ok", false) != true) return out;
+    if (!j.contains("data") || !j["data"].contains("subdomains")) return out;
+    for (auto& e : j["data"]["subdomains"])
+        if (e.contains("host")) out.push_back(e["host"].get<std::string>());
+    return out;
+}
+
+std::string stage2_normalize(std::string h) {
+    while (!h.empty() && h.back() == '.') h.pop_back();
+    std::transform(h.begin(), h.end(), h.begin(), ::tolower);
+    return h;
+}
+
+bool stage2_in_scope(const std::string& normalized, const std::string& domain) {
+    if (normalized.size() < domain.size()) return false;
+    return normalized.compare(normalized.size() - domain.size(), domain.size(), domain) == 0;
+}
+
+} // namespace
+
+Stage2SubdomainResult run_stage2_subdomain_enum(const std::string& domain, int timeout_ms,
+                                                 std::unordered_map<std::string, DiscoveredHost>* merge_into,
+                                                 int resolve_concurrency, bool use_edns0, int retries) {
+    Stage2SubdomainResult result;
+    result.attempted = true;
+    auto t0 = std::chrono::steady_clock::now();
+
+    struct SourceDef {
+        std::string name;
+        std::string url;
+        std::vector<std::pair<std::string, std::string>> headers;
+        std::vector<std::string> (*parser)(const std::string&);
+        DiscoverySource tag;
+    };
+    const std::vector<SourceDef> sources = {
+        {"thc.org", "https://ip.thc.org/sb/" + domain, {}, stage2_parse_thcip, DiscoverySource::PassiveThcIp},
+        {"subdomain.center", "https://api.subdomain.center/?domain=" + domain,
+         {{"Referer", "https://www.subdomain.center/"}, {"Origin", "https://www.subdomain.center"}},
+         stage2_parse_subdomain_center, DiscoverySource::PassiveSubdomainCenter},
+        {"domainee.dev", "https://api.domainee.dev/v1/tools/subdomain-finder?domain=" + domain, {},
+         stage2_parse_domainee, DiscoverySource::PassiveDomainee},
+    };
+
+    std::unordered_set<std::string> seen;
+    for (auto& src : sources) {
+        if (dns_enum_interrupted()) break;
+        Stage2SourceStatus st;
+        st.source_name = src.name;
+
+        auto r = stage2_http_get(src.url, src.headers, timeout_ms);
+        if (!r.ok) {
+            st.detail = !r.error.empty() ? r.error : ("http " + std::to_string(r.http_code));
+            result.source_status.push_back(std::move(st));
+            continue;
+        }
+
+        auto found = src.parser(r.body);
+        size_t added = 0;
+        for (auto& raw : found) {
+            std::string norm = stage2_normalize(raw);
+            if (norm.empty() || !stage2_in_scope(norm, domain)) continue;
+
+            if (seen.insert(norm).second) {
+                result.hostnames.push_back(norm);
+                ++added;
+            }
+            if (merge_into) {
+                auto& dh = (*merge_into)[norm];
+                dh.hostname = norm;
+                dh.sources.insert(src.tag);
+            }
+        }
+
+        st.ok = true;
+        st.items_found = added;
+        st.detail = "ok";
+        result.source_status.push_back(std::move(st));
+    }
+
+    std::sort(result.hostnames.begin(), result.hostnames.end());
+    result.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+
+    // ---- Resolve every unique hostname to its A/AAAA address(es) ----------
+    // Same vectorized/batched async engine stage 1 uses for brute force +
+    // mutation (dns_query_batch), wrapped in the same batch_with_retry()
+    // stage 1's apex/DNSSEC/DKIM/SRV/TLSA sweeps use — one concurrent wave of
+    // queries instead of a blocking round trip per hostname, PLUS a re-issue
+    // pass for anything that didn't answer the first time. At 300-500+ names
+    // fired at once, some UDP loss against public resolvers is normal; a
+    // single unretried pass was misreporting plenty of genuinely-live hosts
+    // (confirmed via manual nslookup) as unresolved. Stage 1's own passive
+    // resolve step has this same single-shot gap, it just runs against much
+    // smaller sets where the loss rarely shows up.
+    if (!result.hostnames.empty() && !dns_enum_interrupted()) {
+        auto t1 = std::chrono::steady_clock::now();
+        auto servers = active_server_list();
+
+        std::vector<AsyncDnsJob> resolve_jobs;
+        resolve_jobs.reserve(result.hostnames.size() * 2);
+        for (auto& name : result.hostnames) {
+            resolve_jobs.push_back({name, DnsRRType::A, name});
+            resolve_jobs.push_back({name, DnsRRType::AAAA, name});
+        }
+
+        auto resolved = batch_with_retry(resolve_jobs, servers, timeout_ms,
+                                          retries, resolve_concurrency, use_edns0);
+
+        // Track which names got a real, positive/definitive answer (covers a
+        // bare NXDOMAIN too — see AsyncDnsResult::answered) versus never
+        // getting a usable reply at all (timeout / unreachable resolver).
+        std::unordered_set<std::string> got_authoritative_reply;
+        for (auto& r : resolved) {
+            if (r.answered) got_authoritative_reply.insert(r.tag);
+            for (auto& rec : r.records)
+                if (rec.type == DnsRRType::A || rec.type == DnsRRType::AAAA)
+                    result.host_ips[r.tag].insert(rec.value);
+        }
+
+        // A name a nameserver positively answered for but that never produced
+        // an address record does not currently exist — these passive sources
+        // (subdomain.center, domainee.dev, thc.org) routinely surface names
+        // that were never actually provisioned. Drop those confirmed-dead
+        // entries instead of listing them as unresolved, mirroring stage 1's
+        // post-passive resolve step. Anything that never got an authoritative
+        // reply at all is genuinely unknown and kept in result.unresolved.
+        std::vector<std::string> survivors;
+        std::unordered_set<std::string> confirmed_dead;
+        survivors.reserve(result.hostnames.size());
+        for (auto& name : result.hostnames) {
+            bool has_addr = result.host_ips.count(name) && !result.host_ips[name].empty();
+            if (has_addr) {
+                survivors.push_back(name);
+            } else if (!got_authoritative_reply.count(name)) {
+                result.unresolved.push_back(name);
+                survivors.push_back(name);
+            } else {
+                confirmed_dead.insert(name); // authoritative reply, no address -> dropped
+            }
+        }
+        result.hostnames = std::move(survivors);
+        std::sort(result.unresolved.begin(), result.unresolved.end());
+
+        if (merge_into) {
+            for (auto& name : result.hostnames) {
+                auto it = merge_into->find(name);
+                if (it == merge_into->end()) continue;
+                auto ips_it = result.host_ips.find(name);
+                if (ips_it != result.host_ips.end())
+                    it->second.ips.insert(ips_it->second.begin(), ips_it->second.end());
+            }
+            // Drop confirmed-dead names from the shared map too, same as
+            // stage 1's post-passive resolve step — but only when nothing
+            // else (AXFR, brute force, another passive source) already gave
+            // this hostname a real address; ips.empty() guards that.
+            for (auto& name : confirmed_dead) {
+                auto it = merge_into->find(name);
+                if (it != merge_into->end() && it->second.ips.empty())
+                    merge_into->erase(it);
+            }
+        }
+
+        result.resolve_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t1);
+    }
+
+    return result;
+}
+
+void print_stage2_subdomain_result(const Stage2SubdomainResult& r, bool show_subdomain_list) {
+    report_section("STAGE 2: PASSIVE SUBDOMAIN SOURCES (thc.org / subdomain.center / domainee.dev)");
+
+    for (auto& s : r.source_status) {
+        std::cout << (s.ok ? color::green : color::red) << std::left << std::setw(20) << s.source_name
+                   << color::reset << ": ";
+        if (s.ok) std::cout << s.items_found << " new host(s)\n";
+        else      std::cout << color::dim << s.detail << color::reset << "\n";
+    }
+
+    // show_subdomain_list is false when the caller already merged these
+    // hosts into the combined SUBDOMAINS section above (run_dns_enum_two_stage
+    // does this before calling print_dns_enum_result) — printing the grid
+    // again here would just repeat the same hostnames a second time under a
+    // separate "STAGE 2" heading. Only the standalone fallback path (stage 2
+    // run without a hosts map to merge into) needs this grid to make the
+    // finds visible at all.
+    if (show_subdomain_list) {
+        // ---- Subdomains, grouped by resolved IP — same layout as stage 1's
+        // SUBDOMAINS section (report_columns), just fed from host_ips instead
+        // of DiscoveredHost::ips. -----------------------------------------------
+        std::cout << "\n" << color::bold << r.hostnames.size() << color::reset
+                   << " unique in-scope subdomain(s) from stage 2";
+        if (!r.host_ips.empty()) {
+            size_t resolved_count = 0;
+            for (auto& name : r.hostnames) if (r.host_ips.count(name)) ++resolved_count;
+            std::cout << " (" << resolved_count << " resolved)";
+        }
+        std::cout << ":\n";
+
+        std::map<std::string, std::vector<std::string>> by_ip;   // ip -> hostnames
+        for (auto& name : r.hostnames) {
+            auto it = r.host_ips.find(name);
+            if (it == r.host_ips.end()) continue;
+            for (auto& ip : it->second) by_ip[ip].push_back(name);
+        }
+        std::vector<std::pair<std::string, std::vector<std::string>>> groups(by_ip.begin(), by_ip.end());
+        std::sort(groups.begin(), groups.end(), [](auto& a, auto& b) {
+            return a.second.size() != b.second.size() ? a.second.size() > b.second.size() : a.first < b.first;
+        });
+        for (auto& [ip, names] : groups) {
+            std::sort(names.begin(), names.end());
+            std::cout << color::bold << "IP: " << color::reset << color::cyan << ip << color::reset
+                       << " (" << names.size() << (names.size() == 1 ? " host)" : " hosts)") << "\n";
+            report_columns(names, color::yellow);
+            std::cout << "\n";
+        }
+        if (!r.unresolved.empty()) {
+            std::cout << color::dim << "Unresolved (" << r.unresolved.size()
+                       << (r.unresolved.size() == 1 ? " host):" : " hosts):") << color::reset << "\n";
+            report_columns(r.unresolved, color::yellow);
+        }
+    }
+
+    std::cout << "\n" << std::left << std::setw(18) << "Stage 2 Fetch" << ": "
+               << r.duration.count() << "ms\n";
+    if (r.resolve_duration.count() > 0)
+        std::cout << std::left << std::setw(18) << "Stage 2 Resolve" << ": "
+                   << r.resolve_duration.count() << "ms\n";
+}
+
+DnsEnumResult run_dns_enum_two_stage(const std::string& domain, const DnsEnumOptions& opts) {
+    // ---- Stage 1: the existing full active+passive dns enum pass ----
+    DnsEnumResult result = run_dns_enum(domain, opts);
+
+    if (opts.run_stage2 && !dns_enum_interrupted())
+        result.stage2 = run_stage2_subdomain_enum(domain, opts.stage2_timeout_ms, &result.hosts,
+                                                   opts.active_concurrency, opts.use_edns0,
+                                                   opts.retries);
+
+    print_dns_enum_result(result, opts);
+
+    if (!opts.save_json_file.empty())
+        save_dns_enum_result(result, opts.save_json_file);
+
+    return result;
 }
