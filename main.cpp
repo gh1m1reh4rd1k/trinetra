@@ -100,6 +100,23 @@ static void print_shiv_enum_banner(const std::string& scan_name) {
                << shiv_enum_timestamp() << "\n";
 }
 
+static bool network_is_up() {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(53);
+    if (inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr) != 1) {
+        close(fd);
+        return false;
+    }
+
+    int rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    close(fd);
+    return rc == 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--server") {
         return server::run(argc, argv);
@@ -1633,6 +1650,11 @@ int main(int argc, char *argv[]) {
         {"--jatayu-scan", ScanType::JATAYU}, {"-sJ", ScanType::JATAYU}
     };
 
+    if (!network_is_up()) {
+        std::cerr << "network seems down, scan terminated\n";
+        return 0;
+    }
+
     while (arg_idx < argc) {
         std::string arg = argv[arg_idx];
         auto scan_it = scan_type_map.find(arg);
@@ -2102,7 +2124,7 @@ int main(int argc, char *argv[]) {
         config.print_filtered_if_few = true;
     }
     
-    if (ports.empty() || terminate_flag) {
+        if (ports.empty() || terminate_flag) {
         std::cerr << "No valid ports to scan.\n";
         return 1;
     }
