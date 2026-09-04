@@ -45,6 +45,7 @@ extern std::unordered_map<std::string, std::string> ip_to_domain_map;
 extern std::vector<std::string> g_dns_bypassed_targets;
 extern std::vector<std::string> g_dns_servers;
 extern std::vector<std::string> g_dns_tls_servers;
+extern std::string g_signature_conf_path;
 extern int g_target_ip_pref;
 extern bool g_saw_literal_target;
 extern struct termios g_orig_termios;
