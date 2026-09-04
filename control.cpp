@@ -1056,17 +1056,8 @@ struct HttpFingerprint {
     }
 };
 
+std::string g_signature_conf_path = "/usr/share/shiv/signatures.conf";
 
-/* =====================================================================
- * Platform / web-framework fingerprint signatures.
- *
- * All signature *data* (path substrings, JS globals, HTML attributes,
- * per-platform scoring rules, meta-tag hints, suppression rules) lives
- * in an external "signatures.conf" file next to the binary, in the
- * same spirit as nmap-service-probes for -sV. control.cpp keeps
- * only the matching *logic* -- adding a new CMS/framework signature is
- * a config-file edit, not a recompile.
- * ===================================================================== */
 
 struct PathSigEntry { std::string needle; std::string label; };
 struct AttrSigEntry { std::string attr;   std::string label; };
@@ -1283,7 +1274,7 @@ static const PlatformSignatureSet &platform_signatures()
 {
     static const PlatformSignatureSet sigs = [] {
         try {
-            return PlatformSignatureSet::loadFromFile("/usr/share/shiv/signatures.conf");
+            return PlatformSignatureSet::loadFromFile(g_signature_conf_path);
         } catch (const std::exception &e) {
             std::cerr << "[web-fp] failed to load signatures.conf: " << e.what()
                       << " -- platform/CMS detection disabled for this run\n";
@@ -1750,17 +1741,20 @@ static void extract_html_body_signals(const std::vector<u8> &resp,
                 scores[sr.suppressed_platform] = 0;
         }
 
-        // Pick winner (score >= 2 to avoid single-field false positives)
+                // Pick winner (score >= 2 to avoid single-field false positives)
         std::string best;
         int best_score = 1; // minimum threshold
+        bool any_qualified = false;
         for (const auto &[name, score] : scores) {
-            if (score > best_score) { best_score = score; best = name; }
+            if (score > best_score) { best_score = score; best = name; any_qualified = true; }
         }
 
         // If two platforms tie, report both
         std::vector<std::string> tied;
-        for (const auto &[name, score] : scores)
-            if (score == best_score && !name.empty()) tied.push_back(name);
+        if (any_qualified) {
+            for (const auto &[name, score] : scores)
+                if (score == best_score && !name.empty()) tied.push_back(name);
+        }
 
         if (tied.size() == 1)
             fp.body_platform_hint = tied[0] + " (score=" + std::to_string(best_score) + ")";
@@ -3523,16 +3517,21 @@ static std::vector<u8> capture_ssl(const std::string &ip, int port,
 }
 
 static bool ssl_port_check(const std::string &ip, int port,
-                            int connect_timeout_sec, bool verbose)
+                            int connect_timeout_sec, bool verbose,
+                            TlsCertInfo *cert_out = nullptr)
 {
-
     TlsCertInfo cert;
-    int check_timeout = std::min(connect_timeout_sec > 0 ? connect_timeout_sec : 3, 5);
-    auto r = capture_ssl(ip, port, check_timeout,nullptr,
+    int check_timeout = std::clamp(connect_timeout_sec > 0 ? connect_timeout_sec : 3, 1, 5);
+
+    auto r = capture_ssl(ip, port, check_timeout, nullptr,
                          verbose, &cert, check_timeout);
+
     bool tls_ok = cert.populated;
+    if (cert_out) *cert_out = cert;
+
     if (tls_ok) vlog::ok(verbose, "port " + std::to_string(port) + ": TLS confirmed", 2);
     else        vlog::fail(verbose, "port " + std::to_string(port) + ": TLS not supported (plain TCP)", 2);
+
     return tls_ok;
 }
 
@@ -4634,7 +4633,6 @@ static int probe_read_timeout(const AllProbes &probes, int port,
             if (ms > best_ms) best_ms = ms;
         }
     }
-    // Also check null probe (always exists, covers all ports)
     if (probes.nullProbe) {
         int ms = probes.nullProbe->getTotalWaitMs();
         if (ms > best_ms) best_ms = ms;
@@ -4642,7 +4640,6 @@ static int probe_read_timeout(const AllProbes &probes, int port,
 
     int probe_sec = (best_ms > 0) ? std::max(1, (best_ms + 999) / 1000) : 0;
 
-    // Use whichever is larger: probe-derived value or user's --timeout
     return std::max(default_sec, probe_sec);
 }
 
@@ -4652,8 +4649,8 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
     Args args;
     args.hostname       = target_ip;
     args.port           = target_port;
-    args.ip             = target_ip; 
-    const std::string &ip = args.ip; 
+    args.ip             = target_ip;
+    const std::string &ip = args.ip;
     args.verbose        = opts.verbose;
     args.timeout        = opts.timeout_sec;
     args.connect_timeout = opts.connect_timeout_sec;
@@ -4674,9 +4671,8 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
     {
         std::lock_guard<std::mutex> lk(g_probe_setup_mu);
 
-        g_verbose = args.verbose;   // gate all diagnostic stderr output
+        g_verbose = args.verbose;
 
-        // -- Populate global TLS config from the resolved options ---------------
         g_tls_config.ca_file     = args.tls_ca_file;
         g_tls_config.ca_path     = args.tls_ca_path;
         g_tls_config.client_cert = args.tls_cert;
@@ -4684,7 +4680,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
         g_tls_config.verify_peer = args.tls_verify;
         vlog::phase(g_verbose, "Resolving host");
         if (!args.host_override.empty()) {
-            // --host wins unconditionally
             effective_host = args.host_override;
             vlog::line(g_verbose, "--host override: using '" + effective_host + "' in Host: header");
         } else if (is_ip_literal(args.hostname)) {
@@ -4692,7 +4687,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                 effective_host = args.hostname;
                 vlog::line(g_verbose, "LAN IP " + args.hostname + ": skipping reverse-DNS, using IP directly");
             } else {
-                // Public IP — attempt reverse-DNS for correct virtual-host routing.
                 std::string rdns = resolve_ip_to_domain(args.hostname);
                 if (!rdns.empty()) {
                     effective_host = rdns;
@@ -4703,18 +4697,14 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                 }
             }
         } else {
-            // User gave a domain or URL-with-domain: use it directly
             effective_host = args.hostname;
         }
 
-        // SNI: explicit --tls-sni wins; otherwise use effective_host (domain, not IP)
-        // so TLS SNI is correct for virtual hosting
         g_tls_config.sni_name = args.tls_sni.empty() ? effective_host : args.tls_sni;
 
-        // Populate globals used by request builders
         g_hostname    = effective_host;
         g_target_path = args.path.empty() ? "/" : args.path;
-    } // lock released — network probing below runs unlocked/concurrently
+    }
 
     vlog::phase(g_verbose, "Target");
     vlog::kv(g_verbose, "Target",   args.target_raw);
@@ -4736,18 +4726,13 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
     vlog::kv(g_verbose, "Timeouts", "connect=" + std::to_string(args.connect_timeout) + "s  read=" +
               std::to_string(args.timeout) + "s  idle=" + std::to_string(std::max(2, args.timeout / 2)) + "s");
 
-    // -- 2. Parse probe file for network decisions -------------------------
     ProbeFileInfo pfi = parse_probe_file_info(args.probes_file);
 
-    // -- 3. Capture response -----------------------------------------------
     std::vector<u8>              response;
     std::string                  method_label;
     int                          proto_int = IPPROTO_TCP;
-    std::vector<HttpFingerprint> http_fps;   // accumulates all HTTP fingerprints
+    std::vector<HttpFingerprint> http_fps;
 
-    // Smart read timeout: derived from probe's totalwaitms for this port.
-    // Falls back to --timeout if no probe claims this port.
-    // compute proto_int for UDP early so probe_read_timeout uses correct proto
     if (args.udp) proto_int = IPPROTO_UDP;
     const int read_to = probe_read_timeout(probes, args.port, proto_int, args.timeout);
     vlog::kv(g_verbose, "Effective", "connect=" + std::to_string(args.connect_timeout) + "s  read=" +
@@ -4765,7 +4750,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
         if (pl && !pl->empty()) {
             udp_payload = *pl;
             const std::string &probe_host = g_hostname.empty() ? ip : g_hostname;
-	    substitute_probe_vars(udp_payload, probe_host, args.port);
+            substitute_probe_vars(udp_payload, probe_host, args.port);
             pl = &udp_payload;
         }
         response = capture_udp(ip, args.port, read_to, pl, args.verbose);
@@ -4782,7 +4767,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
     } else if (args.force_http) {
         vlog::line(g_verbose, "capturing HTTP response from " + ip + ":" + std::to_string(args.port) +
                    "  path: " + g_target_path, 1);
-        std::string hs = make_get_request(g_target_path, ip, args.port, /*is_ssl=*/false);
+        std::string hs = make_get_request(g_target_path, ip, args.port, false);
         std::vector<u8> payload(hs.begin(), hs.end());
         response = capture_tcp(ip, args.port, read_to, &payload, args.verbose,
                                args.connect_timeout);
@@ -4791,7 +4776,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
         if (!response.empty()) {
             int code = extract_status_code(response);
 
-            // -- Auto-detect: 4xx -> twin fingerprint (400-then-SSL) --------
             if (code >= 400 && code < 500) {
                 vlog::line(g_verbose, "force-http: got " + std::to_string(code) +
                            " -> attempting 400-SSL twin fingerprint", 1);
@@ -4801,17 +4785,13 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                     response     = std::move(twin.best_response);
                     method_label = "ssl-after-4xx";
                 }
-                // If SSL failed, response stays as the original 4xx bytes
-                // (fingerprint was already pushed into http_fps by twin helper)
             }
-            // -- Auto-detect: 3xx -> redirect dual fingerprint --------------
             else if (is_redirect(response)) {
                 response = follow_redirects_tcp_fp(ip, args.port, read_to,
                                                    args.verbose, std::move(response),
                                                    http_fps);
                 method_label = "http-redirect";
             } else {
-                // Plain non-redirect, non-error response — fingerprint it
                 http_fps.push_back(make_http_fingerprint(response, "http-initial", false));
             }
         }
@@ -4819,7 +4799,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
     } else if (args.force_https) {
         vlog::line(g_verbose, "capturing HTTPS response from " + ip + ":" + std::to_string(args.port) +
                    "  path: " + g_target_path, 1);
-        std::string hs = make_get_request(g_target_path, ip, args.port, /*is_ssl=*/true);
+        std::string hs = make_get_request(g_target_path, ip, args.port, true);
         std::vector<u8> payload(hs.begin(), hs.end());
         TlsCertInfo https_cert;
         response = capture_ssl(ip, args.port, read_to, &payload, args.verbose,
@@ -4827,7 +4807,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
         method_label = "https";
 
         if (!response.empty()) {
-            // -- Auto-detect: 3xx -> redirect dual fingerprint (scheme-aware) -
             if (is_redirect(response)) {
                 response = follow_redirects_ssl_fp(ip, args.port, read_to,
                                                    args.verbose, std::move(response),
@@ -4865,46 +4844,39 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                 vlog::fail(g_verbose, "udp: no response from " + ip + ":" + std::to_string(args.port), 1);
             goto capture_done;
         }
-
         bool is_ssl = false;
         if (dec.method == ScanMethod::SSL) {
-            vlog::line(g_verbose, "port " + std::to_string(args.port) +
-                       " is declared as sslports -- verifying TLS support (strict then permissive)", 1);
-
-            TlsCertInfo ssl_check_cert;
-            auto ssl_test = capture_ssl(ip, args.port, 3 /*sec*/, nullptr,
-                                        args.verbose, &ssl_check_cert,
-                                        args.connect_timeout);
-
-            if (!ssl_test.empty() || !ssl_check_cert.tls_version.empty()) {
-                vlog::ok(g_verbose, "strict TLS confirmed on port " + std::to_string(args.port), 2);
-            } else {
-                // Strict handshake failed -- try permissive SSL
-                vlog::fail(g_verbose, "strict TLS handshake failed on port " + std::to_string(args.port) +
-                           "; retrying with permissive SSL (all versions/ciphers, no cert validation)", 2);
-                TlsCertInfo perm_cert;
-                auto perm_test = capture_ssl_permissive(
-                    ip, args.port, 3 /*sec*/, nullptr,
-                    args.verbose, &perm_cert, args.connect_timeout);
-
-                if (!perm_test.empty() || !perm_cert.tls_version.empty()) {
-                    vlog::ok(g_verbose, "permissive SSL handshake succeeded on port " +
-                             std::to_string(args.port) + " (version: " + perm_cert.tls_version + ")", 2);
-                } else {
-                    vlog::fail(g_verbose, "permissive SSL also failed on port " + std::to_string(args.port) +
-                               "; port is declared sslports -- keeping SSL mode (not falling back to plain TCP)", 2);
+            is_ssl = true;
+            if (args.verbose) {
+                vlog::line(g_verbose, "port " + std::to_string(args.port) +
+                           " is declared as sslports -- verifying TLS support (diagnostic only)", 1);
+                TlsCertInfo ssl_check_cert;
+                bool strict_ok = ssl_port_check(ip, args.port, 3, args.verbose, &ssl_check_cert);
+                if (!strict_ok) {
+                    vlog::fail(g_verbose, "strict TLS handshake failed on port " + std::to_string(args.port) +
+                               "; retrying with permissive SSL for diagnostics", 2);
+                    TlsCertInfo perm_cert;
+                    auto perm_test = capture_ssl_permissive(
+                        ip, args.port, 3, nullptr, args.verbose, &perm_cert, args.connect_timeout);
+                    if (!perm_test.empty() || !perm_cert.tls_version.empty())
+                        vlog::ok(g_verbose, "permissive SSL handshake succeeded on port " +
+                                 std::to_string(args.port) + " (version: " + perm_cert.tls_version + ")", 2);
+                    else
+                        vlog::fail(g_verbose, "permissive SSL also failed on port " + std::to_string(args.port) +
+                                   "; port is declared sslports -- keeping SSL mode (not falling back to plain TCP)", 2);
                 }
             }
-            is_ssl = true;
         } else {
-            int precheck_to = std::min(2, args.connect_timeout > 0 ? args.connect_timeout : 2);
-            vlog::line(g_verbose, "port " + std::to_string(args.port) + " not declared as sslports -- "
-                       "running quick TLS pre-check (timeout=" + std::to_string(precheck_to) +
-                       "s) before plaintext probes", 1);
-            if (ssl_port_check(ip, args.port, precheck_to, args.verbose)) {
-                vlog::ok(g_verbose, "TLS confirmed on port " + std::to_string(args.port) +
-                         " despite not being in sslports; switching to SSL mode", 2);
-                is_ssl = true;
+            if (args.verbose) {
+                int precheck_to = std::min(2, args.connect_timeout > 0 ? args.connect_timeout : 2);
+                vlog::line(g_verbose, "port " + std::to_string(args.port) + " not declared as sslports -- "
+                           "running diagnostic TLS pre-check (timeout=" + std::to_string(precheck_to) +
+                           "s); real probing will still self-detect TLS if this is skipped", 1);
+                if (ssl_port_check(ip, args.port, precheck_to, args.verbose)) {
+                    vlog::ok(g_verbose, "TLS confirmed on port " + std::to_string(args.port) +
+                             " despite not being in sslports; switching to SSL mode", 2);
+                    is_ssl = true;
+                }
             }
         }
 
@@ -4921,14 +4893,12 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
 
         vlog::phase(g_verbose, "Probe planning");
 
-        /* Phase 1: NULL probe */
         if (probes.nullProbe) {
             int plen = 0; const u8 *ps = probes.nullProbe->getProbeString(&plen);
             vlog::line(g_verbose, std::string("phase 1: adding NULL probe '") + probes.nullProbe->getName() + "'", 1);
             add_attempt(probes.nullProbe->getName(), ps, plen);
         }
 
-        /* Phase 2: probes listing this port explicitly */
         int phase2_count = 0;
         for (ServiceProbe *sp : probes.probes) {
             if (sp->getProtocol() != IPPROTO_TCP) continue;
@@ -4943,7 +4913,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
         if (phase2_count == 0)
             vlog::line(g_verbose, "phase 2: no probes explicitly list port " + std::to_string(args.port), 1);
 
-        /* Phase 3: remaining probes up to intensity limit */
         int phase3_count = 0;
         for (ServiceProbe *sp : probes.probes) {
             if (sp->getProtocol() != IPPROTO_TCP) continue;
@@ -4998,8 +4967,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
 
                 {
                     std::string s(substituted_payload.begin(), substituted_payload.end());
-
-                    // Is it an HTTP/1.1 request?
                     bool is_http11_req = (s.size() >= 4 &&
                         (s.rfind("GET ",  0) == 0 ||
                          s.rfind("HEAD ", 0) == 0 ||
@@ -5007,17 +4974,13 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                         s.find("HTTP/1.1") != std::string::npos);
 
                     if (is_http11_req) {
-                        // Case-insensitive check: does it already have Host: ?
                         std::string sl = s;
                         for (char &c : sl) c = (char)tolower((unsigned char)c);
                         bool has_host = sl.find("\r\nhost:") != std::string::npos ||
                                         sl.rfind("host:", 0) == 0;
 
                         if (!has_host) {
-                            // Build the Host value the same way make_host_header does
                             std::string host_val = make_host_header(ip, args.port, is_ssl);
-
-                            // Find the terminal \r\n\r\n and insert Host: before it
                             size_t term = s.find("\r\n\r\n");
                             if (term != std::string::npos) {
                                 s = s.substr(0, term) +
@@ -5028,7 +4991,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                             }
                         }
 
-                        // Inject User-Agent if missing
                         {
                             std::string sl2 = s;
                             for (char &c : sl2) c = (char)tolower((unsigned char)c);
@@ -5100,7 +5062,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                         vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) +
                                    ": SSL retry also produced nothing usable; discarding the "
                                    "TLS-alert bytes and trying next probe over SSL", 2);
-                        continue; // do NOT accept the raw alert bytes as a match
+                        continue;
                     }
                     r = std::move(r_ssl);
                 }
@@ -5114,7 +5076,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                         vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": NULL probe got HTTP " +
                                    std::to_string(null_code) + " (not 200) on port " + std::to_string(args.port) +
                                    " -- web port, NULL probe incompatible; skipping to next probe", 2);
-                        continue;  // don't accept this response; try the next probe
+                        continue;
                     }
                 }
 
@@ -5149,7 +5111,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                    pa.name + "' got HTTP 400 Bad Request -> server is likely HTTP; "
                                    "falling back to GET / HTTP/1.1", 2);
 
-                        // Build a proper GET request with Host header
                         const std::string &probe_host = g_hostname.empty() ? ip : g_hostname;
                         std::string get_req = "GET / HTTP/1.1\r\n"
                                              "Host: " + probe_host + "\r\n"
@@ -5180,7 +5141,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                         }
                         vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) +
                                    ": HTTP GET fallback also got no response; keeping original 400", 2);
-                        // Fall through: accept the 400 as the final response
                     }
                 }
 
@@ -5204,7 +5164,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                             vlog::ok(g_verbose, "probe #" + std::to_string(attempt_idx) + ": Host-header retry got " +
                                      std::to_string(hr_code) + " (" + std::to_string(hr.size()) +
                                      " bytes) -- using this response", 2);
-                            // Fingerprint the new response and follow any redirect
                             if (is_redirect(hr)) {
                                 hr = follow_redirects_tcp_fp(ip, args.port, read_to,
                                                              args.verbose, std::move(hr),
@@ -5220,10 +5179,8 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                         }
                         vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) +
                                    ": Host-header retry also got no response; keeping original 400", 2);
-                        // Fall through: accept the 400 as the final response
                     }
 
-                    // -- Auto-detect: probe response is 3xx -> redirect FP --
                     if (is_redirect(r)) {
                         vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP probe '" +
                                    pa.name + "' got redirect -> dual FP follow", 2);
@@ -5234,7 +5191,6 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                         goto capture_done;
                     }
                 } else if (is_ssl && probe_is_http_req && is_redirect(r)) {
-                    // SSL probe got redirect -> dual FP follow over SSL
                     vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": SSL HTTP probe '" +
                                pa.name + "' got redirect -> SSL dual FP follow", 2);
                     r = follow_redirects_ssl_fp(ip, args.port, args.timeout,
@@ -5254,10 +5210,10 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
         }
 
         if (response.empty() && !terminate_flag) {
-	    vlog::line(g_verbose, "all probes exhausted, trying fallback chain", 1);
-	    response = capture_fallback(ip, args.port, args.timeout, args.verbose,
-		                        method_label, http_fps);
-	}
+            vlog::line(g_verbose, "all probes exhausted, trying fallback chain", 1);
+            response = capture_fallback(ip, args.port, args.timeout, args.verbose,
+                                        method_label, http_fps);
+        }
     }
 
 capture_done:
@@ -5284,7 +5240,6 @@ capture_done:
         vlog::kv(g_verbose, "Transport", final_ssl ? "TLS/SSL" : "plain TCP");
         vlog::kv(g_verbose, "HTTP FPs",  std::to_string(http_fps.size()));
 
-        /* Hex preview */
         fprintf(stderr, "\n%s%sResponse hex (%zu bytes)%s\n", vlog::GRAY(), vlog::BOLD(),
                 response.size(), vlog::RESET());
         for (size_t i = 0; i < response.size(); i++) {
@@ -5319,7 +5274,6 @@ capture_done:
         vlog::line(g_verbose, "first 200 bytes (ascii): " + ascii_preview, 1);
     }
 
-    // -- 4. Match response against probe database ---------------------------
     ServiceTunnel tunnel = final_ssl ? ServiceTunnel::SSL : ServiceTunnel::NONE;
 
     ProbeEngine engine(&probes, args.intensity);
@@ -5338,7 +5292,6 @@ capture_done:
         (u16)args.port, proto_int, tunnel,
         response.data(), (int)response.size());
 
-    // Ensure we have at least one fingerprint for direct (non-HTTP) responses
     if (http_fps.empty() && !response.empty()) {
         HttpFingerprint fp = make_http_fingerprint(response, "final-response", final_ssl);
         if (!fp.title.empty())
@@ -5361,7 +5314,6 @@ capture_done:
         }
     }
 
-    // -- 5. Print result ----------------------------------------------------
     {
         std::lock_guard<std::mutex> lk(g_stdout_mu);
         std::cout << std::left << std::setw(7) << target_port << ": ";
