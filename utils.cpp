@@ -28,10 +28,21 @@
 #include <linux/netlink.h>
 #include <functional>
 #include <cstdlib>
+#include <thread>
+#include <atomic>
+#include <unordered_set>
+#include "dns_enum.hpp"   // AsyncDnsJob / DnsRRType / dns_query_batch — shared vectorized DNS engine
 
 
 bool custom_dns_configured();
 bool resolve_ptr_via_configured_dns(const std::string& ip, std::string& out_domain);
+
+// Implemented in handler.cpp, where g_dns_servers/g_dns_tls_servers live.
+// Returns the plain-UDP --dns-servers list, or empty if only
+// --dns-servers-tls (DoT) was configured, or empty if nothing was set.
+// dns_query_batch() speaks plain UDP only, so an empty return here with
+// custom_dns_configured()==true means "DoT-only, can't be batched".
+std::vector<std::string> get_configured_plain_dns_servers();
 
 static inline uint64_t process_scalar_remainder(const uint8_t* data, int len) {
     uint64_t sum = 0;
@@ -569,62 +580,167 @@ void ptr_cache_store(const std::string& ip, const std::string& domain) {
     g_ptr_cache[ip] = domain;
 }
 
-std::string reverse_dns_lookup(const std::string& ip_address) {
-    std::string cached;
-    if (ptr_cache_lookup(ip_address, cached)) return cached;
-    if (custom_dns_configured()) {
-        std::string domain;
-        bool ok = resolve_ptr_via_configured_dns(ip_address, domain);
-        ptr_cache_store(ip_address, ok ? domain : "");
-        return ok ? domain : "";
+namespace {
+
+// PTR qname builders (in-addr.arpa / ip6.arpa). Small, self-contained
+// duplicates of the same logic dns_enum.cpp keeps private to itself —
+// kept local here rather than exported cross-file to avoid coupling two
+// translation units' internal helpers together.
+std::string reverse_arpa_v4(const std::string& ip) {
+    struct in_addr a{};
+    if (inet_pton(AF_INET, ip.c_str(), &a) != 1) return "";
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(&a.s_addr);
+    std::ostringstream ss;
+    ss << (int)b[3] << "." << (int)b[2] << "." << (int)b[1] << "." << (int)b[0] << ".in-addr.arpa";
+    return ss.str();
+}
+
+std::string reverse_arpa_v6(const std::string& ip) {
+    struct in6_addr a{};
+    if (inet_pton(AF_INET6, ip.c_str(), &a) != 1) return "";
+    std::ostringstream ss;
+    for (int i = 15; i >= 0; --i) {
+        uint8_t byte = a.s6_addr[i];
+        ss << std::hex << (byte & 0xF) << "." << ((byte >> 4) & 0xF) << ".";
     }
+    ss << "ip6.arpa";
+    return ss.str();
+}
 
-    // Build address — support both IPv4 and IPv6 targets.
-    struct sockaddr_storage ss{};
-    socklen_t ss_len = 0;
-    make_sockaddr_from_ip(ip_address, 0, ss, ss_len);
+std::string reverse_arpa(const std::string& ip) {
+    return (get_ip_version(ip.c_str()) == 4) ? reverse_arpa_v4(ip) : reverse_arpa_v6(ip);
+}
 
-    if (ss_len == 0) {
-        // Not a valid IPv4 or IPv6 literal.
-        ptr_cache_store(ip_address, "");
-        return "";
+} // namespace
+
+// Reads /etc/resolv.conf for "nameserver <ip>" lines. Used as the server
+// list for the batched raw-UDP engine whenever no --dns-servers override
+// is configured (plain getaddrinfo() has no concept of "servers", so it
+// can't back a vectorized batch — this is what lets the default path be
+// vectorized too, not just the --dns-servers path).
+std::vector<std::string> get_system_resolvers() {
+    std::vector<std::string> servers;
+    std::ifstream f("/etc/resolv.conf");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("nameserver", 0) != 0) continue;
+        std::istringstream iss(line);
+        std::string tag, ip;
+        iss >> tag >> ip;
+        if (!ip.empty() && get_ip_version(ip.c_str()) > 0) servers.push_back(ip);
     }
+    return servers;
+}
 
-    struct sockaddr_storage ss_copy = ss;
-    socklen_t ss_len_copy = ss_len;
-    struct DnsState {
-        std::mutex m;
-        std::condition_variable cv;
-        bool done = false;
-        int rc = -1;
-        std::string name;
-    };
-    auto state = std::make_shared<DnsState>();
+void reverse_dns_lookup_batch(const std::vector<std::string>& ips,
+                               std::unordered_map<std::string, std::string>& out_hostnames,
+                               int timeout_ms,
+                               int retries,
+                               int concurrency) {
+    out_hostnames.clear();
+    if (ips.empty()) return;
 
-    std::thread([state, ss_copy, ss_len_copy]() {
-        char hostname[NI_MAXHOST];
-        int rc = getnameinfo(
-            reinterpret_cast<const struct sockaddr*>(&ss_copy), ss_len_copy,
-            hostname, NI_MAXHOST, nullptr, 0, NI_NAMEREQD);
-        {
-            std::lock_guard<std::mutex> lock(state->m);
-            state->rc   = rc;
-            state->name = (rc == 0) ? std::string(hostname) : std::string{};
-            state->done = true;
+    // De-dupe and serve whatever's already cached without touching the
+    // network at all.
+    std::vector<std::string> to_query;
+    to_query.reserve(ips.size());
+    std::unordered_set<std::string> seen;
+    for (const auto& ip : ips) {
+        if (!seen.insert(ip).second) continue;
+        std::string cached;
+        if (ptr_cache_lookup(ip, cached)) {
+            if (!cached.empty()) out_hostnames[ip] = cached;
+            continue;
         }
-        state->cv.notify_all();
-    }).detach();
+        to_query.push_back(ip);
+    }
+    if (to_query.empty()) return;
 
-    std::string ret;
-    {
-        std::unique_lock<std::mutex> lock(state->m);
-        bool finished = state->cv.wait_for(lock, std::chrono::milliseconds(1500),
-                                            [&] { return state->done; });
-        if (finished && state->rc == 0) ret = state->name;
+    std::vector<std::string> servers = get_configured_plain_dns_servers();
+    bool dot_only = servers.empty() && custom_dns_configured();
+    if (servers.empty() && !dot_only) servers = get_system_resolvers();
+
+    if (!dot_only && !servers.empty()) {
+        // --- Vectorized path: one shared UDP socket pool, whole batch at once.
+        std::vector<AsyncDnsJob> jobs;
+        jobs.reserve(to_query.size());
+        for (auto& ip : to_query) {
+            std::string arpa = reverse_arpa(ip);
+            if (!arpa.empty()) jobs.push_back({arpa, DnsRRType::PTR, ip});
+        }
+
+        std::unordered_set<std::string> still_missing;
+        for (auto& ip : to_query) still_missing.insert(ip);
+
+        auto run_pass = [&](std::vector<AsyncDnsJob>& job_list) {
+            auto results = dns_query_batch(job_list, servers, timeout_ms, concurrency, /*use_edns0=*/true);
+            for (auto& r : results) {
+                std::string name;
+                for (auto& rec : r.records) {
+                    if (rec.type == DnsRRType::PTR && !rec.value.empty()) { name = rec.value; break; }
+                }
+                if (!name.empty()) {
+                    out_hostnames[r.tag] = name;
+                    ptr_cache_store(r.tag, name);
+                    still_missing.erase(r.tag);
+                } else if (r.answered) {
+                    // Definitive "no PTR" (e.g. NXDOMAIN) — cache the negative
+                    // so we don't re-query it next run.
+                    ptr_cache_store(r.tag, "");
+                    still_missing.erase(r.tag);
+                }
+                // else: no definitive answer yet (timeout/loss) — retried below.
+            }
+        };
+        run_pass(jobs);
+
+        for (int attempt = 1; attempt < retries && !still_missing.empty(); ++attempt) {
+            std::vector<AsyncDnsJob> retry_jobs;
+            retry_jobs.reserve(still_missing.size());
+            for (auto& ip : still_missing) {
+                std::string arpa = reverse_arpa(ip);
+                if (!arpa.empty()) retry_jobs.push_back({arpa, DnsRRType::PTR, ip});
+            }
+            if (retry_jobs.empty()) break;
+            run_pass(retry_jobs);
+        }
+        return;
     }
 
-    ptr_cache_store(ip_address, ret);
-    return ret;
+    // --- DoT-only fallback: raw UDP can't speak TLS, so this batch is
+    // resolved via a bounded thread pool over the existing single-target
+    // TLS PTR resolver. Capped lower than the UDP path since each lookup
+    // is a full TLS handshake, not a fire-and-forget datagram.
+    const int pool_size = std::max(1, std::min(concurrency, 64));
+    std::mutex out_mutex;
+    std::atomic<size_t> next{0};
+    auto worker = [&]() {
+        for (;;) {
+            size_t idx = next.fetch_add(1);
+            if (idx >= to_query.size()) return;
+            const std::string& ip = to_query[idx];
+            std::string domain;
+            bool ok = resolve_ptr_via_configured_dns(ip, domain);
+            std::lock_guard<std::mutex> lock(out_mutex);
+            ptr_cache_store(ip, ok ? domain : "");
+            if (ok && !domain.empty()) out_hostnames[ip] = domain;
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(pool_size);
+    for (int i = 0; i < pool_size; ++i) pool.emplace_back(worker);
+    for (auto& t : pool) t.join();
+}
+
+// Single-target convenience wrapper — kept for every existing call site
+// (scan.cpp etc.) that only has one IP in hand. Internally just runs the
+// vectorized engine with a batch of 1, so behavior/caching semantics stay
+// identical whether callers use the old or new entry point.
+std::string reverse_dns_lookup(const std::string& ip_address) {
+    std::unordered_map<std::string, std::string> out;
+    reverse_dns_lookup_batch({ip_address}, out, /*timeout_ms=*/2000, /*retries=*/2, /*concurrency=*/1);
+    auto it = out.find(ip_address);
+    return it != out.end() ? it->second : "";
 }
 
 bool get_interface_mac(int sock, const char* ifname, uint8_t* mac) {
