@@ -34,8 +34,10 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
+#include <atomic>
 #include "debug.hpp"
 #include "handler.hpp"
+#include "dns_enum.hpp"   // AsyncDnsJob / DnsRRType / dns_query_batch — shared vectorized DNS engine
 
 static int init_arp_ring(struct io_uring* ring, unsigned entries) {
     struct io_uring_params p{};
@@ -199,6 +201,18 @@ void expand_cidr(const std::string& cidr, std::vector<std::string>& ips);
 bool resolve_domain_to_ip(const std::string& domain, std::string& resolved_ip);
 bool custom_dns_configured();
 
+// Vectorized forward resolution (hostname -> IP). Resolves the whole batch
+// concurrently instead of one blocking getaddrinfo()/thread per name --
+// suitable for 1000+ hostnames in a single call. See definition below for
+// the exact server-selection and fallback rules.
+bool resolve_domain_to_ip_batch(const std::vector<std::string>& domains,
+                                 std::unordered_map<std::string, std::string>& out_ip,
+                                 std::unordered_map<std::string, std::vector<std::string>>& out_all_ips,
+                                 std::vector<std::string>& out_unresolved,
+                                 int timeout_ms = 2000,
+                                 int retries = 2,
+                                 int concurrency = 500);
+
 static bool parse_targets(
     std::vector<std::string>& tokens_in,   // caller pre-splits into tokens
     std::vector<std::string>& ips,         // output accumulator
@@ -215,8 +229,10 @@ static bool parse_targets(
     std::unordered_set<std::string>& seen = g_seen_target_ips;
     seen.reserve(seen.size() + seen_reserve);
 
-    std::unordered_map<std::string, std::string> dns_cache;
-    dns_cache.reserve(dns_reserve);
+    std::vector<std::string> pending_hostnames;      // domains seen this call, in order
+    std::unordered_set<std::string> pending_seen;    // de-dupe before the batch resolve
+    pending_hostnames.reserve(dns_reserve);
+    pending_seen.reserve(dns_reserve);
 
     size_t idx = 0;
     for (std::string& token : tokens_in) {
@@ -305,21 +321,10 @@ static bool parse_targets(
             }
 
             if (!normalize_ip_string(token, out_ip)) {
-                // Not an IP, try DNS resolution
-                auto it = dns_cache.find(token);
-                if (it != dns_cache.end()) {
-                    out_ip = it->second;
-                } else {
-                    if (!resolve_domain_to_ip(token, out_ip)) {
-                        std::cerr << "Cannot resolve '" << token
-                                  << "' at " << ctx.pos(idx) << "\n";
-                        return false;
-                    }
-                    dns_cache.emplace(token, out_ip);
-                }
-                // Remember the original hostname for this IP so grepable
-                // output can show "domain (ip)" instead of a bare IP.
-                ip_to_domain_map[out_ip] = token;
+                // Not a literal IP — defer to the single batch DNS pass
+                // after this loop instead of resolving one name at a time.
+                if (pending_seen.insert(token).second) pending_hostnames.push_back(token);
+                continue; // Step F's limit check runs after the batch resolve instead
             } else {
                 g_saw_literal_target = true;
                 if (custom_dns_configured()) {
@@ -335,6 +340,36 @@ static bool parse_targets(
             std::cerr << "Too many IPs after expansion (limit "
                       << MAX_TOTAL_IPS << ")\n";
             return false;
+        }
+    }
+
+    // ── Batch-resolve every hostname collected above in one shot ───────
+    // (instead of the old one-getaddrinfo-call-per-token loop). This is
+    // the actual concurrency win: everything in pending_hostnames goes
+    // through a single dns_query_batch() wave.
+    if (!pending_hostnames.empty()) {
+        std::unordered_map<std::string, std::string> resolved_ip;
+        std::unordered_map<std::string, std::vector<std::string>> resolved_all_ips;
+        std::vector<std::string> unresolved;
+        resolve_domain_to_ip_batch(pending_hostnames, resolved_ip, resolved_all_ips, unresolved);
+
+        if (!unresolved.empty()) {
+            std::cerr << "Cannot resolve '" << unresolved.front() << "'\n";
+            return false;
+        }
+
+        for (const auto& token : pending_hostnames) {
+            const std::string& out_ip = resolved_ip.at(token);
+            // Remember the original hostname for this IP so grepable
+            // output can show "domain (ip)" instead of a bare IP.
+            ip_to_domain_map[out_ip] = token;
+            add_unique_ip(bulk_ips, seen, out_ip);
+
+            if (ips.size() + bulk_ips.size() > MAX_TOTAL_IPS) {
+                std::cerr << "Too many IPs after expansion (limit "
+                          << MAX_TOTAL_IPS << ")\n";
+                return false;
+            }
         }
     }
 
@@ -1849,119 +1884,186 @@ bool resolve_ptr_via_custom_dns(const std::string& ip, std::string& out_domain,
     return false;
 }
 
-bool resolve_domain_to_ip(const std::string& domain, std::string& resolved_ip) {
-    resolved_ip.clear();
-    if (domain.empty() || domain.size() > 253) return false;
+// Returns the plain-UDP --dns-servers list, or empty if only
+// --dns-servers-tls (DoT) was configured, or empty if nothing was set.
+// dns_query_batch() speaks plain UDP only, so an empty return here with
+// custom_dns_configured()==true means "DoT-only, can't be batched" and
+// callers should fall back to a thread pool over the single-target TLS path.
+std::vector<std::string> get_configured_plain_dns_servers() {
+    return g_dns_servers;
+}
 
-    std::string host = domain;
-    trim_in_place(host);
-    if (host.empty() || has_bad_control_char(host)) return false;
-    if (normalize_ip_string(host, resolved_ip)) return true;
-    
+// Vectorized forward resolution (hostname -> IP). Resolves the whole
+// `domains` batch concurrently instead of one blocking call per name:
+//
+//   - Literal IP strings pass straight through, no DNS involved.
+//   - DoT-only (--dns-servers-tls): raw UDP can't pipeline TLS, so this
+//     falls back to a bounded thread pool over the existing single-target
+//     resolve_via_custom_dns_tls(), capped at 64 concurrent handshakes.
+//   - Plain --dns-servers, or (when nothing is configured) the system
+//     resolvers read from /etc/resolv.conf: both speak ordinary UDP, so
+//     the whole batch is fired through dns_query_batch() — the same
+//     vectorized engine dns_enum.cpp uses for subdomain brute force —
+//     two jobs per host (A + AAAA), `concurrency` in flight at once.
+//     A short retry pass re-issues anything that never got a definitive
+//     answer, since some UDP loss is normal at this volume.
+//
+// out_ip: hostname -> chosen address (honors g_target_ip_pref).
+// out_all_ips: hostname -> every address the response(s) contained (used
+//   to populate g_not_scanned_map exactly as the old single-target
+//   function did).
+// out_unresolved: hostnames that could not be resolved at all.
+// Returns true iff at least one hostname resolved.
+bool resolve_domain_to_ip_batch(const std::vector<std::string>& domains,
+                                 std::unordered_map<std::string, std::string>& out_ip,
+                                 std::unordered_map<std::string, std::vector<std::string>>& out_all_ips,
+                                 std::vector<std::string>& out_unresolved,
+                                 int timeout_ms,
+                                 int retries,
+                                 int concurrency) {
+    out_ip.clear();
+    out_all_ips.clear();
+    out_unresolved.clear();
+    if (domains.empty()) return false;
+
+    // 1) Validate, de-dupe, and let literal IPs pass straight through.
+    std::vector<std::string> to_query;
+    to_query.reserve(domains.size());
+    std::unordered_set<std::string> seen;
+    for (const auto& d : domains) {
+        std::string host = d;
+        trim_in_place(host);
+        if (host.empty() || host.size() > 253 || has_bad_control_char(host)) {
+            out_unresolved.push_back(d);
+            continue;
+        }
+        if (!seen.insert(host).second) continue;
+        std::string literal_ip;
+        if (normalize_ip_string(host, literal_ip)) { out_ip[host] = literal_ip; continue; }
+        to_query.push_back(host);
+    }
+    if (to_query.empty()) return !out_ip.empty();
+
+    // 2) DoT-only custom servers -- bounded thread pool over the existing
+    //    single-target TLS resolver (see comment above).
     if (!g_dns_tls_servers.empty()) {
-        if (resolve_via_custom_dns_tls(host, resolved_ip, g_dns_tls_servers)) return true;
-        std::cerr << "domain to ip resolution failed via --dns-servers-tls, can't perform without ip.\n";
-        return false;
-    }
-
-    if (!g_dns_servers.empty()) {
-        if (resolve_via_custom_dns(host, resolved_ip, g_dns_servers)) return true;
-        std::cerr << "domain to ip resolution failed via --dns-servers, can't perform without ip.\n";
-        return false;
-    }
-
-    auto attempt_once = [&host]() -> std::tuple<int, std::string, std::vector<std::string>> {
-        struct AddrState {
-            std::mutex m;
-            std::condition_variable cv;
-            bool done = false;
-            int rc = -1;
-            std::string ip;
-            std::vector<std::string> all_ips;
+        const int pool_size = std::max(1, std::min(concurrency, 64));
+        std::mutex out_mutex;
+        std::atomic<size_t> next{0};
+        auto worker = [&]() {
+            for (;;) {
+                size_t idx = next.fetch_add(1);
+                if (idx >= to_query.size()) return;
+                const std::string& host = to_query[idx];
+                std::string ip;
+                bool ok = resolve_via_custom_dns_tls(host, ip, g_dns_tls_servers);
+                std::lock_guard<std::mutex> lock(out_mutex);
+                if (ok) out_ip[host] = ip;
+                else    out_unresolved.push_back(host);
+            }
         };
-        auto state = std::make_shared<AddrState>();
+        std::vector<std::thread> pool;
+        pool.reserve(pool_size);
+        for (int i = 0; i < pool_size; ++i) pool.emplace_back(worker);
+        for (auto& t : pool) t.join();
+        return !out_ip.empty();
+    }
 
-        std::thread([state, host]() {
-            addrinfo hints{};
-            hints.ai_family   = AF_UNSPEC;   // fetch both A and AAAA in one query
-            hints.ai_socktype = SOCK_STREAM;
-            hints.ai_protocol = IPPROTO_TCP;
-            hints.ai_flags    = AI_ADDRCONFIG;
+    // 3) Plain custom servers, or the system resolver -- the real
+    //    vectorized path. Both speak ordinary UDP, so route the whole
+    //    batch through dns_query_batch(), two jobs per host (A + AAAA).
+    std::vector<std::string> servers = !g_dns_servers.empty() ? g_dns_servers : get_system_resolvers();
+    if (servers.empty()) {
+        std::cerr << "resolve_domain_to_ip_batch: no DNS servers available "
+                     "(resolv.conf unreadable and no --dns-servers set)\n";
+        for (auto& h : to_query) out_unresolved.push_back(h);
+        return !out_ip.empty();
+    }
 
-            addrinfo* result = nullptr;
-            int rc = getaddrinfo(host.c_str(), nullptr, &hints, &result);
-            std::string ip_out;
-            std::vector<std::string> collected;
-            if (rc == 0 && result) {
-                struct Guard { addrinfo* p; ~Guard(){ if(p) freeaddrinfo(p); } } g{result};
-                rc = EAI_NONAME;
+    std::unordered_map<std::string, std::vector<std::string>> v4, v6;
+    std::unordered_set<std::string> answered_hosts;
 
-                // Collect every A/AAAA address the DNS response returned.
-                for (addrinfo* rp = result; rp; rp = rp->ai_next) {
-                    if (rp->ai_family == AF_INET && rp->ai_addr &&
-                        rp->ai_addrlen >= static_cast<socklen_t>(sizeof(sockaddr_in))) {
-                        const auto* sa = reinterpret_cast<const sockaddr_in*>(rp->ai_addr);
-                        char buf[INET_ADDRSTRLEN];
-                        if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) collected.emplace_back(buf);
-                    } else if (rp->ai_family == AF_INET6 && rp->ai_addr &&
-                               rp->ai_addrlen >= static_cast<socklen_t>(sizeof(sockaddr_in6))) {
-                        const auto* sa = reinterpret_cast<const sockaddr_in6*>(rp->ai_addr);
-                        char buf[INET6_ADDRSTRLEN];
-                        if (inet_ntop(AF_INET6, &sa->sin6_addr, buf, sizeof(buf))) collected.emplace_back(buf);
-                    }
-                }
-
-                if (g_target_ip_pref == 6) {
-                    for (const auto& c : collected) {
-                        if (c.find(':') != std::string::npos) { ip_out = c; rc = 0; break; }
-                    }
-                } else if (g_target_ip_pref == 4) {
-                    for (const auto& c : collected) {
-                        if (c.find(':') == std::string::npos) { ip_out = c; rc = 0; break; }
-                    }
-                } else {
-                    for (const auto& c : collected) {
-                        if (c.find(':') == std::string::npos) { ip_out = c; rc = 0; break; }
-                    }
-                    if (rc != 0 && !collected.empty()) { ip_out = collected.front(); rc = 0; }
-                }
+    auto run_pass = [&](std::vector<AsyncDnsJob>& job_list) {
+        auto results = dns_query_batch(job_list, servers, timeout_ms, concurrency, /*use_edns0=*/true);
+        for (auto& r : results) {
+            if (r.answered) answered_hosts.insert(r.tag);
+            for (auto& rec : r.records) {
+                if (rec.type == DnsRRType::A)    v4[r.tag].push_back(rec.value);
+                if (rec.type == DnsRRType::AAAA) v6[r.tag].push_back(rec.value);
             }
-            {
-                std::lock_guard<std::mutex> lock(state->m);
-                state->rc      = rc;
-                state->ip      = ip_out;
-                state->all_ips = std::move(collected);
-                state->done    = true;
-            }
-            state->cv.notify_all();
-        }).detach();
-
-        std::unique_lock<std::mutex> lock(state->m);
-        bool finished = state->cv.wait_for(lock, std::chrono::milliseconds(2000),
-                                            [&] { return state->done; });
-        if (!finished) return {-1, std::string{}, std::vector<std::string>{}};
-        return {state->rc, state->ip, state->all_ips};
+        }
     };
 
-    int rc = 0;
-    for (int attempt = 1; attempt <= 2; ++attempt) {
-        auto [code, ip, all_ips] = attempt_once();
-        rc = code;
+    std::vector<AsyncDnsJob> jobs;
+    jobs.reserve(to_query.size() * 2);
+    for (auto& host : to_query) {
+        jobs.push_back({host, DnsRRType::A,    host});
+        jobs.push_back({host, DnsRRType::AAAA, host});
+    }
+    run_pass(jobs);
 
-        if (rc == 0 && !ip.empty()) {
-            resolved_ip = ip;
-            for (const auto& other : all_ips) {
-                if (other != ip) g_not_scanned_map[ip].push_back(other);
-            }
-            return true;
+    // Retry pass: re-issue only for hosts that never got a definitive
+    // answer at all (packet loss is expected at hundreds of in-flight
+    // UDP queries) -- a host that got a real NXDOMAIN is not retried.
+    for (int attempt = 1; attempt < retries; ++attempt) {
+        std::vector<AsyncDnsJob> leftover;
+        leftover.reserve(to_query.size() * 2);
+        for (auto& host : to_query) {
+            if (answered_hosts.count(host)) continue;
+            leftover.push_back({host, DnsRRType::A,    host});
+            leftover.push_back({host, DnsRRType::AAAA, host});
         }
-
-        if (rc == EAI_FAIL || rc == EAI_NONAME) break;
-        if (attempt < 2) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (leftover.empty()) break;
+        run_pass(leftover);
     }
 
-    //std::cerr << "domain to ip resolution failed, can't perform without ip.\n";
-    return false;
+    // 4) Apply g_target_ip_pref and populate outputs, exactly matching
+    //    the old single-target function's selection rules.
+    for (auto& host : to_query) {
+        auto& all4 = v4[host];
+        auto& all6 = v6[host];
+
+        if (g_target_ip_pref == 6 && all6.empty()) { out_unresolved.push_back(host); continue; }
+        if (g_target_ip_pref == 4 && all4.empty()) { out_unresolved.push_back(host); continue; }
+
+        std::string chosen;
+        if (g_target_ip_pref == 6)      chosen = all6.front();
+        else if (g_target_ip_pref == 4) chosen = all4.front();
+        else if (!all4.empty())         chosen = all4.front();
+        else if (!all6.empty())         chosen = all6.front();
+
+        if (chosen.empty()) { out_unresolved.push_back(host); continue; }
+
+        std::vector<std::string> all;
+        all.reserve(all4.size() + all6.size());
+        all.insert(all.end(), all4.begin(), all4.end());
+        all.insert(all.end(), all6.begin(), all6.end());
+
+        out_ip[host] = chosen;
+        out_all_ips[host] = all;
+        for (auto& other : all) if (other != chosen) g_not_scanned_map[chosen].push_back(other);
+    }
+
+    return !out_ip.empty();
+}
+
+// Single-target convenience wrapper — kept for every existing call site
+// (the target-token parser above, etc.) that only has one hostname in
+// hand. Internally just runs the vectorized engine with a batch of 1, so
+// selection/caching semantics stay identical to calling the batch entry
+// point directly. For resolving many hostnames at once, call
+// resolve_domain_to_ip_batch() directly instead of looping this — looping
+// this still serializes one DNS round trip per call.
+bool resolve_domain_to_ip(const std::string& domain, std::string& resolved_ip) {
+    resolved_ip.clear();
+    std::unordered_map<std::string, std::string> out_ip;
+    std::unordered_map<std::string, std::vector<std::string>> out_all_ips;
+    std::vector<std::string> unresolved;
+    resolve_domain_to_ip_batch({domain}, out_ip, out_all_ips, unresolved,
+                                /*timeout_ms=*/2000, /*retries=*/2, /*concurrency=*/2);
+    if (out_ip.empty()) return false;
+    resolved_ip = out_ip.begin()->second; // batch of 1 -- only one possible entry
+    return true;
 }
 
 bool custom_dns_configured() {
