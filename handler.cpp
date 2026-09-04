@@ -3589,4 +3589,6 @@ void print_full_help() {
 		std::cerr << "                                            For eg: shiv --server --server-port 9443\n\n";
 }
 
-void load_signature_config(const std::string &path);
+void load_signature_config(const std::string &path) {
+    g_signature_conf_path = path;
+}
