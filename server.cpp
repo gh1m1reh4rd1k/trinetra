@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <atomic>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -61,14 +62,8 @@ pid_t g_running_pid = -1;
 
 std::string g_token;
 std::string g_self_path;
-// Whether TLS (via stunnel) is actually fronting this server. Used to decide
-// whether the session cookie can safely carry the `Secure` attribute --
-// setting `Secure` on a cookie handed out over a plaintext-only fallback
-// would just make browsers silently refuse to store it.
 bool g_secure_cookies = false;
 
-// Per-source-IP failed-auth tracking, so a token can't be brute-forced by
-// hammering the endpoint. Single-threaded event loop, so no locking needed.
 std::unordered_map<std::string, std::pair<int, std::time_t>> g_auth_fail;
 
 bool set_cloexec(int fd) {
@@ -287,16 +282,13 @@ std::string render_terminal_page(const std::string& token) {
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         "<title>shiv</title><style>"
         "html,body{height:100%;margin:0;background:#0b0f10;color:#d7e2e2;"
-        "font-family:ui-monospace,Menlo,Consolas,monospace;font-size:16px;line-height:1.45;"
+        "font-family:ui-monospace,Menlo,Consolas,monospace;font-size:14px;"
         "font-weight:700}"
         "#term{height:100%;overflow-y:auto;box-sizing:border-box;padding:10px 12px;"
-        "white-space:pre-wrap;word-break:break-word;-webkit-overflow-scrolling:touch;"
-        "-webkit-user-select:text;user-select:text}"
+        "white-space:pre-wrap;word-break:break-word;-webkit-overflow-scrolling:touch}"
         ".banner{color:#7a8a87}"
         ".line{display:flex}"
-        ".prompt{flex:none;white-space:pre}"
-        ".prompt-user{color:#ff5f5f}"
-        ".prompt-rest{color:#5fd3a3}"
+        ".prompt{flex:none;color:#5fd3a3;white-space:pre}"
         ".typed{flex:1;white-space:pre-wrap;word-break:break-word}"
         ".cmdline{flex:1;background:transparent;color:inherit;border:none;outline:none;"
         "font:inherit;font-weight:inherit;caret-color:#5fd3a3;padding:0;margin:0;min-width:1px}"
@@ -310,8 +302,7 @@ std::string render_terminal_page(const std::string& token) {
         "</div>"
         "<script>\n"
         "const TOKEN = \"" << html_escape(token) << "\";\n"
-        "const PROMPT_USER = 'root';\n"
-        "const PROMPT_REST = '@shiv:~> ';\n"
+        "const PROMPT = 'root@shiv:~> ';\n"
         "const term = document.getElementById('term');\n"
         "let history = [];\n"
         "let histPos = 0;\n"
@@ -401,14 +392,7 @@ std::string render_terminal_page(const std::string& token) {
         "  line.className = 'line';\n"
         "  const prompt = document.createElement('span');\n"
         "  prompt.className = 'prompt';\n"
-        "  const promptUser = document.createElement('span');\n"
-        "  promptUser.className = 'prompt-user';\n"
-        "  promptUser.textContent = PROMPT_USER;\n"
-        "  const promptRest = document.createElement('span');\n"
-        "  promptRest.className = 'prompt-rest';\n"
-        "  promptRest.textContent = PROMPT_REST;\n"
-        "  prompt.appendChild(promptUser);\n"
-        "  prompt.appendChild(promptRest);\n"
+        "  prompt.textContent = PROMPT;\n"
         "  const input = document.createElement('input');\n"
         "  input.className = 'cmdline';\n"
         "  input.autocomplete = 'off';\n"
@@ -533,14 +517,7 @@ std::string render_terminal_page(const std::string& token) {
         "  }\n"
         "});\n"
         "\n"
-        "term.addEventListener('click', () => {\n"
-        "  // Don't steal focus back to the input if this click is the tail end\n"
-        "  // of a text selection drag -- refocusing here used to clear/interrupt\n"
-        "  // the user's selection, making it impossible to copy output.\n"
-        "  const sel = window.getSelection();\n"
-        "  if (sel && sel.toString().length > 0) return;\n"
-        "  if (activeInput) activeInput.focus();\n"
-        "});\n"
+        "term.addEventListener('click', () => { if (activeInput) activeInput.focus(); });\n"
         "newPromptLine();\n"
         "</script></body></html>";
     return html.str();
@@ -692,12 +669,6 @@ void queue_and_flush(std::shared_ptr<Connection> c, const std::string& data) {
     if (!flush_outbuf(c)) close_connection(c);
 }
 
-// Common security headers applied to every response: no framing (clickjacking),
-// no MIME sniffing, no referrer leakage, a tight CSP (the terminal page is
-// 100% inline script/style and same-origin fetches, so this can be strict),
-// HSTS for when we *are* reached over TLS (browsers ignore it over plaintext,
-// so it's harmless to always send), and no caching of anything -- this app
-// only ever serves secrets and live command output.
 std::string security_headers() {
     std::ostringstream h;
     h << "X-Frame-Options: DENY\r\n"
@@ -744,9 +715,6 @@ void send_simple_response(std::shared_ptr<Connection> c, int code, const char* s
     }
 }
 
-// Checks rate-limit + token together; on failure it has already written the
-// appropriate error response (429 or 401) to the connection. Callers must
-// return immediately when this returns false.
 bool require_auth(std::shared_ptr<Connection> c, const std::string& provided) {
     if (auth_rate_limited(c->peer_ip)) {
         send_simple_response(c, 429, "Too Many Requests", "text/plain",
@@ -876,9 +844,6 @@ void on_child_pipe_readable(std::shared_ptr<Connection> c) {
 
 void dispatch(std::shared_ptr<Connection> c, const HttpRequest& req) {
     if (req.method == "GET" && (req.path == "/" || req.path == "/index.html")) {
-        // Prefer an already-established session cookie, so a bookmarked or
-        // history-recalled URL with a stale/absent ?token= doesn't just 401 --
-        // and so the token doesn't have to keep riding around in the URL bar.
         auto cookies = parse_cookies(header_value(req, "cookie"));
         auto cit = cookies.find(kCookieName);
         if (cit != cookies.end() && tokens_match(cit->second, g_token)) {
@@ -891,9 +856,6 @@ void dispatch(std::shared_ptr<Connection> c, const HttpRequest& req) {
         std::string provided = it != q.end() ? it->second : std::string();
         if (!require_auth(c, provided)) return;
 
-        // Valid token via the URL: promote it to an HttpOnly session cookie
-        // and redirect to a clean "/" so the token stops sitting in the
-        // address bar, browser history, and any future Referer header.
         std::ostringstream head;
         head << "HTTP/1.1 303 See Other\r\n"
              << "Location: /\r\n"
@@ -972,10 +934,6 @@ void on_client_readable(std::shared_ptr<Connection> c) {
             return;
         }
 
-        // We don't support chunked/streaming request bodies at all -- only a
-        // bounded Content-Length. Reject Transfer-Encoding outright instead
-        // of silently ignoring it, to avoid any request-smuggling ambiguity
-        // between this app and anything that might sit in front of it.
         if (req.headers.find("transfer-encoding") != req.headers.end()) {
             send_simple_response(c, 400, "Bad Request", "text/plain",
                                   "Transfer-Encoding is not supported\n");
@@ -1036,10 +994,6 @@ void on_listener_readable(int listen_fd) {
     }
 }
 
-// Slowloris guard: a client that opens a connection and never finishes
-// sending headers would otherwise hold an fd (and a Connection object)
-// forever. Swept periodically rather than on every loop iteration to keep
-// this cheap.
 void sweep_idle_connections() {
     static std::time_t last_sweep = 0;
     std::time_t now = std::time(nullptr);
@@ -1114,22 +1068,53 @@ bool ensure_tls_cert() {
 bool write_stunnel_config(int tls_port) {
     std::ofstream out(kStunnelConfPath, std::ios::trunc);
     if (!out) return false;
-    out << "[shiv]\n"
-        << "accept = " << tls_port << "\n"
+    out << "foreground = yes\n"
+        << "[shiv]\n"
+        << "accept = 0.0.0.0:" << tls_port << "\n"
         << "connect = 127.0.0.1:" << kDefaultPort << "\n"
         << "cert = " << kStunnelCertPath << "\n"
-        // Pin the protocol/cipher floor explicitly instead of trusting
-        // whatever the installed stunnel/openssl defaults happen to be.
         << "sslVersionMin = TLSv1.2\n"
-        << "options = NO_SSLv2\n"
-        << "options = NO_SSLv3\n"
-        << "options = NO_TLSv1\n"
-        << "options = NO_TLSv1.1\n"
         << "ciphers = HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA\n";
     return out.good();
 }
 
-bool wait_for_port_listening(int port, int max_attempts = 20, int delay_us = 100000) {
+std::vector<int> pids_listening_on_port(int port) {
+    std::vector<int> pids;
+    std::string cmd = "ss -H -tlnp 'sport = :" + std::to_string(port) + "' 2>/dev/null";
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return pids;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), p)) {
+        std::string line(buf);
+        size_t pos = line.find("pid=");
+        while (pos != std::string::npos) {
+            int pid = std::atoi(line.c_str() + pos + 4);
+            if (pid > 0) pids.push_back(pid);
+            pos = line.find("pid=", pos + 4);
+        }
+    }
+    pclose(p);
+    return pids;
+}
+
+std::string process_comm(int pid) {
+    std::ifstream f("/proc/" + std::to_string(pid) + "/comm");
+    std::string name;
+    std::getline(f, name);
+    return name;
+}
+
+std::string process_exe_path(int pid) {
+    char buf[4096];
+    std::string link = "/proc/" + std::to_string(pid) + "/exe";
+    ssize_t n = readlink(link.c_str(), buf, sizeof(buf) - 1);
+    if (n <= 0) return "";
+    buf[n] = '\0';
+    return std::string(buf, static_cast<size_t>(n));
+}
+
+bool wait_for_port_listening(int port, std::vector<std::string>* occupants = nullptr,
+                              int max_attempts = 20, int delay_us = 100000) {
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd >= 0) {
@@ -1140,6 +1125,14 @@ bool wait_for_port_listening(int port, int max_attempts = 20, int delay_us = 100
             int rc = connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
             close(fd);
             if (rc == 0) return true;
+        }
+        if (occupants) {
+            for (int pid : pids_listening_on_port(port)) {
+                std::string tag = std::to_string(pid) + " (" +
+                                   (process_comm(pid).empty() ? "unknown" : process_comm(pid)) + ")";
+                if (std::find(occupants->begin(), occupants->end(), tag) == occupants->end())
+                    occupants->push_back(tag);
+            }
         }
         usleep(static_cast<useconds_t>(delay_us));
     }
@@ -1160,22 +1153,118 @@ void print_captured_stunnel_output() {
     if (!any) std::cerr << "(stunnel produced no output -- it may have exited before printing anything)\n";
 }
 
+void print_systemd_unit_failure(const std::string& unit) {
+    std::string cmd = "journalctl -u " + unit + " -n 20 --no-pager 2>/dev/null";
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return;
+    char buf[512];
+    bool any = false;
+    while (fgets(buf, sizeof(buf), p)) {
+        if (!any) { std::cerr << unit << " journal:\n"; any = true; }
+        std::cerr << "  " << buf;
+    }
+    pclose(p);
+    if (!any) std::cerr << "(no journal output for " << unit << " -- is journald running?)\n";
+}
+
+void clear_stale_listener(int tls_port) {
+    std::system("systemctl stop stunnel4 >/dev/null 2>&1");
+    std::system("systemctl stop stunnel@shiv >/dev/null 2>&1");
+    std::string pkill_cmd = std::string("pkill -f '") + kStunnelConfPath + "' >/dev/null 2>&1";
+    if (std::system(pkill_cmd.c_str()) != 0) {}
+    constexpr int kMaxAttempts        = 20;
+    constexpr int kSigkillAfterAttempt = 10;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        auto pids = pids_listening_on_port(tls_port);
+        if (pids.empty()) return;
+
+        bool killed_any = false;
+        for (int pid : pids) {
+            std::string comm = process_comm(pid);
+            if (comm.find("stunnel") != std::string::npos) {
+                kill(pid, attempt < kSigkillAfterAttempt ? SIGTERM : SIGKILL);
+                killed_any = true;
+            } else {
+                std::cerr << "Port " << tls_port << " is already in use by pid " << pid
+                           << " (" << (comm.empty() ? "unknown process" : comm)
+                           << "), which isn't stunnel -- leaving it alone. Pick a "
+                              "different --server-port or stop that process yourself.\n";
+            }
+        }
+        if (!killed_any) return;
+        usleep(100000);
+    }
+    for (int pid : pids_listening_on_port(tls_port)) {
+        std::string comm = process_comm(pid);
+        if (comm.find("stunnel") != std::string::npos) {
+            std::cerr << "Port " << tls_port << " is still held by stunnel pid " << pid
+                       << " after SIGTERM/SIGKILL -- it may be stuck (e.g. uninterruptible "
+                          "I/O). The next start attempt may still fail with "
+                          "\"Address already in use\".\n";
+        }
+    }
+}
+
+bool looks_like_shiv(int pid) {
+    if (process_comm(pid) == "shiv") return true;
+    std::string exe = process_exe_path(pid);
+    return !exe.empty() && !g_self_path.empty() && exe == g_self_path;
+}
+
+void clear_stale_shiv_listener(int port) {
+    pid_t self = getpid();
+    constexpr int kMaxAttempts        = 20;
+    constexpr int kSigkillAfterAttempt = 10;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        auto pids = pids_listening_on_port(port);
+        bool killed_any = false;
+        for (int pid : pids) {
+            if (pid == self) continue;  // nothing of ours is listening yet at this point
+            if (looks_like_shiv(pid)) {
+                kill(pid, attempt < kSigkillAfterAttempt ? SIGTERM : SIGKILL);
+                killed_any = true;
+            } else {
+                std::string comm = process_comm(pid);
+                std::cerr << "Port " << port << " is already in use by pid " << pid
+                           << " (" << (comm.empty() ? "unknown process" : comm)
+                           << "), which isn't shiv -- leaving it alone. Stop that "
+                              "process yourself before starting shiv --server.\n";
+            }
+        }
+        if (!killed_any) return;
+        usleep(100000);
+    }
+    for (int pid : pids_listening_on_port(port)) {
+        if (pid == self) continue;
+        if (looks_like_shiv(pid)) {
+            std::cerr << "Port " << port << " is still held by a previous shiv pid " << pid
+                       << " after SIGTERM/SIGKILL -- it may be stuck (e.g. uninterruptible "
+                          "I/O). The bind() below may still fail with "
+                          "\"Address already in use\".\n";
+        }
+    }
+}
+
 bool start_stunnel(int tls_port) {
+    clear_stale_listener(tls_port);
     bool started = false;
     bool used_manual_launch = false;
+    std::string started_via_unit;
     if (std::system("systemctl restart stunnel4 >/dev/null 2>&1") == 0) {
         started = true;
+        started_via_unit = "stunnel4";
     } else if (std::system("systemctl restart stunnel@shiv >/dev/null 2>&1") == 0) {
         started = true;
+        started_via_unit = "stunnel@shiv";
     } else {
         used_manual_launch = true;
         std::string pkill_cmd = std::string("pkill -f '") + kStunnelConfPath + "' >/dev/null 2>&1; ";
         if (std::system(pkill_cmd.c_str()) != 0) {}
         std::string log_redirect = std::string(" >") + kStunnelManualLogPath + " 2>&1";
-        std::string cmd = "stunnel " + std::string(kStunnelConfPath) + log_redirect;
+        std::string cmd = "stunnel " + std::string(kStunnelConfPath) + log_redirect + " &";
         started = (std::system(cmd.c_str()) == 0);
         if (!started) {
-            std::string cmd4 = "stunnel4 " + std::string(kStunnelConfPath) + log_redirect;
+            std::string cmd4 = "stunnel4 " + std::string(kStunnelConfPath) + log_redirect + " &";
             started = (std::system(cmd4.c_str()) == 0);
         }
     }
@@ -1184,11 +1273,29 @@ bool start_stunnel(int tls_port) {
         return false;
     }
 
-    if (!wait_for_port_listening(tls_port)) {
-        std::cerr << "stunnel did not come up listening on port " << tls_port
-                   << ". Something else may already be bound to it -- check with:\n"
-                      "  sudo ss -tlnp | grep " << tls_port << "\n";
-        if (used_manual_launch) print_captured_stunnel_output();
+    std::vector<std::string> occupants;
+    if (!wait_for_port_listening(tls_port, &occupants)) {
+        std::cerr << "stunnel did not come up listening on port " << tls_port << ".\n";
+        if (!occupants.empty()) {
+            std::cerr << "While waiting, this was seen holding the port (even briefly):\n";
+            for (const auto& o : occupants) std::cerr << "  pid " << o << "\n";
+        } else {
+            std::cerr << "No process was observed holding port " << tls_port
+                       << " at any point during the ~2s wait either. That means whatever's "
+                          "conflicting is faster than this check can catch, or the bind is "
+                          "failing for a reason unrelated to another occupant (e.g. a "
+                          "dual-stack IPv4/IPv6 edge case, or an LSM like SELinux/AppArmor "
+                          "denying the bind). Useful next steps:\n"
+                          "  watch -n 0.05 'sudo ss -tlnp | grep " << tls_port << "'   "
+                          "(run this in another terminal while retrying, to try to catch it live)\n"
+                          "  sudo dmesg | tail -50                                    "
+                          "(check for LSM denials around the time of the failure)\n";
+        }
+        if (used_manual_launch) {
+            print_captured_stunnel_output();
+        } else if (!started_via_unit.empty()) {
+            print_systemd_unit_failure(started_via_unit);
+        }
         return false;
     }
     std::string ufw_cmd = "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | "
@@ -1269,6 +1376,7 @@ int run(int argc, char* argv[]) {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
     signal(SIGCHLD, SIG_DFL);
+    clear_stale_shiv_listener(kDefaultPort);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (listen_fd < 0) {
@@ -1318,9 +1426,6 @@ int run(int argc, char* argv[]) {
     } else {
         tls_ready = true;
     }
-    // Only mark cookies Secure when they'll actually be delivered over TLS --
-    // a Secure cookie handed out on a plaintext fallback would just be
-    // silently dropped by the browser, breaking login.
     g_secure_cookies = tls_ready;
 
     if (tls_ready) {
