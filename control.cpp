@@ -1770,6 +1770,59 @@ static void extract_html_body_signals(const std::vector<u8> &resp,
     if (!fp.is_redirect) fp.spa_locations = extract_spa_locations(body);
 }
 
+static std::vector<u8> dechunk_body(const u8 *body_ptr, size_t body_len)
+{
+    std::vector<u8> out;
+    out.reserve(body_len); // final size <= encoded size
+
+    size_t pos = 0;
+    while (pos < body_len) {
+        // ---- find end of the chunk-size line (terminated by \r\n) -------
+        size_t line_end = pos;
+        while (line_end + 1 < body_len &&
+               !(body_ptr[line_end] == '\r' && body_ptr[line_end + 1] == '\n'))
+            ++line_end;
+        if (line_end + 1 >= body_len) break; // malformed / truncated
+
+        // Chunk-size may have extensions after ';' (e.g. "1a3;foo=bar") —
+        // only the hex digits before ';' matter.
+        size_t size_str_len = line_end - pos;
+        std::string size_field(reinterpret_cast<const char *>(body_ptr + pos), size_str_len);
+        size_t semi = size_field.find(';');
+        if (semi != std::string::npos) size_field.resize(semi);
+
+        // Trim any stray whitespace
+        while (!size_field.empty() && isspace((unsigned char)size_field.back()))
+            size_field.pop_back();
+
+        size_t chunk_size = 0;
+        char *endptr = nullptr;
+        chunk_size = std::strtoul(size_field.c_str(), &endptr, 16);
+        if (endptr == size_field.c_str()) break; // not valid hex — malformed
+
+        size_t data_start = line_end + 2; // skip the \r\n after the size line
+
+        if (chunk_size == 0) break; // terminating chunk — trailer/final CRLF follows, ignore
+
+        if (data_start + chunk_size > body_len) {
+            // Truncated/incomplete final chunk (e.g. connection cut mid-read):
+            // take what we have and stop rather than reading out of bounds.
+            size_t avail = body_len - data_start;
+            out.insert(out.end(), body_ptr + data_start, body_ptr + data_start + avail);
+            break;
+        }
+
+        out.insert(out.end(), body_ptr + data_start, body_ptr + data_start + chunk_size);
+
+        pos = data_start + chunk_size;
+        // Skip the trailing \r\n that follows each chunk's data
+        if (pos + 1 < body_len && body_ptr[pos] == '\r' && body_ptr[pos + 1] == '\n')
+            pos += 2;
+    }
+
+    return out;
+}
+
 static std::vector<u8> decompress_body(const std::vector<u8> &resp)
 {
     // ---- 1. Find header/body boundary ------------------------------------
@@ -1790,13 +1843,39 @@ static std::vector<u8> decompress_body(const std::vector<u8> &resp)
 
     // ---- 2. Extract Content-Encoding value (lowercase) -------------------
     std::string ce = extract_header(resp, "Content-Encoding");
-    if (ce.empty()) return resp; // nothing to do
+
+    // ---- 2a. Extract Transfer-Encoding and dechunk first if needed -------
+    std::string te = extract_header(resp, "Transfer-Encoding");
+    for (char &c : te) c = (char)tolower((unsigned char)c);
+
+    const u8 *raw_body_ptr = resp.data() + hdr_end;
+    size_t    raw_body_len = resp.size() - hdr_end;
+
+    std::vector<u8> dechunked_storage; // keeps dechunked bytes alive if used
+    const u8 *body_ptr = raw_body_ptr;
+    size_t    body_len = raw_body_len;
+
+    if (te.find("chunked") != std::string::npos) {
+        dechunked_storage = dechunk_body(raw_body_ptr, raw_body_len);
+        body_ptr = dechunked_storage.data();
+        body_len = dechunked_storage.size();
+    }
+
+    if (ce.empty()) {
+        // No Content-Encoding: if we dechunked, we still need to hand back
+        // the dechunked plaintext body instead of the wire-framed original.
+        if (te.find("chunked") != std::string::npos) {
+            std::vector<u8> out;
+            out.reserve(hdr_end + body_len);
+            out.insert(out.end(), resp.begin(), resp.begin() + (std::ptrdiff_t)hdr_end);
+            out.insert(out.end(), body_ptr, body_ptr + body_len);
+            return out;
+        }
+        return resp; // nothing to do
+    }
 
     // Lowercase for comparison
     for (char &c : ce) c = (char)tolower((unsigned char)c);
-
-    const u8 *body_ptr = resp.data() + hdr_end;
-    size_t    body_len = resp.size() - hdr_end;
 
     std::vector<u8> decompressed;
     bool success = false;
@@ -1887,11 +1966,15 @@ static std::vector<u8> decompress_body(const std::vector<u8> &resp)
 #else
     else if (ce.find("br") != std::string::npos)
     {
-        // Brotli not compiled in — return raw response unchanged.
+        // Brotli not compiled in — return the (already dechunked) body unchanged.
         // Build with -DHAVE_BROTLI -lbrotlidec to enable.
         fprintf(stderr, "  [decompress] br encoding detected but Brotli not compiled in"
                         " — body will be undecompressed\n");
-        return resp;
+        std::vector<u8> out;
+        out.reserve(hdr_end + body_len);
+        out.insert(out.end(), resp.begin(), resp.begin() + (std::ptrdiff_t)hdr_end);
+        out.insert(out.end(), body_ptr, body_ptr + body_len);
+        return out;
     }
 #endif
 
@@ -1921,12 +2004,25 @@ static std::vector<u8> decompress_body(const std::vector<u8> &resp)
     {
         fprintf(stderr, "  [decompress] zstd encoding detected but libzstd not compiled in"
                         " — body will be undecompressed\n");
-        return resp;
+        std::vector<u8> out;
+        out.reserve(hdr_end + body_len);
+        out.insert(out.end(), resp.begin(), resp.begin() + (std::ptrdiff_t)hdr_end);
+        out.insert(out.end(), body_ptr, body_ptr + body_len);
+        return out;
     }
 #endif
 
     // ---- 4. Reassemble response: headers + decompressed body -------------
-    if (!success || decompressed.empty()) return resp; // keep original on failure
+    if (!success || decompressed.empty()) {
+        // Compression failed (or unrecognized ce) — still return the
+        // dechunked-but-not-decompressed body rather than the raw wire
+        // bytes, so downstream code never sees leftover chunk framing.
+        std::vector<u8> out;
+        out.reserve(hdr_end + body_len);
+        out.insert(out.end(), resp.begin(), resp.begin() + (std::ptrdiff_t)hdr_end);
+        out.insert(out.end(), body_ptr, body_ptr + body_len);
+        return out;
+    }
 
     std::vector<u8> out;
     out.reserve(hdr_end + decompressed.size());
@@ -5036,6 +5132,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                 args.connect_timeout);
             }
 
+            bool switched_to_ssl_midstream = false;
             if (!r.empty()) {
                 if (!is_ssl && looks_like_tls_record(r)) {
                     char tls_hdr[16];
@@ -5046,6 +5143,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                "switching to SSL and retrying this probe instead of accepting it", 2);
 
                     is_ssl = true;
+                    switched_to_ssl_midstream = true;
 
                     TlsCertInfo retry_cert;
                     std::vector<u8> r_ssl = capture_ssl(ip, args.port, probe_first_byte_to, pl,
@@ -5101,7 +5199,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                         ps_start.rfind("HEAD ", 0) == 0 ||
                                         ps_start.rfind("POST ", 0) == 0);
                 }
-                if (!probe_is_http_req && !is_ssl) {
+                if (!probe_is_http_req && (!is_ssl || switched_to_ssl_midstream)) {
                     int non_http_code = extract_status_code(r);
                     bool looks_http_resp = (r.size() >= 5 &&
                                             r[0]=='H' && r[1]=='T' && r[2]=='T' &&
@@ -5119,8 +5217,15 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                              "Connection: close\r\n\r\n";
                         std::vector<u8> get_payload(get_req.begin(), get_req.end());
 
-                        auto hr = capture_tcp(ip, args.port, read_to, &get_payload, args.verbose,
-                                              args.connect_timeout);
+                        std::vector<u8> hr;
+                        TlsCertInfo fallback_cert;
+                        if (is_ssl) {
+                            hr = capture_ssl(ip, args.port, read_to, &get_payload, args.verbose,
+                                             &fallback_cert, args.connect_timeout);
+                        } else {
+                            hr = capture_tcp(ip, args.port, read_to, &get_payload, args.verbose,
+                                             args.connect_timeout);
+                        }
                         if (!hr.empty()) {
                             int hr_code = extract_status_code(hr);
                             vlog::ok(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP GET fallback got " +
@@ -5133,7 +5238,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                 method_label = "http-get-fallback-redirect/" + pa.name;
                             } else {
                                 http_fps.push_back(
-                                    make_http_fingerprint(hr, "http-get-fallback", false));
+                                    make_http_fingerprint(hr, "http-get-fallback", is_ssl));
                                 method_label = "http-get-fallback/" + pa.name;
                             }
                             response = std::move(hr);
