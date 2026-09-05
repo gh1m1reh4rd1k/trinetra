@@ -4039,6 +4039,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     state.retry_send_deferred = false;
                     state.syn_sent_time = now;   // real send time, for accurate RTT
                     tx_ts_table[pidx].store(0, std::memory_order_release);
+                    tx_ts_precise[pidx].store(false, std::memory_order_release);
                     real_tx_ts_us[pidx].store(0, std::memory_order_release);
                     replied_this_attempt[pidx].store(false, std::memory_order_release);
                     probe_outstanding[pidx].store(false, std::memory_order_release);
@@ -4142,7 +4143,6 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     }
 
                     state.retry_count++;
-                    port_generation[pidx].fetch_add(1, std::memory_order_relaxed);
                     state.start_time    = now;
                     state.syn_sent_time = now;
                     state.sent_tsval    = 1234567;
