@@ -1168,10 +1168,10 @@ void print_systemd_unit_failure(const std::string& unit) {
 }
 
 void clear_stale_listener(int tls_port) {
-    std::system("systemctl stop stunnel4 >/dev/null 2>&1");
-    std::system("systemctl stop stunnel@shiv >/dev/null 2>&1");
+    [[maybe_unused]] int rc_stop1 = std::system("systemctl stop stunnel4 >/dev/null 2>&1");
+    [[maybe_unused]] int rc_stop2 = std::system("systemctl stop stunnel@shiv >/dev/null 2>&1");
     std::string pkill_cmd = std::string("pkill -f '") + kStunnelConfPath + "' >/dev/null 2>&1";
-    if (std::system(pkill_cmd.c_str()) != 0) {}
+    [[maybe_unused]] int rc_pkill = std::system(pkill_cmd.c_str());
     constexpr int kMaxAttempts        = 20;
     constexpr int kSigkillAfterAttempt = 10;
     for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
