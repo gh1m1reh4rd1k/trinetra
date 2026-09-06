@@ -1081,9 +1081,6 @@ struct SuppressRule {
     std::string suppressed_platform;
 };
 
-// Registry of HttpFingerprint string fields addressable by name from signatures.conf,
-// used only by the FieldAnyNonEmpty rule kind. Extend this list if a new signature
-// needs to reference a field that isn't here yet.
 static const std::unordered_map<std::string, std::string HttpFingerprint::*> &
 platform_field_registry()
 {
@@ -2523,27 +2520,8 @@ static HttpFingerprint merge_http_fingerprints(
     return merged;
 }
 
-// ============================================================================
-// Version-line renderer
-//
-// Output model: up to kMaxSlots (10) "info" entries are shown per port,
-// joined by " | ". Slot 1 is always the primary identity (product+version
-// merged from the probe engine, or the HTTP Server: header — whichever is
-// more informative). Every other slot is filled from a single generic,
-// table-driven candidate list (kIdentityFields below) built from whatever
-// HttpFingerprint fields are non-empty.
-//
-// Adding support for a NEW header/meta field to appear in the version line
-// no longer requires touching the gather loop, the candidate list, AND the
-// print loop by hand — just add one row to kIdentityFields.
-// ============================================================================
 static constexpr size_t kMaxSlots = 10;
 
-// Fields whose raw value is already self-descriptive (contains a product
-// name, e.g. Server: "Jetty(10.0.20)", meta:generator "WordPress 6.4.2") are
-// printed bare. Fields that only carry a bare token/version number (e.g.
-// X-Jenkins: "2.440.3") are printed as "Label: value" so the reader knows
-// what the number refers to.
 struct FieldSpec {
     std::string HttpFingerprint::*field;
     const char                    *label;
@@ -2581,16 +2559,12 @@ static const FieldSpec kIdentityFields[] = {
     { &HttpFingerprint::meta_author,           "Author",           false },
     { &HttpFingerprint::meta_developer,        "Developer",        false },
 };
-// NOTE: fields intentionally left out of this table are pure operational
-// telemetry — request IDs, cache TTL/age, rate-limit counters, timing
-// durations, storage-class/versioning/delete-marker flags, favicon/tile
-// colors — none of which identify *what software or version* is running,
-// so including them would just add noise to the version column. Any of
-// them can be added the same way (one row) if you want them surfaced.
+
 
 static void print_result(const ScanResult                  &result,
                          const std::string                 &method_label,
-                         const std::vector<HttpFingerprint> &http_fps)
+                         const std::vector<HttpFingerprint> &http_fps,
+                         bool                                confirmed_websocket)
 {
     (void)method_label; // no longer printed
 
@@ -3136,15 +3110,7 @@ static void print_result(const ScanResult                  &result,
     for (const auto &v : filled_slots) out_parts.push_back(v);
     if (out_parts.size() > kMaxSlots) out_parts.resize(kMaxSlots);
 
-        bool is_websocket_status = false;
-    for (const auto &fp : http_fps) {
-        if (fp.status_code == 101 || fp.status_code == 501) {
-            is_websocket_status = true;
-            break;
-        }
-    }
-
-    if (is_websocket_status) {
+    if (confirmed_websocket) {
         std::cout << "\033[32mwebsocket\033[0m\n";
     } else if (!out_parts.empty()) {
         for (size_t i = 0; i < out_parts.size(); ++i) {
@@ -4106,6 +4072,58 @@ static HttpFingerprint follow_http_asset(const std::string &ip, int port,
     return make_http_fingerprint(resp, "asset-follow:" + path, is_ssl);
 }
 
+static bool confirm_websocket_upgrade(const std::string &ip, int port,
+                                      bool is_ssl, int timeout_sec, bool verbose)
+{
+    vlog::line(verbose, "websocket-confirm: status suggested possible upgrade -- "
+               "sending Upgrade probe to " + ip + ":" + std::to_string(port) +
+               (is_ssl ? "  (ssl)" : "  (plain)"), 1);
+
+    std::string req = "GET / HTTP/1.1\r\n"
+                       "Host: " + make_host_header(ip, port, is_ssl) + "\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Upgrade: websocket\r\n"
+                       "Sec-WebSocket-Version: 13\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    std::vector<u8> payload(req.begin(), req.end());
+
+    std::vector<u8> resp;
+    if (is_ssl) {
+        TlsCertInfo unused_cert;
+        resp = capture_ssl(ip, port, timeout_sec, &payload, verbose, &unused_cert);
+    } else {
+        resp = capture_tcp(ip, port, timeout_sec, &payload, verbose);
+    }
+
+    if (resp.empty()) {
+        vlog::fail(verbose, "websocket-confirm: no response to Upgrade probe", 2);
+        return false;
+    }
+
+    int code = extract_status_code(resp);
+    vlog::line(verbose, "websocket-confirm: got status " + std::to_string(code), 2);
+    if (code != 101) {
+        vlog::fail(verbose, "websocket-confirm: status != 101 -- not a websocket upgrade", 2);
+        return false;
+    }
+
+    std::string conn = extract_header(resp, "Connection");
+    std::string upg  = extract_header(resp, "Upgrade");
+    vlog::kv(verbose, "Connection", conn.empty() ? "(missing)" : conn, 2);
+    vlog::kv(verbose, "Upgrade",    upg.empty()  ? "(missing)" : upg,  2);
+
+    std::string conn_lc = conn, upg_lc = upg;
+    for (auto &c : conn_lc) c = (char)tolower((unsigned char)c);
+    for (auto &c : upg_lc)  c = (char)tolower((unsigned char)c);
+
+    bool ok = conn_lc.find("upgrade")   != std::string::npos
+           && upg_lc.find("websocket") != std::string::npos;
+
+    if (ok) vlog::ok(verbose,   "websocket-confirm: Connection/Upgrade headers match -- confirmed", 2);
+    else    vlog::fail(verbose, "websocket-confirm: 101 but headers don't confirm websocket -- rejecting", 2);
+
+    return ok;
+}
 
 static std::vector<u8> capture_http_get(const std::string &ip, int port,
                                         int timeout_sec, bool verbose)
@@ -5419,10 +5437,19 @@ capture_done:
         }
     }
 
+    bool confirmed_websocket = false;
+    for (const auto &fp : http_fps) {
+        if (fp.status_code == 101 || fp.status_code == 501) {
+            confirmed_websocket =
+                confirm_websocket_upgrade(ip, args.port, final_ssl, read_to, args.verbose);
+            break;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lk(g_stdout_mu);
         std::cout << std::left << std::setw(7) << target_port << ": ";
-        print_result(result, method_label, http_fps);
+        print_result(result, method_label, http_fps, confirmed_websocket);
     }
     return 0;
 }
