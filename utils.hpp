@@ -39,6 +39,7 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s);
 std::string reverse_dns_lookup(const std::string& ip_address);
 bool ptr_cache_lookup(const std::string& ip, std::string& out_domain);
 void ptr_cache_store(const std::string& ip, const std::string& domain);
+std::vector<std::string> get_system_resolvers();
 std::string format_mac(const uint8_t* mac);
 std::string get_current_time();
 std::string format_ipv6(const uint8_t* ip6);
