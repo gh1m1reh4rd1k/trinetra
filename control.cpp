@@ -1081,6 +1081,9 @@ struct SuppressRule {
     std::string suppressed_platform;
 };
 
+// Registry of HttpFingerprint string fields addressable by name from signatures.conf,
+// used only by the FieldAnyNonEmpty rule kind. Extend this list if a new signature
+// needs to reference a field that isn't here yet.
 static const std::unordered_map<std::string, std::string HttpFingerprint::*> &
 platform_field_registry()
 {
@@ -2520,8 +2523,27 @@ static HttpFingerprint merge_http_fingerprints(
     return merged;
 }
 
+// ============================================================================
+// Version-line renderer
+//
+// Output model: up to kMaxSlots (10) "info" entries are shown per port,
+// joined by " | ". Slot 1 is always the primary identity (product+version
+// merged from the probe engine, or the HTTP Server: header — whichever is
+// more informative). Every other slot is filled from a single generic,
+// table-driven candidate list (kIdentityFields below) built from whatever
+// HttpFingerprint fields are non-empty.
+//
+// Adding support for a NEW header/meta field to appear in the version line
+// no longer requires touching the gather loop, the candidate list, AND the
+// print loop by hand — just add one row to kIdentityFields.
+// ============================================================================
 static constexpr size_t kMaxSlots = 10;
 
+// Fields whose raw value is already self-descriptive (contains a product
+// name, e.g. Server: "Jetty(10.0.20)", meta:generator "WordPress 6.4.2") are
+// printed bare. Fields that only carry a bare token/version number (e.g.
+// X-Jenkins: "2.440.3") are printed as "Label: value" so the reader knows
+// what the number refers to.
 struct FieldSpec {
     std::string HttpFingerprint::*field;
     const char                    *label;
@@ -5339,11 +5361,9 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
         }
     }
 
-capture_done:
+    capture_done:
     if (response.empty()) {
-        vlog::section(true, "No response");
-        fprintf(stderr, "%s✗%s no response from %s:%d\n\n",
-                vlog::RED(), vlog::RESET(), ip.c_str(), args.port);
+        fprintf(stdout, "%-7d: No response\n", args.port);
         return 1;
     }
 
