@@ -37,7 +37,8 @@
 #include <atomic>
 #include "debug.hpp"
 #include "handler.hpp"
-#include "dns_enum.hpp"   // AsyncDnsJob / DnsRRType / dns_query_batch — shared vectorized DNS engine
+#include "dns_enum.hpp"
+#include "simulations.hpp"
 
 static int init_arp_ring(struct io_uring* ring, unsigned entries) {
     struct io_uring_params p{};
@@ -250,10 +251,37 @@ static bool parse_targets(
         trim_in_place(token);
         if (token.empty()) continue;
 
-        // ── Step C: control-character guard ─────────────────────────────
-        if (has_bad_control_char(token)) {
-            std::cerr << "Invalid characters at " << ctx.pos(idx) << "\n";
-            return false;
+        {
+            std::string base_domain;
+            if (simulations::is_wildcard_target_spec(token, base_domain)) {
+                g_saw_literal_target = true;
+
+                simulations::SimulationResult sim =
+                    simulations::run_wildcard_enum_simulation(base_domain);
+
+                if (!sim.ok) {
+                    std::cerr << "Simulation failed for *." << base_domain
+                              << ": " << sim.error << "\n";
+                    return false;
+                }
+
+                for (const auto& host : sim.resolved_hosts)
+                    for (const auto& ip : host.ips)
+                        ip_to_domain_map[ip] = host.hostname;
+
+                if (!sim.unresolved_hosts.empty())
+                    g_not_scanned_map[base_domain] = sim.unresolved_hosts;
+
+                for (const auto& ip : sim.unique_ips)
+                    add_unique_ip(bulk_ips, seen, ip);
+
+                if (ips.size() + bulk_ips.size() > MAX_TOTAL_IPS) {
+                    std::cerr << "Too many IPs after expansion (limit "
+                              << MAX_TOTAL_IPS << ")\n";
+                    return false;
+                }
+                continue;
+            }
         }
 
         if (token.find('/') != std::string::npos) {
