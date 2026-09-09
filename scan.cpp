@@ -2789,8 +2789,8 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
     }
     
     {
-        RawPacket _discard[64];
-        while (my_queue->try_dequeue_bulk(_discard, 64) > 0) {}
+        auto _discard = std::make_unique<RawPacket[]>(64);
+        while (my_queue->try_dequeue_bulk(_discard.get(), 64) > 0) {}
     }
     RTTTracker& global_rtt_tracker = shared_rtt_tracker;
     std::vector<int32_t> port_to_idx(65536, -1);
@@ -3415,10 +3415,15 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
         return DEADLINE_COALESCE_NS;         // nothing in flight
     };
     auto next_jitter_drain_time = std::chrono::steady_clock::now();
+    std::vector<RawPacket> pkt_batch_storage(2048);
+    RawPacket* pkt_batch = pkt_batch_storage.data();
+    std::vector<RawPacket> mixed_storage(32);
+    RawPacket* mixed = mixed_storage.data();
+    std::vector<RawPacket> icmp_pkts_storage(8);
+    RawPacket* icmp_pkts = icmp_pkts_storage.data();
     while (active_count.load(std::memory_order_relaxed) > 0 && !terminate_flag) {
         size_t got = 0;
         do {
-        RawPacket pkt_batch[2048];
 
         if (g_send) {
             if (g_send->errq_ring_v4_valid)
@@ -3717,9 +3722,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
         }
 
         if (got == 0) {
-            RawPacket mixed[32];
             const size_t mixed_got = my_queue->try_dequeue_bulk(mixed, 32);
-            RawPacket icmp_pkts[8];
             size_t icmp_got = 0;
             for (size_t mi = 0; mi < mixed_got; ++mi) {
                 if (mixed[mi].pkt_type == RawPacket::PktType::ICMP && icmp_got < 8) {
@@ -5567,7 +5570,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
     }
 
     // ── slot buffers ───────────────────────────────────────────────────────
-    constexpr size_t SLOT_SIZE = 4096;
+    constexpr size_t SLOT_SIZE = 16384;
     const size_t     N_SLOTS   = depth - 1 < 8 ? 8 : depth - 1 - GlobalRecvCtx::N_ICMP_SLOTS;
     ctx->buf_storage = std::make_unique<uint8_t[]>(N_SLOTS * SLOT_SIZE);
     std::memset(ctx->buf_storage.get(), 0, N_SLOTS * SLOT_SIZE);
@@ -5698,7 +5701,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
 }
 
 void recv_reader_thread_func(GlobalRecvCtx* ctx) {
-    constexpr size_t SLOT_SIZE = 4096;
+    constexpr size_t SLOT_SIZE = 16384;
     struct io_uring&        ring      = ctx->ring;
     std::vector<SlotMeta>&  slots     = ctx->slots;
     uint8_t*                recv_bufs = ctx->bufs;
