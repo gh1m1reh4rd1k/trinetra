@@ -1155,7 +1155,7 @@ inline IPv6Key make_ipv6_key(const struct in6_addr& a) {
 }
 
 struct RawPacket {
-    static constexpr size_t MAX_LEN = 2048;
+    static constexpr size_t MAX_LEN = 16384;
     enum class PktType : uint8_t { TCP = 0, ICMP = 1, TCP6 = 2, ICMPV6 = 3 } pkt_type = PktType::TCP;
 
     uint8_t  data[MAX_LEN];
