@@ -342,6 +342,102 @@ static std::string extract_header(const std::vector<u8> &resp,
     }
     return "";
 }
+
+// Generic header collector: parses every "Name: value" line in the response
+// header block into a map keyed by lowercased header name. Unlike
+// extract_header() (which only knows about one hardcoded field name at a
+// time), this lets signatures.conf reference ANY response header directly
+// by name -- new header-based signatures need zero C++ changes.
+// First occurrence of a repeated header wins, matching extract_header()'s
+// behavior. Values are right/left trimmed of spaces/tabs the same way.
+//
+// dup_out (optional): if non-null, records "Name: first-value | second-value"
+// for every header name seen more than once WITH DIFFERING values. A
+// duplicated Server/X-Powered-By/Content-Length/etc. header with conflicting
+// values is a classic sign of response splitting, a chunked-proxy rewrite,
+// or a deliberately spoofed banner sitting in front of the real one -- and
+// under the old first-wins-silently behavior that second value was thrown
+// away with no trace at all, so this kind of tampering was invisible to the
+// scanner. Exact-duplicate repeats (same name, same value) are NOT flagged;
+// that's normal for some servers/proxies and not a useful signal.
+static std::map<std::string, std::string> collect_all_headers(
+    const std::vector<u8> &resp,
+    std::vector<std::string> *dup_out = nullptr)
+{
+    std::map<std::string, std::string> headers;
+
+    const size_t hard_cap = std::min(resp.size(), (size_t)8192);
+    size_t header_end = hard_cap;
+
+    for (size_t i = 0; i + 3 < hard_cap; ++i) {
+        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
+            header_end = i + 4;
+            break;
+        }
+    }
+    if (header_end == hard_cap) {
+        for (size_t i = 0; i + 1 < hard_cap; ++i) {
+            if (resp[i]=='\n' && resp[i+1]=='\n') {
+                header_end = i + 2;
+                break;
+            }
+        }
+    }
+
+    size_t pos = 0;
+    // Skip the status line.
+    while (pos < header_end && resp[pos] != '\r' && resp[pos] != '\n') ++pos;
+    if (pos < header_end && resp[pos] == '\r') ++pos;
+    if (pos < header_end && resp[pos] == '\n') ++pos;
+
+    while (pos < header_end) {
+        size_t line_start = pos;
+        while (pos < header_end && resp[pos] != '\r' && resp[pos] != '\n') ++pos;
+        size_t line_end = pos;
+        if (pos < header_end && resp[pos] == '\r') ++pos;
+        if (pos < header_end && resp[pos] == '\n') ++pos;
+
+        if (line_end == line_start) break; // blank line -> end of headers
+
+        size_t colon = line_start;
+        while (colon < line_end && resp[colon] != ':') ++colon;
+        if (colon >= line_end) continue; // malformed line, no colon
+
+        std::string name(resp.begin() + (std::ptrdiff_t)line_start,
+                         resp.begin() + (std::ptrdiff_t)colon);
+        for (char &c : name) c = (char)tolower((unsigned char)c);
+
+        size_t val_start = colon + 1;
+        while (val_start < line_end &&
+               (resp[val_start] == ' ' || resp[val_start] == '\t')) ++val_start;
+        size_t val_end = line_end;
+        while (val_end > val_start &&
+               (resp[val_end - 1] == ' ' || resp[val_end - 1] == '\t')) --val_end;
+
+        std::string value(resp.begin() + (std::ptrdiff_t)val_start,
+                          resp.begin() + (std::ptrdiff_t)val_end);
+
+        static const std::set<std::string> kMultiValueHeaders = { "set-cookie" };
+
+        auto existing = headers.find(name);
+        if (existing != headers.end()) {
+            if (dup_out && existing->second != value &&
+                !kMultiValueHeaders.count(name)) {
+                std::string entry = name + ": \"" + existing->second + "\" | \"" + value + "\"";
+                bool already_recorded = false;
+                for (const auto &d : *dup_out) {
+                    if (d == entry) { already_recorded = true; break; }
+                }
+                if (!already_recorded) dup_out->push_back(entry);
+            }
+            continue;
+        }
+        headers.emplace(std::move(name), std::move(value));
+    }
+
+    return headers;
+}
+
 static std::string extract_status_line(const std::vector<u8> &resp)
 {
     const size_t limit = std::min(resp.size(), (size_t)256);
@@ -597,6 +693,21 @@ struct HttpFingerprint {
     bool        is_ssl       = false;
     std::string raw_snippet;    // first 200 bytes of response (printable)
     TlsCertInfo tls_cert;       // populated when is_ssl == true
+
+    // Every response header, lowercased-name -> value. Populated generically
+    // for ALL headers (not just the ones with a dedicated field below), so
+    // signatures.conf [platform.*] rules can reference any header by name
+    // via field_any_nonempty without requiring a matching C++ field.
+    std::map<std::string, std::string> raw_headers;
+
+    // ---- Tamper / anomaly signals -----------------------------------------
+    // Populated in fetch_and_fingerprint() from collect_all_headers()'s
+    // dup_out, and in extract_html_body_signals() when the page's own
+    // meta-generator claim contradicts what the structural (path/JS-global/
+    // comment/body) evidence actually points to. Both are heuristics, not
+    // proof -- surfaced to the operator as a flag, not auto-acted-on.
+    std::vector<std::string> duplicate_headers; // "Name: \"v1\" | \"v2\""
+    std::string               tamper_hint;       // e.g. "meta:generator claims WordPress but structural signals point to Joomla (score=5 vs 0)"
 
     // ---- CDN / Cache / Proxy infrastructure headers ----
     std::string x_amz_cf_pop;
@@ -1018,6 +1129,11 @@ struct HttpFingerprint {
         emit("meta:apple-capable",  meta_apple_capable);
         if (!body_platform_hint.empty())
             emit("Body Platform", "[" + body_platform_hint + "]");
+        if (!tamper_hint.empty())
+            emit("TAMPER?", "[" + tamper_hint + "]");
+        for (size_t di = 0; di < duplicate_headers.size() && di < 5; ++di) {
+            emit("Dup Header", duplicate_headers[di]);
+        }
         // ---- SPA / Client-Side Routing locations ----
         for (size_t si = 0; si < spa_locations.size() && si < 5; ++si) {
             emit("SPA-Location", spa_locations[si]);
@@ -1062,16 +1178,42 @@ std::string g_signature_conf_path = "/usr/share/shiv/signatures.conf";
 struct PathSigEntry { std::string needle; std::string label; };
 struct AttrSigEntry { std::string attr;   std::string label; };
 
+// An entry in signatures.conf's [identity_headers] section: a single HTTP
+// response header that should be surfaced on the -sV version line whenever
+// it's present. This is the ONLY thing you need to touch to make a new
+// header show up there -- no HttpFingerprint field, no extract_header()
+// call, no C++ recompile. Lookup happens directly against
+// HttpFingerprint::raw_headers, which already captures every response
+// header generically (see collect_all_headers()).
+//   header : the HTTP header name, case-insensitive (e.g. "X-Powered-By-Plesk")
+//   label  : what to print it as
+//   bare   : true  -> the header's value is already self-descriptive and is
+//                      printed as-is, e.g. Server: "cloudflare" -> "cloudflare"
+//            false -> the value is just a bare token/number, so it's printed
+//                      as "label: value", e.g. X-Jenkins: "2.440.3" ->
+//                      "Jenkins: 2.440.3"
+struct IdentityHeaderSpec { std::string header; std::string label; bool bare; };
+
 struct PlatformRule {
     enum class Kind {
         PathContains,          // arg = substring to find in link_platform_paths entries
         JsGlobalEq,            // arg = exact string to match in js_globals entries
         CommentContains,       // arg = substring to find in html_comments entries
         MetaGeneratorContains, // arg = substring to find in meta_generator
-        FieldAnyNonEmpty       // arg = comma-separated HttpFingerprint field names; bump if any non-empty
+        FieldAnyNonEmpty,      // arg = comma-separated HTTP header names; bump if any is present & non-empty
+        BodyContains,          // arg = substring to find anywhere in the lowercased response body
+                                //       (covers text outside href=/comments -- e.g. src="...", plain
+                                //       visible text, inline JSON blobs)
+        HeaderValueContains    // header = specific HTTP response header name (lowercased);
+                                // arg    = substring to find inside THAT header's value (lowercased).
+                                //          Unlike FieldAnyNonEmpty (presence-only), this lets a rule
+                                //          key off *what a header says*, e.g. Server containing
+                                //          "openresty" or "nginx", or X-Powered-By containing "PHP".
+                                //          signatures.conf syntax: header_contains|Header=needle|weight
     };
     Kind        kind;
     std::string arg;
+    std::string header;   // only used by HeaderValueContains
     int         weight = 1;
 };
 
@@ -1081,21 +1223,13 @@ struct SuppressRule {
     std::string suppressed_platform;
 };
 
-// Registry of HttpFingerprint string fields addressable by name from signatures.conf,
-// used only by the FieldAnyNonEmpty rule kind. Extend this list if a new signature
-// needs to reference a field that isn't here yet.
-static const std::unordered_map<std::string, std::string HttpFingerprint::*> &
-platform_field_registry()
-{
-    static const std::unordered_map<std::string, std::string HttpFingerprint::*> reg = {
-        { "x_drupal_cache",         &HttpFingerprint::x_drupal_cache },
-        { "x_drupal_dynamic_cache", &HttpFingerprint::x_drupal_dynamic_cache },
-        { "x_magento_cache_debug",  &HttpFingerprint::x_magento_cache_debug },
-        { "x_wordpress_cache",      &HttpFingerprint::x_wordpress_cache },
-        { "x_prestashop_cache",     &HttpFingerprint::x_prestashop_cache },
-    };
-    return reg;
-}
+// NOTE: field_any_nonempty used to require each header to be registered here
+// by hand as a named HttpFingerprint field. That's gone -- it now looks
+// straight into HttpFingerprint::raw_headers (see the FieldAnyNonEmpty case
+// in the scorer below), so any header can be referenced purely from
+// signatures.conf. Underscores in the signatures.conf arg are treated as
+// equivalent to hyphens (e.g. "x_iinfo" matches the "X-Iinfo" header), so
+// existing entries using the old underscore convention keep working as-is.
 
 class PlatformSignatureSet {
 public:
@@ -1105,6 +1239,7 @@ public:
     std::map<std::string, std::vector<PlatformRule>>  platform_rules; // platform name -> rules
     std::vector<std::string>                          meta_hint_platforms;
     std::vector<SuppressRule>                          suppress_rules;
+    std::vector<IdentityHeaderSpec>                    identity_headers; // [identity_headers]
 
     static PlatformSignatureSet loadFromFile(const std::string &path);
 };
@@ -1205,6 +1340,26 @@ PlatformSignatureSet PlatformSignatureSet::loadFromFile(const std::string &path)
         else if (section == "meta_hint_platforms") {
             sigs.meta_hint_platforms.push_back(check);
         }
+        else if (section == "identity_headers") {
+            // header|label|bare
+            auto f = split_pipe(line);
+            if (f.size() != 3) {
+                throw std::runtime_error(path + ":" + std::to_string(lineno) +
+                                          ": [identity_headers] entry needs 'header|label|bare'");
+            }
+            IdentityHeaderSpec spec;
+            spec.header = trim(f[0]);
+            spec.label  = trim(f[1]);
+            std::string bare_str = trim(f[2]);
+            for (char &c : bare_str) c = (char)tolower((unsigned char)c);
+            if (bare_str == "true" || bare_str == "1")       spec.bare = true;
+            else if (bare_str == "false" || bare_str == "0") spec.bare = false;
+            else {
+                throw std::runtime_error(path + ":" + std::to_string(lineno) +
+                                          ": [identity_headers] bare flag must be true/false");
+            }
+            sigs.identity_headers.push_back(std::move(spec));
+        }
         else if (section == "suppress") {
             // trigger_platform>=min_score|suppressed_platform
             auto f = split_pipe(line);
@@ -1258,6 +1413,29 @@ PlatformSignatureSet PlatformSignatureSet::loadFromFile(const std::string &path)
             else if (kind_str == "comment_contains")         rule.kind = PlatformRule::Kind::CommentContains;
             else if (kind_str == "meta_generator_contains")  rule.kind = PlatformRule::Kind::MetaGeneratorContains;
             else if (kind_str == "field_any_nonempty")       rule.kind = PlatformRule::Kind::FieldAnyNonEmpty;
+            else if (kind_str == "body_contains") {
+                rule.kind = PlatformRule::Kind::BodyContains;
+                // Stored lowercased up front since it's always matched against lbody.
+                for (char &c : rule.arg) c = (char)tolower((unsigned char)c);
+            }
+            else if (kind_str == "header_contains") {
+                // arg is "Header=needle"; split on the FIRST '=' so a needle
+                // containing '=' (unlikely but not impossible) still works.
+                rule.kind = PlatformRule::Kind::HeaderValueContains;
+                size_t eq = rule.arg.find('=');
+                if (eq == std::string::npos) {
+                    throw std::runtime_error(path + ":" + std::to_string(lineno) +
+                                              ": header_contains arg must be 'Header=needle'");
+                }
+                rule.header = trim(rule.arg.substr(0, eq));
+                rule.arg    = trim(rule.arg.substr(eq + 1));
+                for (char &c : rule.header) { c = (char)tolower((unsigned char)c); if (c == '_') c = '-'; }
+                for (char &c : rule.arg)    c = (char)tolower((unsigned char)c);
+                if (rule.header.empty() || rule.arg.empty()) {
+                    throw std::runtime_error(path + ":" + std::to_string(lineno) +
+                                              ": header_contains needs both a header name and a needle");
+                }
+            }
             else {
                 throw std::runtime_error(path + ":" + std::to_string(lineno) +
                                           ": unknown rule kind '" + kind_str + "'");
@@ -1675,7 +1853,6 @@ static void extract_html_body_signals(const std::vector<u8> &resp,
         // (e.g. Next.js implies React, so don't double-report React) come from
         // signatures.conf [platform.*] / [meta_hint_platforms] / [suppress].
         const auto &sigs = platform_signatures();
-        const auto &field_reg = platform_field_registry();
 
         std::map<std::string, int> scores;
         auto bump = [&](const std::string &platform, int weight) { scores[platform] += weight; };
@@ -1704,17 +1881,53 @@ static void extract_html_body_signals(const std::vector<u8> &resp,
                         break;
 
                     case PlatformRule::Kind::FieldAnyNonEmpty: {
+                        // arg = comma-separated list of HTTP header names (e.g. "X-Iinfo" or
+                        // "x_iinfo" -- underscores and hyphens are interchangeable). Looked up
+                        // directly against fp.raw_headers, so any response header can be used
+                        // as a signature straight from signatures.conf with no C++ change.
                         bool any = false;
-                        for (const auto &fname : platform_sig_detail::split_comma(rule.arg)) {
-                            auto it = field_reg.find(fname);
-                            if (it != field_reg.end() && !(fp.*(it->second)).empty()) { any = true; break; }
+                        for (auto fname : platform_sig_detail::split_comma(rule.arg)) {
+                            for (char &c : fname) {
+                                c = (char)tolower((unsigned char)c);
+                                if (c == '_') c = '-';
+                            }
+                            auto it = fp.raw_headers.find(fname);
+                            if (it != fp.raw_headers.end() && !it->second.empty()) { any = true; break; }
                         }
                         if (any) bump(platform, rule.weight);
+                        break;
+                    }
+
+                    case PlatformRule::Kind::BodyContains:
+                        // rule.arg was already lowercased at parse time.
+                        if (lbody.find(rule.arg) != std::string::npos)
+                            bump(platform, rule.weight);
+                        break;
+
+                    case PlatformRule::Kind::HeaderValueContains: {
+                        // rule.header and rule.arg were already lowercased at parse time.
+                        auto it = fp.raw_headers.find(rule.header);
+                        if (it != fp.raw_headers.end()) {
+                            std::string lv = it->second;
+                            for (char &c : lv) c = (char)tolower((unsigned char)c);
+                            if (lv.find(rule.arg) != std::string::npos)
+                                bump(platform, rule.weight);
+                        }
                         break;
                     }
                 }
             }
         }
+
+        // Snapshot the *structural-only* scores (paths, JS globals, HTML
+        // comments, response body, header presence) before meta-tag hints
+        // get mixed in below. This is what lets us catch a spoofed
+        // meta:generator: a page can trivially lie in a <meta name=generator>
+        // tag (WAFs/honeypots sometimes do this on purpose to mislead
+        // scanners), but faking convincing paths, JS globals, and body
+        // content for a *different* platform at the same time is much
+        // harder, so a strong disagreement between the two is a real signal.
+        std::map<std::string, int> structural_scores = scores;
 
         // --- Generic CMS/framework hints from meta tags (meta_generator, meta_cms, ...) ---
         auto gen_hint = [&](const std::string &val, const std::string &platform, int w) {
@@ -1739,6 +1952,9 @@ static void extract_html_body_signals(const std::vector<u8> &resp,
             auto it = scores.find(sr.trigger_platform);
             if (it != scores.end() && it->second >= sr.trigger_min_score)
                 scores[sr.suppressed_platform] = 0;
+            auto sit = structural_scores.find(sr.trigger_platform);
+            if (sit != structural_scores.end() && sit->second >= sr.trigger_min_score)
+                structural_scores[sr.suppressed_platform] = 0;
         }
 
                 // Pick winner (score >= 2 to avoid single-field false positives)
@@ -1765,6 +1981,53 @@ static void extract_html_body_signals(const std::vector<u8> &resp,
                 fp.body_platform_hint += tied[i];
             }
             fp.body_platform_hint += " (tied, score=" + std::to_string(best_score) + ")";
+        }
+
+        // --- Generator-tag spoof check ---------------------------------
+        // Find the platform name meta_generator itself literally claims
+        // (if any), independent of the scored winner above.
+        std::string claimed;
+        {
+            std::string lgen = fp.meta_generator;
+            for (char &c : lgen) c = (char)tolower((unsigned char)c);
+            for (const std::string &platform : sigs.meta_hint_platforms) {
+                std::string lp = platform;
+                for (char &c : lp) c = (char)tolower((unsigned char)c);
+                if (!lp.empty() && lgen.find(lp) != std::string::npos) { claimed = platform; break; }
+            }
+        }
+
+        // Strongest structural (non-meta-tag) platform, independent of what
+        // the generator tag says.
+        std::string structural_top;
+        int structural_top_score = 1; // same "> 1" confidence bar as the main winner
+        for (const auto &[name, score] : structural_scores) {
+            if (score > structural_top_score) { structural_top_score = score; structural_top = name; }
+        }
+
+        if (!claimed.empty() && !structural_top.empty()) {
+            std::string lc = claimed, ls = structural_top;
+            for (char &c : lc) c = (char)tolower((unsigned char)c);
+            for (char &c : ls) c = (char)tolower((unsigned char)c);
+            int claimed_structural_score = 0;
+            for (const auto &[name, score] : structural_scores) {
+                std::string ln = name;
+                for (char &c : ln) c = (char)tolower((unsigned char)c);
+                if (ln == lc) { claimed_structural_score = score; break; }
+            }
+            // Flag only a *confident, contradicted* claim: real independent
+            // structural evidence (score >= 3, i.e. more than one corroborating
+            // signal) for a platform other than the one the generator tag
+            // names, while that claimed platform has little/no structural
+            // backing of its own. This intentionally stays quiet on weak/
+            // single-signal cases to avoid crying wolf on ordinary noise
+            // (shared JS libraries, boilerplate comments, etc.).
+            if (lc != ls && structural_top_score >= 3 && claimed_structural_score <= 1) {
+                fp.tamper_hint = "meta:generator claims '" + claimed + "' but structural evidence "
+                                  "(paths/JS/comments/body/headers) points to '" + structural_top +
+                                  "' (structural score " + std::to_string(structural_top_score) +
+                                  " vs " + std::to_string(claimed_structural_score) + " for " + claimed + ")";
+            }
         }
     }
     if (!fp.is_redirect) fp.spa_locations = extract_spa_locations(body);
@@ -2055,6 +2318,7 @@ static HttpFingerprint make_http_fingerprint(const std::vector<u8> &resp,
     fp.via         = extract_header(effective, "Via");
     fp.x_generator = extract_header(effective, "X-Generator");
     fp.location    = extract_header(effective, "Location");
+    fp.raw_headers = collect_all_headers(effective, &fp.duplicate_headers);
 
     // ---- CDN / Cache / Proxy infrastructure headers ----
     fp.x_amz_cf_pop              = extract_header(effective, "X-Amz-Cf-Pop");
@@ -2497,6 +2761,8 @@ static HttpFingerprint merge_http_fingerprints(
     merged.meta_apple_title          = merge_field(fps, &HttpFingerprint::meta_apple_title);
     merged.meta_apple_capable        = merge_field(fps, &HttpFingerprint::meta_apple_capable);
     merged.body_platform_hint        = merge_field(fps, &HttpFingerprint::body_platform_hint);
+    merged.duplicate_headers         = merge_vec(fps, &HttpFingerprint::duplicate_headers);
+    merged.tamper_hint               = merge_field(fps, &HttpFingerprint::tamper_hint);
 
     // Vector fields: union
     merged.html_comments       = merge_vec(fps, &HttpFingerprint::html_comments);
@@ -2530,32 +2796,38 @@ static HttpFingerprint merge_http_fingerprints(
 // joined by " | ". Slot 1 is always the primary identity (product+version
 // merged from the probe engine, or the HTTP Server: header — whichever is
 // more informative). Every other slot is filled from a single generic,
-// table-driven candidate list (kIdentityFields below) built from whatever
-// HttpFingerprint fields are non-empty.
+// table-driven candidate list built from signatures.conf [identity_headers]
+// plus a small fixed set of HTML-<meta>-tag-sourced fields.
 //
-// Adding support for a NEW header/meta field to appear in the version line
-// no longer requires touching the gather loop, the candidate list, AND the
-// print loop by hand — just add one row to kIdentityFields.
+// Adding support for a NEW *header* on the version line requires NO C++
+// change at all any more: add one line to signatures.conf's
+// [identity_headers] section (see PlatformSignatureSet::identity_headers,
+// resolved against HttpFingerprint::raw_headers, which already captures
+// every response header generically). The only fields still hardcoded below
+// are the handful sourced from parsed HTML <meta> tags rather than headers
+// (meta_generator, meta_cms, meta:author, ...) — those aren't in
+// raw_headers because they were never HTTP headers to begin with, so a
+// conf-file header table can't reach them. Anything HTTP-header-shaped
+// (Server, X-Powered-By, X-Jenkins, X-Powered-By-Plesk, X-Aspnet-Version,
+// whatever ships next) goes in signatures.conf, full stop.
 // ============================================================================
 static constexpr size_t kMaxSlots = 10;
 
 // Fields whose raw value is already self-descriptive (contains a product
-// name, e.g. Server: "Jetty(10.0.20)", meta:generator "WordPress 6.4.2") are
-// printed bare. Fields that only carry a bare token/version number (e.g.
-// X-Jenkins: "2.440.3") are printed as "Label: value" so the reader knows
-// what the number refers to.
-struct FieldSpec {
+// name, e.g. meta:generator "WordPress 6.4.2") are printed bare. Fields that
+// only carry a bare token/version number are printed as "Label: value" so
+// the reader knows what the value refers to. This mirrors the bare/labeled
+// distinction used by signatures.conf's [identity_headers] rows below —
+// same rules, just for the HTML-<meta>-tag-sourced subset that a header
+// table can't cover.
+struct MetaFieldSpec {
     std::string HttpFingerprint::*field;
     const char                    *label;
     bool                            bare;
 };
 
-static const FieldSpec kIdentityFields[] = {
+static const MetaFieldSpec kMetaIdentityFields[] = {
     // ---- self-descriptive (bare) ----
-    { &HttpFingerprint::server,               "Server",           true  },
-    { &HttpFingerprint::osd_name,              "OSD-Name",         true  },
-    { &HttpFingerprint::powered_by,            "X-Powered-By",     true  },
-    { &HttpFingerprint::x_generator,           "X-Generator",      true  },
     { &HttpFingerprint::meta_generator,        "meta:generator",   true  },
     { &HttpFingerprint::meta_cms,              "meta:cms",         true  },
     { &HttpFingerprint::meta_framework,        "meta:framework",   true  },
@@ -2565,19 +2837,6 @@ static const FieldSpec kIdentityFields[] = {
     { &HttpFingerprint::meta_created_by,       "meta:created-by",  true  },
     { &HttpFingerprint::meta_application_name, "app-name",         true  },
     // ---- bare-token fields: need the label to make sense of the value ----
-    { &HttpFingerprint::x_jenkins,             "Jenkins",          false },
-    { &HttpFingerprint::x_hudson,              "Hudson",           false },
-    { &HttpFingerprint::x_teamcity_node_id,    "TeamCity",         false },
-    { &HttpFingerprint::x_gitlab_meta,         "GitLab",           false },
-    { &HttpFingerprint::x_harness_account,     "Harness",          false },
-    { &HttpFingerprint::x_wordpress_theme,     "WordPress Theme",  false },
-    { &HttpFingerprint::x_wordpress_plugin,    "WordPress Plugin", false },
-    { &HttpFingerprint::x_drupal_route,        "Drupal Route",     false },
-    { &HttpFingerprint::x_magento_store,       "Magento Store",    false },
-    { &HttpFingerprint::x_magento_theme,       "Magento Theme",    false },
-    { &HttpFingerprint::x_prestashop_store,    "PrestaShop Store", false },
-    { &HttpFingerprint::x_cdn,                 "CDN",              false },
-    { &HttpFingerprint::x_mailer,              "Mailer",           false },
     { &HttpFingerprint::meta_author,           "Author",           false },
     { &HttpFingerprint::meta_developer,        "Developer",        false },
 };
@@ -2824,13 +3083,40 @@ static void print_result(const ScanResult                  &result,
             fp_meta_created_by  = clean_field(fp.meta_created_by);
     }
 
-    // ---- generic table-driven pass: every field in kIdentityFields --------
+    // ---- generic table-driven pass ----------------------------------------
     // First-non-empty-fingerprint-wins, same rule as the hand-written
     // gathers above. Produces {raw, display, label} triples; "raw" is used
     // for subsumption checks, "display" is what actually gets printed.
+    //
+    // Two sources feed this, merged into one list so downstream dedup/print
+    // logic doesn't need to know or care which one a candidate came from:
+    //   1. signatures.conf [identity_headers] — any HTTP response header,
+    //      looked up straight out of HttpFingerprint::raw_headers. This is
+    //      the one to extend for a new header; no C++ change needed.
+    //   2. kMetaIdentityFields — the handful of fields parsed out of HTML
+    //      <meta> tags rather than headers, so they can't live in
+    //      raw_headers and still need a named struct field.
     struct GenericCandidate { std::string raw; std::string display; std::string label; };
     std::vector<GenericCandidate> generic_candidates;
-    for (const auto &spec : kIdentityFields) {
+
+    for (const auto &spec : platform_signatures().identity_headers) {
+        std::string header_lc = spec.header;
+        for (char &c : header_lc) c = (char)tolower((unsigned char)c);
+
+        std::string raw;
+        for (const auto &fp : effective_fps) {
+            auto it = fp.raw_headers.find(header_lc);
+            if (it != fp.raw_headers.end() && !it->second.empty()) {
+                raw = clean_field(it->second);
+                break;
+            }
+        }
+        if (raw.empty()) continue;
+        std::string display = spec.bare ? raw : (spec.label + ": " + raw);
+        generic_candidates.push_back({ raw, display, spec.label });
+    }
+
+    for (const auto &spec : kMetaIdentityFields) {
         std::string raw;
         for (const auto &fp : effective_fps) {
             const std::string &val = fp.*(spec.field);
@@ -2839,6 +3125,66 @@ static void print_result(const ScanResult                  &result,
         if (raw.empty()) continue;
         std::string display = spec.bare ? raw : (std::string(spec.label) + ": " + raw);
         generic_candidates.push_back({ raw, display, spec.label });
+    }
+
+    // ---- body_platform_hint: only add its own slot when it's NOT already
+    // implied by a meta field just printed above ------------------------
+    // body_platform_hint is the *scored* CMS/framework verdict from
+    // extract_html_body_signals(): structural evidence (paths, JS globals,
+    // HTML comments, body text) combined with meta-tag hints. When it agrees
+    // with a meta field already on the line (e.g. meta:generator already
+    // reads "Joomla 1.5"), printing "Joomla (score=2)" too is the same fact
+    // twice with nothing new -- that's the "why is Joomla printed twice"
+    // redundancy. It earns its own slot only when it names a platform not
+    // already visible in ANY meta field gen_hint() scores against -- exactly
+    // the useful case: no meta tag at all (or a misleading one), where
+    // structural signals are the *only* reason the platform is known.
+    {
+        std::string hint, meta_gen, meta_cms, meta_fw, meta_pb, meta_bw;
+        for (const auto &fp : effective_fps) {
+            if (hint.empty()     && !fp.body_platform_hint.empty()) hint     = clean_field(fp.body_platform_hint);
+            if (meta_gen.empty() && !fp.meta_generator.empty())     meta_gen = fp.meta_generator;
+            if (meta_cms.empty() && !fp.meta_cms.empty())           meta_cms = fp.meta_cms;
+            if (meta_fw.empty()  && !fp.meta_framework.empty())     meta_fw  = fp.meta_framework;
+            if (meta_pb.empty()  && !fp.meta_powered_by.empty())    meta_pb  = fp.meta_powered_by;
+            if (meta_bw.empty()  && !fp.meta_built_with.empty())    meta_bw  = fp.meta_built_with;
+        }
+        if (!hint.empty()) {
+            std::string already = meta_gen + " " + meta_cms + " " + meta_fw + " " + meta_pb + " " + meta_bw;
+            for (char &c : already) c = (char)tolower((unsigned char)c);
+
+            // Strip the trailing "(score=N)" / "(tied, score=N)" annotation
+            // to get just the platform name(s), possibly "A / B" if tied.
+            std::string names = hint;
+            size_t paren = names.find(" (");
+            if (paren != std::string::npos) names = names.substr(0, paren);
+
+            bool any_new = false;
+            size_t start = 0;
+            while (start <= names.size()) {
+                size_t sep = names.find(" / ", start);
+                std::string one = (sep == std::string::npos) ? names.substr(start)
+                                                               : names.substr(start, sep - start);
+                std::string lone = one;
+                for (char &c : lone) c = (char)tolower((unsigned char)c);
+                if (!lone.empty() && already.find(lone) == std::string::npos) any_new = true;
+                if (sep == std::string::npos) break;
+                start = sep + 3;
+            }
+
+            // The version line should show WHAT was detected, not the
+            // internal confidence score that drove the decision -- "score=3"
+            // is debugging detail, not identity info, and printing it here
+            // was the same class of noise as the earlier Joomla duplication,
+            // just triggered by a different case (a platform gen_hint()
+            // never saw, e.g. a real WordPress site alongside spoofed
+            // Drupal/HubSpot meta tags). 'names' (already stripped of the
+            // "(score=N)"/"(tied, score=N)" suffix above) is what gets
+            // shown; the full 'hint' -- WITH the score -- still exists on
+            // fp.body_platform_hint for the verbose dump and stays
+            // available to extract_html_body_signals()'s tamper check.
+            if (any_new) generic_candidates.push_back({ names, names, "Platform" });
+        }
     }
 
     auto extract_tech_version = [](const std::string &raw) -> std::string {
@@ -2899,23 +3245,37 @@ static void print_result(const ScanResult                  &result,
         };
 
         // Helper: does this token look like a tech name (not pure garbage)?
-        // A tech-name token contains at least one letter and is <= 30 chars.
-        auto is_tech_tok = [](const std::string &t) -> bool {
-            if (t.size() > 30) return false;
+        // A tech-name token contains at least one letter and is <= 30 chars,
+        // once trailing branding punctuation (the "!" in "Joomla!", trailing
+        // ":" / ";") is stripped. That trailing punctuation is legitimately
+        // part of some products' own branding and must not disqualify the
+        // token -- it previously made extract_tech_version() silently drop
+        // the product name (e.g. "Joomla! 1.5" -> just "1.5"), which both
+        // looks like a parse failure and throws away real identity info an
+        // operator needs. The stripped form is what's returned so the stray
+        // punctuation doesn't show up on the version line either.
+        auto is_tech_tok = [](const std::string &t) -> std::pair<bool, std::string> {
+            std::string s = t;
+            while (!s.empty() && (s.back() == '!' || s.back() == ':' || s.back() == ';'))
+                s.pop_back();
+            if (s.empty() || s.size() > 30) return { false, "" };
             bool has_letter = false;
-            for (char c : t) {
+            for (char c : s) {
                 if (isalpha((unsigned char)c)) { has_letter = true; }
-                else if (!isdigit((unsigned char)c) && c != '-' && c != '_' && c != '.') return false;
+                else if (!isdigit((unsigned char)c) && c != '-' && c != '_' && c != '.') return { false, "" };
             }
-            return has_letter;
+            return { has_letter, s };
         };
 
         // Step 2+3: find first version token; take the preceding tech word if valid.
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (is_version_tok(tokens[i])) {
-                if (i > 0 && is_tech_tok(tokens[i-1])) {
-                    // tech + version
-                    return tokens[i-1] + " " + tokens[i];
+                if (i > 0) {
+                    auto [ok, tech] = is_tech_tok(tokens[i-1]);
+                    if (ok) {
+                        // tech + version
+                        return tech + " " + tokens[i];
+                    }
                 }
                 // Step 4: bare version
                 return tokens[i];
@@ -2986,8 +3346,12 @@ static void print_result(const ScanResult                  &result,
 
     struct LabeledCandidate { std::string value; std::string label; };
 
+    // Header/meta candidates are listed BEFORE the HTML <title> on purpose:
+    // a title is marketing copy ("Acme Inc — Home"), while these are actual
+    // tech identity signals. Ties are broken by document order below, so
+    // putting title last means it only wins slot2 when nothing more
+    // informative is available.
     std::vector<LabeledCandidate> app_candidates_labeled;
-    app_candidates_labeled.push_back({ fp_title,          "title"          });
     app_candidates_labeled.push_back({ fp_meta_app_name,  "app-name"       });
     app_candidates_labeled.push_back({ fp_powered_by,     "X-Powered-By"   });
     app_candidates_labeled.push_back({ fp_x_generator,    "X-Generator"    });
@@ -2998,6 +3362,7 @@ static void print_result(const ScanResult                  &result,
     app_candidates_labeled.push_back({ fp_meta_powered_by,"meta:powered-by"});
     app_candidates_labeled.push_back({ fp_meta_built_with,"meta:built-with"});
     app_candidates_labeled.push_back({ fp_meta_created_by,"meta:created-by"});
+    app_candidates_labeled.push_back({ fp_title,          "title"          });
 
     // Dedup: among subsumption-related candidates keep the better one.
     std::vector<LabeledCandidate> app_winners;
@@ -3015,6 +3380,28 @@ static void print_result(const ScanResult                  &result,
             }
         }
         if (!merged) app_winners.push_back(cand);
+    }
+
+    // The HTML title is the weakest identity signal we have (it's copy
+    // written for humans, not tech fingerprinting) so it gets dropped
+    // entirely once real header/meta identity info is available: either a
+    // header carries an actual version token (e.g. "4.0.30319"), or there
+    // are simply enough other identity candidates that the title would just
+    // be crowding out more useful information.
+    {
+        size_t non_title_count = 0;
+        bool   have_versioned  = false;
+        for (const auto &w : app_winners) {
+            if (w.label == "title") continue;
+            ++non_title_count;
+            if (has_version_token(w.value)) have_versioned = true;
+        }
+        if (have_versioned || non_title_count >= 3) {
+            app_winners.erase(
+                std::remove_if(app_winners.begin(), app_winners.end(),
+                                [](const LabeledCandidate &w) { return w.label == "title"; }),
+                app_winners.end());
+        }
     }
 
     std::string slot2, slot2_label;
@@ -3057,16 +3444,19 @@ static void print_result(const ScanResult                  &result,
     if (!fp_asset_title.empty() && !is_subsumed(fp_asset_title, slot2)
         && !is_subsumed(fp_asset_title, slot1))
         extra_candidates.push_back({ fp_asset_title, "title (asset)" });
+    // Note: value is what's actually printed for slots 3+ (see filled_slots
+    // below), so a bare token like "cf-nel" needs its label folded in here —
+    // otherwise it prints unlabeled and the reader has no idea what it is.
     if (!fp_via.empty())
-        extra_candidates.push_back({ fp_via, "Proxy" });
+        extra_candidates.push_back({ "Proxy: " + fp_via, "Proxy" });
     if (!fp_report_to.empty() && !is_subsumed(fp_report_to, fp_via))
-        extra_candidates.push_back({ fp_report_to, "Proxy" });
+        extra_candidates.push_back({ "Proxy: " + fp_report_to, "Proxy" });
     for (size_t i = 0; i < app_winners.size(); ++i) {
         if (i == slot2_idx) continue;
         extra_candidates.push_back({ app_winners[i].value, app_winners[i].label });
     }
-    // Universal pass: anything kIdentityFields picked up that isn't already
-    // covered by slot1/slot2/an existing extra candidate.
+    // Universal pass: anything generic_candidates picked up that isn't
+    // already covered by slot1/slot2/an existing extra candidate.
     for (const auto &gc : generic_candidates) {
         bool dup = is_subsumed(gc.raw, slot1) || (!slot2.empty() && is_subsumed(gc.raw, slot2));
         if (!dup) {
@@ -3131,6 +3521,37 @@ static void print_result(const ScanResult                  &result,
     if (!slot2.empty()) out_parts.push_back(slot2);
     for (const auto &v : filled_slots) out_parts.push_back(v);
     if (out_parts.size() > kMaxSlots) out_parts.resize(kMaxSlots);
+
+    // ---- tamper / anomaly marker -------------------------------------------
+    // Appended AFTER the kMaxSlots cap (and not counted against it) so a
+    // possible-spoofing signal can never get silently truncated off the end
+    // of a long version line -- that's exactly the kind of response an
+    // operator most needs to see. Two independent heuristics feed this:
+    //   1. tamper_hint: meta:generator's claimed platform disagrees with
+    //      what the structural (path/JS-global/comment/body) scorer found
+    //      (see extract_html_body_signals) -- a common WAF/honeypot trick is
+    //      serving a fake generator tag while running something else.
+    //   2. duplicate_headers: the same header name appeared twice in one
+    //      response with two different values -- a sign of response
+    //      splitting, a rewriting proxy, or a spoofed banner layered in
+    //      front of the real one.
+    {
+        std::string tamper_note;
+        for (const auto &fp : effective_fps) {
+            if (!fp.tamper_hint.empty()) { tamper_note = fp.tamper_hint; break; }
+        }
+        size_t dup_count = 0;
+        for (const auto &fp : effective_fps) dup_count += fp.duplicate_headers.size();
+
+        std::string marker;
+        if (!tamper_note.empty()) marker = "TAMPER? " + tamper_note;
+        if (dup_count > 0) {
+            if (!marker.empty()) marker += "; ";
+            marker += std::to_string(dup_count) + " duplicate header"
+                      + (dup_count == 1 ? "" : "s") + " w/ conflicting values";
+        }
+        if (!marker.empty()) out_parts.push_back("[" + marker + "]");
+    }
 
     if (confirmed_websocket) {
         std::cout << "\033[32mwebsocket\033[0m\n";
@@ -5103,13 +5524,20 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
 
                 {
                     std::string s(substituted_payload.begin(), substituted_payload.end());
-                    bool is_http11_req = (s.size() >= 4 &&
+                    // NOTE: previously only matched "HTTP/1.1", which silently skipped this
+                    // whole fixup for HTTP/1.0 probes -- including the stock GetRequest probe
+                    // ("GET / HTTP/1.0\r\n\r\n"), the single most common probe run against any
+                    // web port. HTTP/1.0 is legal without Host:, but plenty of real-world
+                    // virtual-hosted/CDN-fronted targets need it anyway, so treat both versions
+                    // the same way here.
+                    bool is_http_req = (s.size() >= 4 &&
                         (s.rfind("GET ",  0) == 0 ||
                          s.rfind("HEAD ", 0) == 0 ||
                          s.rfind("POST ", 0) == 0) &&
-                        s.find("HTTP/1.1") != std::string::npos);
+                        (s.find("HTTP/1.1") != std::string::npos ||
+                         s.find("HTTP/1.0") != std::string::npos));
 
-                    if (is_http11_req) {
+                    if (is_http_req) {
                         std::string sl = s;
                         for (char &c : sl) c = (char)tolower((unsigned char)c);
                         bool has_host = sl.find("\r\nhost:") != std::string::npos ||
@@ -5123,7 +5551,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                     "\r\nHost: " + host_val +
                                     s.substr(term);
                                 vlog::line(g_verbose, "probe-fixup: injected Host: " + host_val +
-                                           " into HTTP/1.1 probe (was missing)", 2);
+                                           " into HTTP probe (was missing)", 2);
                             }
                         }
 
@@ -5139,7 +5567,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                         "\r\nUser-Agent: " + std::string(kDefaultUserAgent) +
                                         s.substr(term2);
                                     vlog::line(g_verbose, "probe-fixup: injected User-Agent "
-                                               "into HTTP/1.1 probe (was missing)", 2);
+                                               "into HTTP probe (was missing)", 2);
                                 }
                             }
                         }
@@ -5289,9 +5717,17 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                     }
                 }
 
-                if (!is_ssl && probe_is_http_req) {
+                // NOTE: previously gated on `!is_ssl`, so an HTTP probe (GET/HEAD/POST)
+                // that got a 4xx over SSL/TLS -- e.g. the stock GetRequest probe hitting
+                // a virtual-hosted HTTPS target without a Host: header -- had no retry
+                // path at all and the raw 400 was accepted as final. Now both transports
+                // are handled: plaintext keeps the original SSL-twin-fingerprint check
+                // (in case the port actually needs SSL), SSL retries directly with a
+                // proper Host-bearing GET over the same TLS connection.
+                if (probe_is_http_req) {
                     int code = extract_status_code(r);
                     if (code >= 400 && code < 500) {
+                        if (!is_ssl) {
                         vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP probe '" +
                                    pa.name + "' got " + std::to_string(code) + " -> trying 400-SSL twin FP", 2);
                         auto twin = do_400_ssl_twin_fingerprint(ip, args.port, read_to,
@@ -5324,25 +5760,68 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                         }
                         vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) +
                                    ": Host-header retry also got no response; keeping original 400", 2);
+                        } else {
+                            // Already on SSL -- do_400_ssl_twin_fingerprint (plaintext-to-SSL
+                            // switch) and capture_http_get (plaintext-only) don't apply here.
+                            // Retry directly over SSL with a well-formed, Host-bearing GET.
+                            vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP probe '" +
+                                       pa.name + "' got " + std::to_string(code) + " over SSL; probe may "
+                                       "have sent Host-less request -> retrying with proper Host: header GET "
+                                       "over SSL", 2);
+                            std::string get_req_ssl = make_get_request("/", ip, args.port, is_ssl);
+                            std::vector<u8> get_payload_ssl(get_req_ssl.begin(), get_req_ssl.end());
+
+                            TlsCertInfo ssl_retry_cert;
+                            std::vector<u8> hr = capture_ssl(ip, args.port, read_to, &get_payload_ssl,
+                                                             args.verbose, &ssl_retry_cert,
+                                                             args.connect_timeout);
+                            if (hr.empty() && !terminate_flag) {
+                                TlsCertInfo ssl_retry_perm_cert;
+                                hr = capture_ssl_permissive(ip, args.port, read_to, &get_payload_ssl,
+                                                            args.verbose, &ssl_retry_perm_cert,
+                                                            args.connect_timeout);
+                            }
+                            if (!hr.empty()) {
+                                int hr_code = extract_status_code(hr);
+                                vlog::ok(g_verbose, "probe #" + std::to_string(attempt_idx) +
+                                         ": SSL Host-header retry got " + std::to_string(hr_code) +
+                                         " (" + std::to_string(hr.size()) + " bytes) -- using this response", 2);
+                                if (is_redirect(hr)) {
+                                    hr = follow_redirects_tcp_fp(ip, args.port, read_to,
+                                                                 args.verbose, std::move(hr),
+                                                                 http_fps);
+                                    method_label = "http-host-retry-ssl-redirect/" + pa.name;
+                                } else {
+                                    http_fps.push_back(
+                                        make_http_fingerprint(hr, "http-host-retry-ssl", true));
+                                    method_label = "http-host-retry-ssl/" + pa.name;
+                                }
+                                response = std::move(hr);
+                                goto capture_done;
+                            }
+                            vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) +
+                                       ": SSL Host-header retry also got no response; keeping original " +
+                                       std::to_string(code), 2);
+                        }
                     }
 
                     if (is_redirect(r)) {
-                        vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP probe '" +
-                                   pa.name + "' got redirect -> dual FP follow", 2);
-                        r = follow_redirects_tcp_fp(ip, args.port, read_to,
-                                                    args.verbose, std::move(r), http_fps);
-                        response     = std::move(r);
-                        method_label = "http-redirect/" + pa.name;
+                        if (is_ssl) {
+                            vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": SSL HTTP probe '" +
+                                       pa.name + "' got redirect -> SSL dual FP follow", 2);
+                            r = follow_redirects_ssl_fp(ip, args.port, args.timeout,
+                                                        args.verbose, std::move(r), http_fps);
+                            method_label = "ssl-redirect/" + pa.name;
+                        } else {
+                            vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP probe '" +
+                                       pa.name + "' got redirect -> dual FP follow", 2);
+                            r = follow_redirects_tcp_fp(ip, args.port, read_to,
+                                                        args.verbose, std::move(r), http_fps);
+                            method_label = "http-redirect/" + pa.name;
+                        }
+                        response = std::move(r);
                         goto capture_done;
                     }
-                } else if (is_ssl && probe_is_http_req && is_redirect(r)) {
-                    vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": SSL HTTP probe '" +
-                               pa.name + "' got redirect -> SSL dual FP follow", 2);
-                    r = follow_redirects_ssl_fp(ip, args.port, args.timeout,
-                                                args.verbose, std::move(r), http_fps);
-                    response     = std::move(r);
-                    method_label = "ssl-redirect/" + pa.name;
-                    goto capture_done;
                 }
 
                 vlog::ok(g_verbose, "probe #" + std::to_string(attempt_idx) + " '" + pa.name + "' got " +
