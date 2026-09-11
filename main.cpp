@@ -10,6 +10,7 @@
 #include "probe.hpp"
 #include "async_io.hpp"
 #include "netns_split.hpp"
+#include "net_capture.hpp"
 #include <stdexcept>
 #include <future>
 #include <thread>
@@ -292,6 +293,9 @@ int main(int argc, char *argv[]) {
        EthArpOptions eth_opts;
        bool dns_enum_enabled = false;
        bool ssl_enum_enabled = false;
+       bool netradar_enabled = false;
+       int  netradar_duration_ms = 0;      // 0 = run until interrupted; set via --time
+       bool netradar_time_specified = false; // true if --time was passed at all, regardless of --netradar
    } config;
    
     std::vector<std::string> ips;
@@ -463,6 +467,23 @@ int main(int argc, char *argv[]) {
                     exit(1);
                 }
             }
+        }},
+        
+        {"--netradar", [&](int& idx) {
+            config.netradar_enabled = true;
+        }},
+        
+        {"--time", [&](int& idx) {
+            std::string val = get_next_arg(idx, "--time");
+            int ms = 0;
+            if (!net_capture::parse_duration_ms(val, ms)) {
+                std::cerr << "--time: invalid duration '" << sanitize_echo(val)
+                           << "' (expected a positive integer with an optional s/m/h suffix, "
+                              "e.g. 30s, 5m, 2h -- a bare number is treated as seconds)\n";
+                exit(1);
+            }
+            config.netradar_duration_ms = ms;
+            config.netradar_time_specified = true;
         }},
         
         {"--sport-range", [&](int& idx) {
@@ -1680,6 +1701,19 @@ int main(int argc, char *argv[]) {
 	   config.target_spec_display += arg;
 	   arg_idx++;
 	}
+    }
+    
+    if (config.netradar_time_specified && !config.netradar_enabled) {
+        std::cerr << "--time is only valid together with --netradar.\n";
+        return 1;
+    }
+
+    if (config.netradar_enabled) {
+        net_capture::Options nopts;
+        nopts.verbose = config.sv_verbose;
+        nopts.duration_ms = config.netradar_duration_ms;
+        nopts.iface = config.interface;
+        return net_capture::run_netradar(nopts);
     }
 
     if (saw_dash4 && saw_dash6) {
