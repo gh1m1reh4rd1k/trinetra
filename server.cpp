@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -31,7 +32,6 @@
 namespace server {
 namespace {
 
-constexpr int    kDefaultPort      = 8787;
 constexpr int    kDefaultTlsPort   = 8443;
 constexpr size_t kMaxHeaderBytes   = 16 * 1024;
 constexpr size_t kMaxBodyBytes     = 4  * 1024;
@@ -49,11 +49,21 @@ constexpr int    kCookieMaxAgeSec       = 3600;  // session cookie lifetime
 constexpr const char* kCookieName       = "shiv_token";
 constexpr int    kConnIdleTimeoutSec    = 20;    // slowloris guard
 constexpr int    kSweepIntervalSec      = 5;
-
 constexpr const char* kStunnelDir      = "/etc/stunnel";
-constexpr const char* kStunnelConfPath = "/etc/stunnel/shiv.conf";
 constexpr const char* kStunnelCertPath = "/etc/stunnel/shiv.pem";
+constexpr const char* kCertLockPath    = "/etc/stunnel/.shiv_cert.lock";
 
+std::string stunnel_conf_path(int tls_port) {
+    return std::string(kStunnelDir) + "/shiv-" + std::to_string(tls_port) + ".conf";
+}
+
+std::string stunnel_section_name(int tls_port) {
+    return "shiv-" + std::to_string(tls_port);
+}
+
+std::string stunnel_manual_log_path(int tls_port) {
+    return "/tmp/shiv_stunnel_start-" + std::to_string(tls_port) + ".log";
+}
 
 volatile std::sig_atomic_t g_shutdown = 0;
 void on_signal(int) { g_shutdown = 1; }
@@ -63,6 +73,8 @@ pid_t g_running_pid = -1;
 std::string g_token;
 std::string g_self_path;
 bool g_secure_cookies = false;
+
+pid_t g_stunnel_pid = -1;
 
 std::unordered_map<std::string, std::pair<int, std::time_t>> g_auth_fail;
 
@@ -1029,49 +1041,56 @@ bool ensure_stunnel_installed() {
 }
 
 bool ensure_tls_cert() {
-    struct stat st{};
-    if (stat(kStunnelCertPath, &st) == 0) return true;
-
-    std::cout << "Generating self-signed TLS cert at " << kStunnelCertPath << "...\n";
     std::string mkdir_cmd = std::string("mkdir -p ") + kStunnelDir;
     if (std::system(mkdir_cmd.c_str()) != 0) {}
 
-    char tmp_key[] = "/tmp/shiv_key_XXXXXX";
-    char tmp_crt[] = "/tmp/shiv_crt_XXXXXX";
-    int kfd = mkstemp(tmp_key);
-    int cfd = mkstemp(tmp_crt);
-    if (kfd < 0 || cfd < 0) {
-        if (kfd >= 0) close(kfd);
-        if (cfd >= 0) close(cfd);
-        std::cerr << "Could not create temp files for cert generation.\n";
-        return false;
-    }
-    close(kfd);
-    close(cfd);
+    int lock_fd = open(kCertLockPath, O_CREAT | O_RDWR, 0600);
+    if (lock_fd >= 0) flock(lock_fd, LOCK_EX);
 
-    std::string gen_cmd = std::string("openssl req -x509 -newkey rsa:2048 -nodes -keyout ") +
-                           tmp_key + " -out " + tmp_crt +
-                           " -days 365 -subj /CN=shiv >/dev/null 2>&1";
-    bool ok = (std::system(gen_cmd.c_str()) == 0);
-    if (ok) {
-        std::string combine_cmd = std::string("cat ") + tmp_crt + " " + tmp_key + " > " +
-                                   kStunnelCertPath + " && chmod 600 " + kStunnelCertPath;
-        ok = (std::system(combine_cmd.c_str()) == 0);
-    } else {
-        std::cerr << "openssl failed to generate a certificate.\n";
+    struct stat st{};
+    bool ok = stat(kStunnelCertPath, &st) == 0;
+    if (!ok) {
+        std::cout << "Generating self-signed TLS cert at " << kStunnelCertPath << "...\n";
+
+        char tmp_key[] = "/tmp/shiv_key_XXXXXX";
+        char tmp_crt[] = "/tmp/shiv_crt_XXXXXX";
+        int kfd = mkstemp(tmp_key);
+        int cfd = mkstemp(tmp_crt);
+        if (kfd < 0 || cfd < 0) {
+            if (kfd >= 0) close(kfd);
+            if (cfd >= 0) close(cfd);
+            std::cerr << "Could not create temp files for cert generation.\n";
+        } else {
+            close(kfd);
+            close(cfd);
+            std::string gen_cmd = std::string("openssl req -x509 -newkey rsa:2048 -nodes -keyout ") +
+                                   tmp_key + " -out " + tmp_crt +
+                                   " -days 365 -subj /CN=shiv >/dev/null 2>&1";
+            ok = (std::system(gen_cmd.c_str()) == 0);
+            if (ok) {
+                std::string combine_cmd = std::string("cat ") + tmp_crt + " " + tmp_key + " > " +
+                                           kStunnelCertPath + " && chmod 600 " + kStunnelCertPath;
+                ok = (std::system(combine_cmd.c_str()) == 0);
+            } else {
+                std::cerr << "openssl failed to generate a certificate.\n";
+            }
+            std::remove(tmp_key);
+            std::remove(tmp_crt);
+            ok = ok && stat(kStunnelCertPath, &st) == 0;
+        }
     }
-    std::remove(tmp_key);
-    std::remove(tmp_crt);
-    return ok && stat(kStunnelCertPath, &st) == 0;
+
+    if (lock_fd >= 0) { flock(lock_fd, LOCK_UN); close(lock_fd); }
+    return ok;
 }
 
-bool write_stunnel_config(int tls_port) {
-    std::ofstream out(kStunnelConfPath, std::ios::trunc);
+bool write_stunnel_config(int tls_port, int internal_port) {
+    std::ofstream out(stunnel_conf_path(tls_port), std::ios::trunc);
     if (!out) return false;
     out << "foreground = yes\n"
-        << "[shiv]\n"
+        << "[" << stunnel_section_name(tls_port) << "]\n"
         << "accept = 0.0.0.0:" << tls_port << "\n"
-        << "connect = 127.0.0.1:" << kDefaultPort << "\n"
+        << "connect = 127.0.0.1:" << internal_port << "\n"
         << "cert = " << kStunnelCertPath << "\n"
         << "sslVersionMin = TLSv1.2\n"
         << "ciphers = HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA\n";
@@ -1104,13 +1123,11 @@ std::string process_comm(int pid) {
     return name;
 }
 
-std::string process_exe_path(int pid) {
-    char buf[4096];
-    std::string link = "/proc/" + std::to_string(pid) + "/exe";
-    ssize_t n = readlink(link.c_str(), buf, sizeof(buf) - 1);
-    if (n <= 0) return "";
-    buf[n] = '\0';
-    return std::string(buf, static_cast<size_t>(n));
+bool process_cmdline_contains(int pid, const std::string& needle) {
+    std::ifstream f("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
+    if (!f) return false;
+    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return data.find(needle) != std::string::npos;
 }
 
 bool wait_for_port_listening(int port, std::vector<std::string>* occupants = nullptr,
@@ -1139,10 +1156,8 @@ bool wait_for_port_listening(int port, std::vector<std::string>* occupants = nul
     return false;
 }
 
-constexpr const char* kStunnelManualLogPath = "/tmp/shiv_stunnel_start.log";
-
-void print_captured_stunnel_output() {
-    std::ifstream log(kStunnelManualLogPath);
+void print_captured_stunnel_output(const std::string& log_path) {
+    std::ifstream log(log_path);
     if (!log) return;
     std::string line;
     bool any = false;
@@ -1153,125 +1168,62 @@ void print_captured_stunnel_output() {
     if (!any) std::cerr << "(stunnel produced no output -- it may have exited before printing anything)\n";
 }
 
-void print_systemd_unit_failure(const std::string& unit) {
-    std::string cmd = "journalctl -u " + unit + " -n 20 --no-pager 2>/dev/null";
-    FILE* p = popen(cmd.c_str(), "r");
-    if (!p) return;
-    char buf[512];
-    bool any = false;
-    while (fgets(buf, sizeof(buf), p)) {
-        if (!any) { std::cerr << unit << " journal:\n"; any = true; }
-        std::cerr << "  " << buf;
-    }
-    pclose(p);
-    if (!any) std::cerr << "(no journal output for " << unit << " -- is journald running?)\n";
-}
-
-void clear_stale_listener(int tls_port) {
-    [[maybe_unused]] int rc_stop1 = std::system("systemctl stop stunnel4 >/dev/null 2>&1");
-    [[maybe_unused]] int rc_stop2 = std::system("systemctl stop stunnel@shiv >/dev/null 2>&1");
-    std::string pkill_cmd = std::string("pkill -f '") + kStunnelConfPath + "' >/dev/null 2>&1";
-    [[maybe_unused]] int rc_pkill = std::system(pkill_cmd.c_str());
-    constexpr int kMaxAttempts        = 20;
-    constexpr int kSigkillAfterAttempt = 10;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        auto pids = pids_listening_on_port(tls_port);
-        if (pids.empty()) return;
-
-        bool killed_any = false;
-        for (int pid : pids) {
-            std::string comm = process_comm(pid);
-            if (comm.find("stunnel") != std::string::npos) {
-                kill(pid, attempt < kSigkillAfterAttempt ? SIGTERM : SIGKILL);
-                killed_any = true;
-            } else {
-                std::cerr << "Port " << tls_port << " is already in use by pid " << pid
-                           << " (" << (comm.empty() ? "unknown process" : comm)
-                           << "), which isn't stunnel -- leaving it alone. Pick a "
-                              "different --server-port or stop that process yourself.\n";
-            }
-        }
-        if (!killed_any) return;
-        usleep(100000);
-    }
-    for (int pid : pids_listening_on_port(tls_port)) {
+bool report_if_port_busy(int tls_port) {
+    auto pids = pids_listening_on_port(tls_port);
+    if (pids.empty()) return false;
+    const std::string conf_path = stunnel_conf_path(tls_port);
+    for (int pid : pids) {
         std::string comm = process_comm(pid);
-        if (comm.find("stunnel") != std::string::npos) {
-            std::cerr << "Port " << tls_port << " is still held by stunnel pid " << pid
-                       << " after SIGTERM/SIGKILL -- it may be stuck (e.g. uninterruptible "
-                          "I/O). The next start attempt may still fail with "
-                          "\"Address already in use\".\n";
+        bool ours = comm.find("stunnel") != std::string::npos &&
+                    process_cmdline_contains(pid, conf_path);
+        std::cerr << "Port " << tls_port << " is already in use by pid " << pid
+                   << " (" << (comm.empty() ? "unknown process" : comm) << ")";
+        if (ours) {
+            std::cerr << " -- this looks like a stunnel instance for this exact "
+                          "--server-port from an earlier shiv --server run. If it's "
+                          "stale, stop it with: kill " << pid << "\n";
+        } else {
+            std::cerr << ". Pick a different --server-port or stop that process yourself.\n";
         }
     }
-}
-
-bool looks_like_shiv(int pid) {
-    if (process_comm(pid) == "shiv") return true;
-    std::string exe = process_exe_path(pid);
-    return !exe.empty() && !g_self_path.empty() && exe == g_self_path;
-}
-
-void clear_stale_shiv_listener(int port) {
-    pid_t self = getpid();
-    constexpr int kMaxAttempts        = 20;
-    constexpr int kSigkillAfterAttempt = 10;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        auto pids = pids_listening_on_port(port);
-        bool killed_any = false;
-        for (int pid : pids) {
-            if (pid == self) continue;  // nothing of ours is listening yet at this point
-            if (looks_like_shiv(pid)) {
-                kill(pid, attempt < kSigkillAfterAttempt ? SIGTERM : SIGKILL);
-                killed_any = true;
-            } else {
-                std::string comm = process_comm(pid);
-                std::cerr << "Port " << port << " is already in use by pid " << pid
-                           << " (" << (comm.empty() ? "unknown process" : comm)
-                           << "), which isn't shiv -- leaving it alone. Stop that "
-                              "process yourself before starting shiv --server.\n";
-            }
-        }
-        if (!killed_any) return;
-        usleep(100000);
-    }
-    for (int pid : pids_listening_on_port(port)) {
-        if (pid == self) continue;
-        if (looks_like_shiv(pid)) {
-            std::cerr << "Port " << port << " is still held by a previous shiv pid " << pid
-                       << " after SIGTERM/SIGKILL -- it may be stuck (e.g. uninterruptible "
-                          "I/O). The bind() below may still fail with "
-                          "\"Address already in use\".\n";
-        }
-    }
+    return true;
 }
 
 bool start_stunnel(int tls_port) {
-    clear_stale_listener(tls_port);
-    bool started = false;
-    bool used_manual_launch = false;
-    std::string started_via_unit;
-    if (std::system("systemctl restart stunnel4 >/dev/null 2>&1") == 0) {
-        started = true;
-        started_via_unit = "stunnel4";
-    } else if (std::system("systemctl restart stunnel@shiv >/dev/null 2>&1") == 0) {
-        started = true;
-        started_via_unit = "stunnel@shiv";
-    } else {
-        used_manual_launch = true;
-        std::string pkill_cmd = std::string("pkill -f '") + kStunnelConfPath + "' >/dev/null 2>&1; ";
-        if (std::system(pkill_cmd.c_str()) != 0) {}
-        std::string log_redirect = std::string(" >") + kStunnelManualLogPath + " 2>&1";
-        std::string cmd = "stunnel " + std::string(kStunnelConfPath) + log_redirect + " &";
-        started = (std::system(cmd.c_str()) == 0);
-        if (!started) {
-            std::string cmd4 = "stunnel4 " + std::string(kStunnelConfPath) + log_redirect + " &";
-            started = (std::system(cmd4.c_str()) == 0);
-        }
-    }
-    if (!started) {
-        if (used_manual_launch) print_captured_stunnel_output();
+    if (report_if_port_busy(tls_port)) return false;
+
+    const std::string conf_path = stunnel_conf_path(tls_port);
+    const std::string log_path  = stunnel_manual_log_path(tls_port);
+
+    int log_fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    pid_t pid = fork();
+    if (pid < 0) {
+        std::cerr << "fork() failed launching stunnel: " << strerror(errno) << "\n";
+        if (log_fd >= 0) close(log_fd);
         return false;
     }
+    if (pid == 0) {
+        if (log_fd >= 0) {
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        }
+        setsid();
+        execlp("stunnel", "stunnel", conf_path.c_str(), static_cast<char*>(nullptr));
+        execlp("stunnel4", "stunnel4", conf_path.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    if (log_fd >= 0) close(log_fd);
+
+    usleep(150000);
+    int status = 0;
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+        std::cerr << "stunnel exited immediately (is it installed as either "
+                      "'stunnel' or 'stunnel4'?).\n";
+        print_captured_stunnel_output(log_path);
+        return false;
+    }
+    g_stunnel_pid = pid;
 
     std::vector<std::string> occupants;
     if (!wait_for_port_listening(tls_port, &occupants)) {
@@ -1291,11 +1243,10 @@ bool start_stunnel(int tls_port) {
                           "  sudo dmesg | tail -50                                    "
                           "(check for LSM denials around the time of the failure)\n";
         }
-        if (used_manual_launch) {
-            print_captured_stunnel_output();
-        } else if (!started_via_unit.empty()) {
-            print_systemd_unit_failure(started_via_unit);
-        }
+        print_captured_stunnel_output(log_path);
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        g_stunnel_pid = -1;
         return false;
     }
     std::string ufw_cmd = "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | "
@@ -1305,11 +1256,21 @@ bool start_stunnel(int tls_port) {
     return true;
 }
 
+// Kills exactly the stunnel process this instance spawned -- nothing else.
 void stop_stunnel() {
-    if (std::system("systemctl stop stunnel4 >/dev/null 2>&1") == 0) return;
-    if (std::system("systemctl stop stunnel@shiv >/dev/null 2>&1") == 0) return;
-    std::string cmd = std::string("pkill -f '") + kStunnelConfPath + "' >/dev/null 2>&1";
-    if (std::system(cmd.c_str()) != 0) {}
+    if (g_stunnel_pid <= 0) return;
+    kill(g_stunnel_pid, SIGTERM);
+    int status = 0;
+    for (int i = 0; i < 20; ++i) {
+        if (waitpid(g_stunnel_pid, &status, WNOHANG) == g_stunnel_pid) {
+            g_stunnel_pid = -1;
+            return;
+        }
+        usleep(100000);
+    }
+    kill(g_stunnel_pid, SIGKILL);
+    waitpid(g_stunnel_pid, &status, 0);
+    g_stunnel_pid = -1;
 }
 
 }
@@ -1347,11 +1308,6 @@ int run(int argc, char* argv[]) {
         std::cerr << "--server-port must be 1-65535\n";
         return 1;
     }
-    if (tls_port == kDefaultPort) {
-        std::cerr << "--server-port cannot be " << kDefaultPort
-                   << " (reserved for shiv's internal loopback listener)\n";
-        return 1;
-    }
     if (!fixed_token.empty() && fixed_token.size() < kMinFixedTokenLen) {
         std::cerr << "--server-token must be at least " << kMinFixedTokenLen
                    << " characters (needs enough entropy to resist guessing)\n";
@@ -1376,19 +1332,19 @@ int run(int argc, char* argv[]) {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
     signal(SIGCHLD, SIG_DFL);
-    clear_stale_shiv_listener(kDefaultPort);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (listen_fd < 0) {
         std::cerr << "socket() failed: " << strerror(errno) << "\n";
         return 1;
     }
-    int one = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
+    // Port 0 asks the kernel for any free ephemeral port. This is what
+    // lets N instances run at once with zero chance of colliding on the
+    // backend listener -- each one just gets whatever's free right now.
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(kDefaultPort));
+    addr.sin_port = htons(0);
     if (inet_pton(AF_INET, bind_addr.c_str(), &addr.sin_addr) != 1) {
         std::cerr << "Internal error: invalid loopback bind address '" << bind_addr << "'\n";
         return 1;
@@ -1402,6 +1358,13 @@ int run(int argc, char* argv[]) {
         return 1;
     }
 
+    socklen_t addrlen = sizeof(addr);
+    if (getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), &addrlen) != 0) {
+        std::cerr << "getsockname() failed: " << strerror(errno) << "\n";
+        return 1;
+    }
+    const int internal_port = ntohs(addr.sin_port);
+
     g_epfd = epoll_create1(EPOLL_CLOEXEC);
     if (g_epfd < 0) {
         std::cerr << "epoll_create1() failed: " << strerror(errno) << "\n";
@@ -1409,18 +1372,20 @@ int run(int argc, char* argv[]) {
     }
     epoll_add(listen_fd, EPOLLIN);
 
-    std::cout << "shiv server listening on " << bind_addr << ":" << kDefaultPort << " (loopback only)\n";
+    std::cout << "shiv server listening on " << bind_addr << ":" << internal_port
+               << " (loopback only, internal)\n";
     std::cout << "Auth token: " << g_token << "\n";
 
     bool tls_ready = false;
     if (!ensure_stunnel_installed()) {
-        std::cout << "Falling back to plaintext, loopback-only: http://127.0.0.1:" << kDefaultPort
+        std::cout << "Falling back to plaintext, loopback-only: http://127.0.0.1:" << internal_port
                    << "/?token=" << g_token << "\n";
     } else if (!ensure_tls_cert()) {
-        std::cout << "Falling back to plaintext, loopback-only: http://127.0.0.1:" << kDefaultPort
+        std::cout << "Falling back to plaintext, loopback-only: http://127.0.0.1:" << internal_port
                    << "/?token=" << g_token << "\n";
-    } else if (!write_stunnel_config(tls_port)) {
-        std::cout << "Could not write " << kStunnelConfPath << " (are you root?); TLS not started.\n";
+    } else if (!write_stunnel_config(tls_port, internal_port)) {
+        std::cout << "Could not write " << stunnel_conf_path(tls_port)
+                   << " (are you root?); TLS not started.\n";
     } else if (!start_stunnel(tls_port)) {
         std::cout << "Could not start stunnel; TLS not started. Is it installed?\n";
     } else {
