@@ -3516,6 +3516,20 @@ void print_full_help() {
 		std::cerr << "                                      For eg: shiv  abc.com -sS -Pn --enum shodan,dns (scan, then shodan + dns enum)\n";
 		std::cerr << "                                      For eg: shiv  abc.com --enum shodan,trail:<api-key>,dns (multiple modules, any order)\n\n";
 		
+		std::cerr << color::green << "Passive Discovery (--netradar) Options:\n" << color::reset;
+		std::cerr << color::yellow << " --netradar" << color::reset << " Passively watch the wire instead of sending probes: puts the interface in promiscuous mode\n";
+		std::cerr << "             and correlates TCP SYN/SYN-ACK/ACK/PSH/PSH-ACK/FIN-ACK traffic plus QUIC and DNS\n";
+		std::cerr << "             query/response exchanges to report which hosts have which ports open. No packets\n";
+		std::cerr << "             of shiv's own are ever sent -- only what already crosses the capture NIC is seen\n";
+		std::cerr << "             (same LAN segment, a switch mirror/SPAN port, or an on-path gateway).\n";
+		std::cerr << color::yellow << " --time" << color::reset << " <N>[s|m|h] Only valid together with --netradar. Capture for this long, then stop\n";
+		std::cerr << "             automatically and print one aggregated report (grouped by host, every open port\n";
+		std::cerr << "             folded into a single comma-separated cell). Omit --time to run until Ctrl-C instead\n";
+		std::cerr << "             -- the report still prints once, at that point.\n\n";
+		std::cerr << "                                      For eg: shiv --netradar (run until Ctrl-C, then print the report)\n";
+		std::cerr << "                                      For eg: shiv --netradar --time 30s (capture for 30 seconds)\n";
+		std::cerr << "                                      For eg: shiv --netradar --time 5m --interface eth0 (5 minutes on a specific interface)\n\n";
+		
 		std::cerr << color::cyan << "Filtered State Tackle Controller / Performance Options \n" << color::reset;
 		std::cerr << color::yellow << "  --retry-delay-min" << color::reset << " <dur>       Floor for congestion-scaled retry delay (default: 3ms)\n";
 		std::cerr << color::yellow << "  --retry-delay-max" << color::reset << " <dur>       Ceiling for congestion-scaled retry delay (default: 700ms)\n";
