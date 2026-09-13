@@ -2874,7 +2874,7 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                 auto rit = result.icmp_filter_reasons.find(fport);
                 if (rit != result.icmp_filter_reasons.end()) {
                     std::string icmp_note;
-                    switch (rit->second) {
+                    switch (rit->second.reason) {
                         case IcmpFilterReason::NetAdminProhibited:
                             icmp_note = "Net-admin-prohibited"
                                         " (" + color::red + "ACL/router policy blocks subnet" + color::reset + ")";
@@ -2899,7 +2899,7 @@ void thread_worker(const std::vector<std::string>& thread_ips,
             }
             if (!result.icmp_warnings.empty()) {
                 std::unordered_set<int> seen_w;
-                for (auto& [wr, wmsg] : result.icmp_warnings) {
+                for (auto& [wr, wmsg, wreplier] : result.icmp_warnings) {
                     if (seen_w.insert(static_cast<int>(wr)).second) {
                         layer3_reason += "Warning        : "
                                        + color::yellow + wmsg + color::reset + "\n";
