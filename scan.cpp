@@ -2789,19 +2789,14 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
     }
     
     {
-        auto _discard = std::make_unique<RawPacket[]>(64);
-        while (my_queue->try_dequeue_bulk(_discard.get(), 64) > 0) {}
+        thread_local std::array<RawPacket, 64> _discard_buf;
+        while (my_queue->try_dequeue_bulk(_discard_buf.data(), 64) > 0) {}
     }
     RTTTracker& global_rtt_tracker = shared_rtt_tracker;
     std::vector<int32_t> port_to_idx(65536, -1);
-
-    // Sized to exactly what we're scanning, not 65536.
     std::vector<PortState>          port_states_arr(ports.size());
     std::vector<std::atomic<bool>>  port_final(ports.size());
     std::vector<std::atomic<bool>>  port_rtt_measured(ports.size());
-
-    // Assigned sequentially in the init loop below; recovers the real
-    // port number from an index when needed (htons(), composite keys).
     std::vector<uint16_t> idx_to_port(ports.size());
 
     // Running counter for the dense index space.
@@ -2991,6 +2986,14 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
         }
     };
     std::thread sender_thread(sender_thread_func);
+    auto shutdown_sender_thread = [&]() {
+        if (sender_thread.joinable()) {
+            PacketTask poison_pill;
+            poison_pill.is_poison = true;
+            packet_queue.enqueue(std::move(poison_pill));
+            sender_thread.join();
+        }
+    };
 
     std::string scan_name_str;
     switch (scan_type) {
@@ -3470,9 +3473,14 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
             got = my_queue->try_dequeue_bulk(pkt_batch, 32);
             break;  // re-check active_count / process whatever we got, same as before
         }
+        size_t icmp_got = 0;
 
         for (size_t pi = 0; pi < got; ++pi) {
             RawPacket& rp   = pkt_batch[pi];
+            if (rp.pkt_type == RawPacket::PktType::ICMP) {
+                if (icmp_got < 8) icmp_pkts[icmp_got++] = std::move(rp);
+                continue;
+            }
             int        bytes = rp.len;
             const char* buffer = reinterpret_cast<const char*>(rp.data);
 
@@ -3723,7 +3731,6 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
 
         if (got == 0) {
             const size_t mixed_got = my_queue->try_dequeue_bulk(mixed, 32);
-            size_t icmp_got = 0;
             for (size_t mi = 0; mi < mixed_got; ++mi) {
                 if (mixed[mi].pkt_type == RawPacket::PktType::ICMP && icmp_got < 8) {
                     icmp_pkts[icmp_got++] = std::move(mixed[mi]);
@@ -3733,7 +3740,9 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     my_queue->enqueue(std::move(mixed[mi]));
                 }
             }
+        }
 
+        {
             for (size_t ip = 0; ip < icmp_got; ++ip) {
                 const RawPacket& rp        = icmp_pkts[ip];
                 const char*      icmp_buf  = reinterpret_cast<const char*>(rp.data);
@@ -3768,6 +3777,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                         std::lock_guard<std::mutex> lk(cout_mutex);
                         std::cerr << msg;
                     }
+                    shutdown_sender_thread();
                     return result;
                 }
 
@@ -3818,6 +3828,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                                 std::cerr << msg;
                             }
                         }
+                        shutdown_sender_thread();
                         return result;
                     }
                     default: break;
@@ -5711,6 +5722,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
     uint64_t lost_slot_warnings  = 0;
     uint64_t dbg_oversized_drops = 0;
     uint64_t dbg_rxq_ovfl_total  = 0;
+    uint64_t dbg_rxq_ovfl_last_reported = 0;
     uint64_t dbg_cq_overflow_last = 0;
     uint64_t dbg_loop_iters      = 0;
     uint64_t dbg_slow_iters      = 0;
@@ -6152,17 +6164,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                             } else if (c->cmsg_type == SO_RXQ_OVFL) {
                                 uint32_t ovfl = 0;
                                 std::memcpy(&ovfl, CMSG_DATA(c), sizeof(ovfl));
-                                if (ovfl > 0) {
-                                    uint64_t prev = dbg_rxq_ovfl_total;
-                                    dbg_rxq_ovfl_total = ovfl;
-                                    if (ovfl != prev) {
-				        auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-					    std::chrono::steady_clock::now().time_since_epoch()).count();
-				        std::lock_guard<std::mutex> lock(cout_mutex);
-				        std::cerr << "[DBG-RX9a] t=" << now_us << "us SO_RXQ_OVFL: " << ovfl
-					          << " kernel drops on TCP socket\n";
-				    }
-                                }
+                                if (ovfl > 0) dbg_rxq_ovfl_total = ovfl;
                             }
                         }
                         pkt.kernel_rx_us = kernel_rx_us;
