@@ -923,7 +923,7 @@ bool build_packet(const PacketTask& task, char* packet_buffer, size_t buffer_siz
     const uint16_t&    manual_tcp_checksum     = opts.manual_tcp_checksum;
     const uint8_t&     window_scale            = opts.window_scale;
     const uint16_t&    mss_value               = opts.mss_value;
-    const uint32_t&    timestamp_val           = opts.timestamp_val;
+    const uint32_t&    timestamp_val           = task.timestamp_val;
     const uint32_t&    timestamp_ecr_custom    = opts.timestamp_ecr_custom;
     const uint16_t&    nops_count              = opts.nops_count;
     const bool&        sack_permitted          = opts.sack_permitted;
@@ -2666,7 +2666,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                       print_filtered_if_few,
                       struct io_uring *send_ring, bool fast_scan, size_t batch_size, ScanType scan_type,uint8_t custom_ttl, uint8_t custom_dscp,uint16_t custom_ip_flags, IpIdMode ip_id_mode, uint16_t fixed_ip_id,
                       const TcpBuildOptions& opts,
-                      RTTTracker& shared_rtt_tracker,
+                      RTTTracker& shared_rtt_tracker, uint32_t shared_tsval_offset,
                       bool debug_rtt,bool debug_ttl,bool debug_demux,bool debug_strack,bool frag_out_of_order,bool frag_overlap, uint16_t frag_overlap_bytes,bool
                       frag_zof,const SportRangeConfig& sport_range_cfg,const GsportConfig& gsport_cfg,int initial_rtt_ms,int port_timeout_min_ms, int port_timeout_max_ms,RateConfig rate_config,JitterConfig 
                       jitter_config,BatchDelayConfig
@@ -2851,7 +2851,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
     active_ports.reserve(ports.size());
 
     std::uniform_int_distribution<uint32_t> seq_dist(0, 4294967295U);
-
+    const uint32_t target_tsval_offset = shared_tsval_offset;
     static const std::unordered_set<ScanType> no_retry_scan_types = {
         ScanType::FIN, ScanType::NULL_SCAN, ScanType::XMAS,
         ScanType::CWR, ScanType::URG, ScanType::PSH, ScanType::HANUMAN
@@ -3092,7 +3092,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
         uint32_t seq          = use_token
                                 ? compute_token(static_cast<uint16_t>(port))
                                 : (seq_num > 0 ? seq_num : seq_dist(rng));
-        uint32_t tsval        = 1234567;
+        uint32_t tsval_offset = target_tsval_offset;
         int initial_timeout   = global_rtt_tracker.get_timeout_for_retry(0);
         initial_timeout = std::max(port_timeout_min_ms, std::min(initial_timeout, port_timeout_max_ms));
         port_to_idx[port]       = static_cast<int32_t>(next_idx);
@@ -3110,7 +3110,8 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
         ps.retries_cap            = g_cong_tune.min_retries;
         ps.timeout_ms             = initial_timeout;
         ps.syn_sent_time          = now;
-        ps.sent_tsval             = tsval;
+        ps.tsval_offset           = tsval_offset;
+        ps.sent_tsval             = generate_tcp_tsval() + tsval_offset;
         ps.ewma_rtt               = static_cast<double>(initial_timeout);
         ps.reported_state         = PortState::PortReportedState::None;
         ps.initial_send_deferred  = true;
@@ -4013,6 +4014,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
 
                 if (state.initial_send_deferred) {
                     state.initial_send_deferred = false;
+                    state.sent_tsval = generate_tcp_tsval() + state.tsval_offset;
                     state.syn_sent_time = now;  
                     state.start_time    = now;
 
@@ -4047,13 +4049,13 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     }
 
                     deadline_heap.push({now + std::chrono::milliseconds(state.timeout_ms), port});
-                    continue;   // this pop is fully handled; don't fall into
-                                // the retry_send_deferred / retry logic below
+                    continue; 
                 }
 
                 if (state.retry_send_deferred) {
                     state.retry_send_deferred = false;
-                    state.syn_sent_time = now;   // real send time, for accurate RTT
+                    state.sent_tsval = generate_tcp_tsval() + state.tsval_offset;
+                    state.syn_sent_time = now;
                     tx_ts_table[pidx].store(0, std::memory_order_release);
                     tx_ts_precise[pidx].store(false, std::memory_order_release);
                     real_tx_ts_us[pidx].store(0, std::memory_order_release);
@@ -4161,7 +4163,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     state.retry_count++;
                     state.start_time    = now;
                     state.syn_sent_time = now;
-                    state.sent_tsval    = 1234567;
+                    state.sent_tsval    = generate_tcp_tsval() + state.tsval_offset;
 
                     if (state.retry_count == 1) {
                         state.retries_cap = g_dynamic_max_retries.load(std::memory_order_relaxed);
@@ -4736,18 +4738,18 @@ void flush_sent_packet_debug() {
         case ScanType::SYN: {
             if ((tcph->th_flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK) && !state.connection_established) {
                 state.ack_seq = ntohl(tcph->th_seq) + 1;
-
+                state.sent_tsval = generate_tcp_tsval() + state.tsval_offset;
                 if (!fast_scan) {
                     if (dest6_ptr) {
                         sockaddr_in6 single_dest6 = *dest6_ptr;
                         single_dest6.sin6_port = htons(dest_port);
                         packet_queue.enqueue(PacketTask(
-                            single_dest6, state.src_port, state.seq + 1, state.ack_seq, TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale,
+                            single_dest6, state.src_port, state.seq + 1, state.ack_seq, TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale,
                             mss_value, timestamp_val, timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,
                             use_badsum, custom_badsum_value,use_partial_badsum, partial_badsum_type,use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
                         ));
                         packet_queue.enqueue(PacketTask(
-                            single_dest6, state.src_port, state.seq + 1, state.ack_seq, TH_FIN | TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale, mss_value, timestamp_val,
+                            single_dest6, state.src_port, state.seq + 1, state.ack_seq, TH_FIN | TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale, mss_value, timestamp_val,
                             timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,use_badsum, custom_badsum_value,use_partial_badsum, partial_badsum_type,
                             use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
                         ));
@@ -4755,12 +4757,12 @@ void flush_sent_packet_debug() {
                     sockaddr_in single_dest = dest;
                     single_dest.sin_port = htons(dest_port);
                     packet_queue.enqueue(PacketTask(
-                        single_dest, state.src_port, state.seq + 1, state.ack_seq, TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale, 
+                        single_dest, state.src_port, state.seq + 1, state.ack_seq, TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale, 
                         mss_value, timestamp_val, timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,
                         use_badsum, custom_badsum_value,use_partial_badsum, partial_badsum_type,use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
                     ));
                     packet_queue.enqueue(PacketTask(
-                        single_dest, state.src_port, state.seq + 1, state.ack_seq, TH_FIN | TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale, mss_value, timestamp_val, 
+                        single_dest, state.src_port, state.seq + 1, state.ack_seq, TH_FIN | TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale, mss_value, timestamp_val, 
                         timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,use_badsum, custom_badsum_value,use_partial_badsum, partial_badsum_type,
                         use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
                     ));
@@ -4951,18 +4953,18 @@ void flush_sent_packet_debug() {
                 !state.connection_established) {
                 
                 state.ack_seq = ntohl(tcph->th_seq) + 1;
-
+                state.sent_tsval = generate_tcp_tsval() + state.tsval_offset;
                 if (!fast_scan) {
                     if (dest6_ptr) {
                         sockaddr_in6 single_dest6 = *dest6_ptr;
                         single_dest6.sin6_port = htons(dest_port);
                         packet_queue.enqueue(PacketTask(
-                            single_dest6, state.src_port, state.seq + 1, state.ack_seq, TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale,
+                            single_dest6, state.src_port, state.seq + 1, state.ack_seq, TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale,
                             mss_value, timestamp_val, timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,
                             use_badsum, custom_badsum_value,use_partial_badsum, partial_badsum_type,use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
                         ));
                         packet_queue.enqueue(PacketTask(
-                            single_dest6, state.src_port, state.seq + 1, state.ack_seq, TH_FIN | TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale, mss_value, timestamp_val,
+                            single_dest6, state.src_port, state.seq + 1, state.ack_seq, TH_FIN | TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale, mss_value, timestamp_val,
                             timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,use_badsum, custom_badsum_value,use_partial_badsum, partial_badsum_type,
                             use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
                         ));
@@ -4970,12 +4972,12 @@ void flush_sent_packet_debug() {
                     sockaddr_in single_dest = dest;
                     single_dest.sin_port = htons(dest_port);
                     packet_queue.enqueue(PacketTask(
-                        single_dest, state.src_port, state.seq + 1, state.ack_seq, TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale, 
+                        single_dest, state.src_port, state.seq + 1, state.ack_seq, TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale, 
                         mss_value, timestamp_val, timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,
                         use_badsum, custom_badsum_value,use_partial_badsum, partial_badsum_type,use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
                     ));
                     packet_queue.enqueue(PacketTask(
-                        single_dest, state.src_port, state.seq + 1, state.ack_seq, TH_FIN | TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale, mss_value, timestamp_val, 
+                        single_dest, state.src_port, state.seq + 1, state.ack_seq, TH_FIN | TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale, mss_value, timestamp_val, 
                         timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,use_badsum, custom_badsum_value,use_partial_badsum, partial_badsum_type,
                         use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
                     ));
@@ -5097,12 +5099,13 @@ void flush_sent_packet_debug() {
     }
     if (state.connection_established && state.fin_sent && !state.fin_ack_received) {
         if (tcph->th_flags & TH_FIN) {
+            state.sent_tsval = generate_tcp_tsval() + state.tsval_offset;
             uint32_t data_len = bytes - (iph ? (iph->ip_hl * 4) : 0) - (tcph->th_off * 4);
             if (dest6_ptr) {
                 sockaddr_in6 single_dest6 = *dest6_ptr;
                 single_dest6.sin6_port = htons(dest_port);
                 packet_queue.enqueue(PacketTask(
-                    single_dest6, state.src_port, state.seq + 2, ntohl(tcph->th_seq) + data_len + 1, TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale, mss_value,
+                    single_dest6, state.src_port, state.seq + 2, ntohl(tcph->th_seq) + data_len + 1, TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale, mss_value,
                     timestamp_val, timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,use_badsum, custom_badsum_value,
                     use_partial_badsum, partial_badsum_type,use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
                 ));
@@ -5110,7 +5113,7 @@ void flush_sent_packet_debug() {
             sockaddr_in single_dest = dest;
             single_dest.sin_port = htons(dest_port);
             packet_queue.enqueue(PacketTask(
-                single_dest, state.src_port, state.seq + 2, ntohl(tcph->th_seq) + data_len + 1, TH_ACK, std::string(), current_time, 0, scan_type, 1234567, 0, true, window_scale, mss_value, 
+                single_dest, state.src_port, state.seq + 2, ntohl(tcph->th_seq) + data_len + 1, TH_ACK, std::string(), current_time, 0, scan_type, state.sent_tsval, 0, true, window_scale, mss_value, 
                 timestamp_val, timestamp_ecr_custom, nops_count, sack_permitted, custom_data, data_length, use_custom_data, generate_random_data,use_badsum, custom_badsum_value,
                 use_partial_badsum, partial_badsum_type,use_tfo_cookie, tfo_cookie_as_hex, tfo_cookie_random,tfo_cookie_str, tfo_cookie_num, tfo_cookie_length
             ));
@@ -6467,7 +6470,8 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
     } idle_ring_guard{&idle_ring, idle_ring_ok, g_recv, dest_ip_key,
                        dest_ip_key6_valid, dest_ip_key6};
     
-    RTTTracker shared_rtt_tracker(initial_rtt_ms);   // one tracker per target, shared across every batch below
+    RTTTracker shared_rtt_tracker(initial_rtt_ms);
+    const uint32_t shared_tsval_offset = static_cast<uint32_t>(rng());
     uint64_t pending_dispatch_delay_us = 0;   // computed for batch i, consumed by batch i's receive_response() call
     for (const auto& range : batches) {
         if (terminate_flag) break;
@@ -6480,7 +6484,7 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
         RecPross batch_result = receive_response(ip, batch_ports, effective_src_ip, rng, pool, 
                                  send_sock, source_port, retry_source_port, seq_num, win_size, print_individual_closed_filtered, print_filtered_if_few,send_ring, fast_scan, scan_batch_size, scan_type,
                                  custom_ttl,custom_dscp,custom_ip_flags, ip_id_mode, fixed_ip_id,
-                                 opts, shared_rtt_tracker,
+                                 opts, shared_rtt_tracker, shared_tsval_offset,
                                    debug_rtt,debug_ttl,debug_demux,debug_strack,frag_out_of_order,frag_overlap, frag_overlap_bytes,frag_zof,sport_range_cfg,gsport_cfg,initial_rtt_ms,port_timeout_min_ms,port_timeout_max_ms,rate_config,jitter_config,batch_delay_config,
                                  g_recv,g_send, idle_ring_ok ? &idle_ring : nullptr, &rate_state,
                                  bandwidth_config, &bandwidth_state,
