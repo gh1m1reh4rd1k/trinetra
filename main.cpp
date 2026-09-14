@@ -218,7 +218,7 @@ int main(int argc, char *argv[]) {
                 fixed_ip_id = 0, data_length = 0, nops_count = 0, mss_value = 1460,frag_offset_size  = 8,mtu_size = 0;
        int user_rcvbuf_size = -1,port_timeout_min_ms = 5,port_timeout_max_ms = 700;
        uint8_t custom_ttl = 64, window_scale = 7,custom_dscp = 0,custom_ip_tos = 0;SportRangeConfig sport_range_cfg;GsportConfig gsport_cfg;
-       uint32_t seq_num = 0, timestamp_val = 1234567, timestamp_ecr_custom = 0;
+       uint32_t seq_num = 0, timestamp_val = generate_tcp_tsval(), timestamp_ecr_custom = 0;
        size_t send_uring_depth = 2048, rcv_uring_depth = 0, main_batch_size = 500;
        bool batch_specified = false;
        bool debug_rtt = false;
