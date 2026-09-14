@@ -285,21 +285,17 @@ struct Ipv6ExtHeaderOptions {
     uint32_t  stop_dest_n = 1;   // --stop dest:2 -> Nth Destination Options occurrence (1-indexed)
 };
 
-// Parses --dest's <option>[:<value>]. Same contract as parse_hop_option().
-
-// Parses --ah's <mode>: yes|badspi|noicv|badlen|seq0
-
-// Parses --esp's <mode>: yes|badpad|badspi|noiv|bad
-
-// Parses --flow's <value>: a 0-1048575 number, "0", "rand", or "inc".
-
-// Maps a --chain custom:... token to its IPPROTO_* value.
-
-// Parses --chain's <option>[:<value>]. Returns false (message on stderr,
-// `out` left untouched) on anything malformed or out of range.
-
-// Parses --stop's <position>[:<value>]. Returns false (message on stderr,
-// `out` left untouched) on anything malformed or out of range.
+inline uint32_t generate_tcp_tsval() {
+    static const uint32_t base_offset = [] {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        return std::uniform_int_distribution<uint32_t>()(gen);
+    }();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+    return base_offset + static_cast<uint32_t>(ms);
+}
 
 struct TcpBuildOptions {
     bool        use_ip_tos              = false;
@@ -310,7 +306,7 @@ struct TcpBuildOptions {
 
     uint8_t     window_scale            = 7;
     uint16_t    mss_value               = 1460;
-    uint32_t    timestamp_val           = 1234567;
+    uint32_t    timestamp_val           = generate_tcp_tsval();
     uint32_t    timestamp_ecr_custom    = 0;
     uint16_t    nops_count              = 0;
     bool        sack_permitted          = true;
@@ -896,7 +892,7 @@ struct PacketTemplate {
 
 struct PortState {
     uint16_t src_port;uint32_t seq;uint32_t ack_seq;bool connection_established;bool fin_sent;bool fin_ack_received; std::chrono::steady_clock::time_point start_time;int retry_count;int timeout_ms;int retries_cap = 2;
-    bool rtt_measured;std::chrono::steady_clock::time_point syn_sent_time;uint32_t sent_tsval;double ewma_rtt; bool final_state_determined;enum class PortReportedState { None, Open, Closed, Filtered };
+    bool rtt_measured;std::chrono::steady_clock::time_point syn_sent_time;uint32_t sent_tsval;uint32_t tsval_offset;double ewma_rtt; bool final_state_determined;enum class PortReportedState { None, Open, Closed, Filtered };
     PortReportedState reported_state;
     std::array<uint16_t, 6> used_src_ports{};
     std::array<uint8_t, 6>  used_src_port_attempt{}; 
@@ -971,12 +967,12 @@ struct PacketTask {
         }
     };
     PacketTask()noexcept:dest{},dest6{},is_ipv6(false),src_port(0),seq(0),ack(0),flags(0),data{},syn_sent_time{},sent_tsval(0),scan_type(ScanType::SYN),dest_port(0),timestamp_val(0),timestamp_ecr(0),include_timestamp(false),window_scale(7),mss_value(1460),
-                     custom_timestamp(1234567),timestamp_ecr_custom(0),nops_count(0),sack_permitted(true),custom_data(""),data_length(0),use_custom_data(false),generate_random_data(false),use_badsum(false),custom_badsum_value(0),
+                     custom_timestamp(generate_tcp_tsval()),timestamp_ecr_custom(0),nops_count(0),sack_permitted(true),custom_data(""),data_length(0),use_custom_data(false),generate_random_data(false),use_badsum(false),custom_badsum_value(0),
                      use_partial_badsum(false),partial_badsum_type(""),use_tfo_cookie(false),tfo_cookie_as_hex(false),tfo_cookie_random(false),tfo_cookie_str(""),tfo_cookie_num(0),tfo_cookie_length(0){}
     
     PacketTask(const sockaddr_in& d, uint16_t sp, uint32_t s, uint32_t a, uint8_t f,
                std::string&& dat, std::chrono::steady_clock::time_point sst,uint32_t stv, ScanType type, uint32_t tsval = 0, uint32_t tsecr = 0,
-               bool inc_ts = false, uint8_t ws = 7, uint16_t mss = 1460,uint32_t custom_ts = 1234567, uint32_t tsecr_custom = 0,
+               bool inc_ts = false, uint8_t ws = 7, uint16_t mss = 1460,uint32_t custom_ts = generate_tcp_tsval(), uint32_t tsecr_custom = 0,
                uint16_t nops = 0, bool sack = true, const std::string& cdata = "",uint16_t dlen = 0, bool use_cdata = false, bool gen_random = false,
                bool use_bad = false, uint16_t custom_badsum_val = 0,bool use_partial_bad = false, const std::string& partial_bad_type = "",
                bool use_tfo = false, bool tfo_as_hex = false, bool tfo_random = false,const std::string& tfo_str = "", uint64_t tfo_num = 0, size_t tfo_len = 0) noexcept
@@ -987,7 +983,7 @@ struct PacketTask {
           use_tfo_cookie(use_tfo),tfo_cookie_as_hex(tfo_as_hex),tfo_cookie_random(tfo_random),tfo_cookie_str(tfo_str),tfo_cookie_num(tfo_num),tfo_cookie_length(tfo_len) {}
     PacketTask(const sockaddr_in6& d6, uint16_t sp, uint32_t s, uint32_t a, uint8_t f,
                std::string&& dat, std::chrono::steady_clock::time_point sst,uint32_t stv, ScanType type, uint32_t tsval = 0, uint32_t tsecr = 0,
-               bool inc_ts = false, uint8_t ws = 7, uint16_t mss = 1460,uint32_t custom_ts = 1234567, uint32_t tsecr_custom = 0,
+               bool inc_ts = false, uint8_t ws = 7, uint16_t mss = 1460,uint32_t custom_ts = generate_tcp_tsval(), uint32_t tsecr_custom = 0,
                uint16_t nops = 0, bool sack = true, const std::string& cdata = "",uint16_t dlen = 0, bool use_cdata = false, bool gen_random = false,
                bool use_bad = false, uint16_t custom_badsum_val = 0,bool use_partial_bad = false, const std::string& partial_bad_type = "",
                bool use_tfo = false, bool tfo_as_hex = false, bool tfo_random = false,const std::string& tfo_str = "", uint64_t tfo_num = 0, size_t tfo_len = 0) noexcept
