@@ -1820,7 +1820,7 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                      bool frag_out_of_order,bool frag_overlap, uint16_t frag_overlap_bytes,bool frag_zof,
                      std::function<void(const std::vector<uint16_t>&,const std::vector<uint16_t>&,bool,bool)> on_pre_submit,
                      uint64_t* out_bytes_sent, bool debug_send,
-                     int sock6, const uint8_t* src_ip6,std::atomic<size_t>* pool_loss_out,std::atomic<size_t>* sq_loss_out,std::atomic<size_t>* send_fail_loss_out) {
+                     int sock6, const uint8_t* src_ip6, TxLossCounters* txloss) {
 
     // Local aliases: same names the body below has always used, now backed
     // by the shared opts struct instead of ~29 individual parameters.
@@ -1946,15 +1946,18 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
     
     for (size_t i = 0; i < num_packets; ++i) {
         char *packet = pool.acquire();
-	if (!packet) {
-	    std::lock_guard<std::mutex> lock(cout_mutex);
-	    std::cerr << "[DBG-TX1] buffer pool exhausted — packet dropped BEFORE build, idx=" << i << "\n";
-	}
         if (!packet) {
-            for (size_t j = 0; j < i; ++j) {
-                if (packets[j]) pool.release(packets[j]);
+            if (debug_send) {
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cerr << "[DBG-TX1] buffer pool exhausted before build, idx="
+                          << i << " batch=" << num_packets << "\n";
             }
-            if (pool_loss_out) pool_loss_out->fetch_add(num_packets, std::memory_order_relaxed);
+            for (size_t j = 0; j < i; ++j) {
+                if (packets[j]) { pool.release(packets[j]); packets[j] = nullptr; }
+            }
+            // The caller does NOT retry this chunk, so the whole batch is gone.
+            if (txloss)
+                txloss->buffer_pool.fetch_add(num_packets, std::memory_order_relaxed);
             return -1;
         }
         packets[i] = packet;
@@ -2010,6 +2013,14 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
             opts, packet_len, frag_step_i, debug_send, src_ip6
         );
         if (!build_success) {
+            // Same batch-wide loss as pool exhaustion, different cause.
+            if (txloss)
+                txloss->build_fail.fetch_add(num_packets, std::memory_order_relaxed);
+            if (debug_send) {
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cerr << "[DBG-TX5] build_packet failed at idx=" << i
+                          << " — dropping batch of " << num_packets << "\n";
+            }
             pool.release(packet);
             packets[i] = nullptr;
             for (size_t j = 0; j < i; ++j) {
@@ -2044,7 +2055,6 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
     // Non-fragmented packets (frag_steps[i] == 0) are untouched here.
     std::vector<BatchFrag> all_batch_frags;
     all_batch_frags.reserve(num_packets * 8);
-    bool any_frag_collect_failed = false;
 
     for (size_t i = 0; i < num_packets; ++i) {
         if (frag_steps[i] == 0) continue;   // skip non-fragmented
@@ -2176,13 +2186,21 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
         packets[i] = nullptr;
 
         if (collect_failed) {
-            // Release only THIS packet's fragments that were just added
+            // Pool ran dry partway through this packet's fragments.  Release
+            // only THIS packet's fragments — the rest of the batch is fine and
+            // still goes out.  Charge it to BufferPool: that is the real cause.
             while (!all_batch_frags.empty() &&
                    all_batch_frags.back().orig_pkt_idx == i) {
                 pool.release(all_batch_frags.back().buf);
                 all_batch_frags.pop_back();
             }
-            any_frag_collect_failed = true;
+            if (txloss)
+                txloss->buffer_pool.fetch_add(1, std::memory_order_relaxed);
+            if (debug_send) {
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cerr << "[DBG-TX1] pool exhausted mid-fragmentation, pkt idx="
+                          << i << " dropped\n";
+            }
         } else {
             // ── Apply per-packet zof / out-of-order reordering ───────────
             // Find the start index of THIS packet's fragments in all_batch_frags.
@@ -2252,16 +2270,18 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                             terminate_flag.store(true);
                             return;
                         }
-			if (res >= 0) { total_sent++; local_bytes_sent += static_cast<uint64_t>(res); }
-			else if (res == -EAGAIN || res == -EWOULDBLOCK) {
-			    std::lock_guard<std::mutex> lock(cout_mutex);
-			    std::cerr << "[DBG-TX4] sendmsg EAGAIN (silently swallowed) — likely TX ring/driver backpressure\n";
-			    if (send_fail_loss_out) send_fail_loss_out->fetch_add(1, std::memory_order_relaxed);
-			} else {
-			    std::lock_guard<std::mutex> lock(cout_mutex);
-			    std::cerr << "[DBG-TX4] send failed res=" << res << " (" << strerror(-res) << ")\n";
-			    if (send_fail_loss_out) send_fail_loss_out->fetch_add(1, std::memory_order_relaxed);
-			}
+                        if (res >= 0) {
+                            total_sent++;
+                            local_bytes_sent += static_cast<uint64_t>(res);
+                        } else {
+                            if (txloss)
+                                txloss->kernel_reject.fetch_add(1, std::memory_order_relaxed);
+                            if (debug_send) {
+                                std::lock_guard<std::mutex> lock(cout_mutex);
+                                std::cerr << "[DBG-TX4] sendmsg rejected res=" << res
+                                          << " (" << strerror(-res) << ")\n";
+                            }
+                        }
                     }
                     block = false;   // got at least one — switch to peek mode
                     continue;
@@ -2285,16 +2305,18 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                         disconnect = true;
                         break;
                     }
-		    if (res >= 0) { total_sent++; local_bytes_sent += static_cast<uint64_t>(res); }
-		    else if (res == -EAGAIN || res == -EWOULDBLOCK) {
-		        std::lock_guard<std::mutex> lock(cout_mutex);
-		        std::cerr << "[DBG-TX4] sendmsg EAGAIN (silently swallowed) — likely TX ring/driver backpressure\n";
-		        if (send_fail_loss_out) send_fail_loss_out->fetch_add(1, std::memory_order_relaxed);
-		    } else {
-		        std::lock_guard<std::mutex> lock(cout_mutex);
-		        std::cerr << "[DBG-TX4] send failed res=" << res << " (" << strerror(-res) << ")\n";
-		        if (send_fail_loss_out) send_fail_loss_out->fetch_add(1, std::memory_order_relaxed);
-		    }
+                    if (res >= 0) {
+                        total_sent++;
+                        local_bytes_sent += static_cast<uint64_t>(res);
+                    } else {
+                        if (txloss)
+                            txloss->kernel_reject.fetch_add(1, std::memory_order_relaxed);
+                        if (debug_send) {
+                            std::lock_guard<std::mutex> lock(cout_mutex);
+                            std::cerr << "[DBG-TX4] sendmsg rejected res=" << res
+                                      << " (" << strerror(-res) << ")\n";
+                        }
+                    }
                 }
                 io_uring_cq_advance(send_ring, n);
 
@@ -2317,23 +2339,38 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                 const uint16_t step = frag_steps[pi];
 
                 if (step == 0) {
-		    struct io_uring_sqe* sqe = io_uring_get_sqe(send_ring);
-		    if (!sqe) {
-		        std::lock_guard<std::mutex> lock(cout_mutex);
-		        std::cerr << "[DBG-TX2] SQ full at pkt idx=" << pi
-			          << " in_flight=" << in_flight << " WINDOW=" << WINDOW << "\n";
-		        break;
-		    }
+                    // Cheap rejections first: no point burning an SQE, or
+                    // registering a probe in the port state machine, for a
+                    // task we already know we cannot send.
+                    if (tasks[pi].is_ipv6 && sock6 < 0) {
+                        if (debug_send) {
+                            std::lock_guard<std::mutex> lock(cout_mutex);
+                            std::cerr << "[DBG-TX9] IPv6 task with no sock6 — dropping idx="
+                                      << pi << "\n";
+                        }
+                        if (txloss)
+                            txloss->no_socket.fetch_add(1, std::memory_order_relaxed);
+                        pool.release(packets[pi]);
+                        packets[pi] = nullptr;
+                        next_pkt++;
+                        continue;
+                    }
+
+                    struct io_uring_sqe* sqe = io_uring_get_sqe(send_ring);
+                    if (!sqe) {
+                        // NOT loss.  The outer loop submits, reaps and refills;
+                        // this packet goes out on the next pass.
+                        if (debug_send) {
+                            std::lock_guard<std::mutex> lock(cout_mutex);
+                            std::cerr << "[DBG-TX2] SQ full at pkt idx=" << pi
+                                      << " in_flight=" << in_flight
+                                      << " WINDOW=" << WINDOW << "\n";
+                        }
+                        break;
+                    }
                     if (on_pre_submit)
                         on_pre_submit({tasks[pi].src_port}, {tasks[pi].dest_port}, tasks[pi].is_ipv6, true);
                     if (tasks[pi].is_ipv6) {
-                        if (sock6 < 0) {
-                            std::cerr << "[TX] IPv6 task with no sock6 configured — dropping\n";
-                            pool.release(packets[pi]);
-                            packets[pi] = nullptr;
-                            next_pkt++;
-                            continue;
-                        }
                         if (g_send_fixed_file_active.load(std::memory_order_acquire)) {
                             io_uring_prep_sendmsg(sqe, SEND6_SOCK_FIXED_IDX, &msgs[pi], 0);
                             io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
@@ -2387,8 +2424,18 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                 struct __kernel_timespec ts = { .tv_sec = 0,
                                                 .tv_nsec = 200 * 1000 * 1000 };
                 int ret = io_uring_wait_cqe_timeout(send_ring, &cqe, &ts);
-                if (ret == -ETIME || ret == -EINTR || ret < 0) break;
-                if (!cqe) break;
+                if (ret == -ETIME || ret == -EINTR || ret < 0 || !cqe) {
+                    if (txloss && in_flight > 0) {
+                        txloss->drain_timeout.fetch_add(
+                            static_cast<uint64_t>(in_flight), std::memory_order_relaxed);
+                        if (debug_send) {
+                            std::lock_guard<std::mutex> lock(cout_mutex);
+                            std::cerr << "[DBG-TX7] drain timeout, " << in_flight
+                                      << " CQE(s) unreaped — buffers stranded\n";
+                        }
+                    }
+                    break;
+                }
                 char* buf = static_cast<char*>(io_uring_cqe_get_data(cqe));
                 io_uring_cqe_seen(send_ring, cqe);
                 in_flight--;
@@ -2405,11 +2452,11 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                     packets[i] = nullptr;
                 }
             }
-            if (sq_loss_out && abandoned)
-                sq_loss_out->fetch_add(abandoned, std::memory_order_relaxed);
+            if (txloss && abandoned)
+                txloss->aborted.fetch_add(abandoned, std::memory_order_relaxed);
         }
         // ── Send all pre-built fragments via io_uring ─────────────────────
-        if (!all_batch_frags.empty() && !any_frag_collect_failed) {
+        if (!all_batch_frags.empty()) {
 
             // Fix iov pointers invalidated by vector reallocation during build.
             for (auto& bf : all_batch_frags)
@@ -2444,7 +2491,12 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                     const bool frag_is_v6 = tasks[bf.orig_pkt_idx].is_ipv6;
 
                     if (frag_is_v6 && sock6 < 0) {
-                        std::cerr << "[TX-FRAG] IPv6 fragment with no sock6 configured — dropping\n";
+                        if (debug_send) {
+                            std::lock_guard<std::mutex> lock(cout_mutex);
+                            std::cerr << "[DBG-TX9] IPv6 fragment with no sock6 — dropping\n";
+                        }
+                        if (txloss)
+                            txloss->no_socket.fetch_add(1, std::memory_order_relaxed);
                         pool.release(bf.buf);
                         bf.buf = nullptr;
                         frag_next++;
@@ -2452,12 +2504,15 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                     }
 
                     struct io_uring_sqe* sqe = io_uring_get_sqe(send_ring);
-		    if (!sqe) {
-		        std::lock_guard<std::mutex> lock(cout_mutex);
-		        std::cerr << "[DBG-TX3] SQ full (frag path) idx=" << frag_next
-			          << " in_flight=" << in_flight << "\n";
-		        break;
-		    }
+                    if (!sqe) {
+                        // NOT loss — same reasoning as DBG-TX2 above.
+                        if (debug_send) {
+                            std::lock_guard<std::mutex> lock(cout_mutex);
+                            std::cerr << "[DBG-TX3] SQ full (frag path) idx=" << frag_next
+                                      << " in_flight=" << in_flight << "\n";
+                        }
+                        break;
+                    }
 
                     if (frag_is_v6) {
                         if (g_send_fixed_file_active.load(std::memory_order_acquire)) {
@@ -2513,8 +2568,18 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                 struct __kernel_timespec ts = { .tv_sec = 0,
                                                 .tv_nsec = 200 * 1000 * 1000 };
                 int ret = io_uring_wait_cqe_timeout(send_ring, &cqe, &ts);
-                if (ret == -ETIME || ret == -EINTR || ret < 0) break;
-                if (!cqe) break;
+                if (ret == -ETIME || ret == -EINTR || ret < 0 || !cqe) {
+                    if (txloss && in_flight > 0) {
+                        txloss->drain_timeout.fetch_add(
+                            static_cast<uint64_t>(in_flight), std::memory_order_relaxed);
+                        if (debug_send) {
+                            std::lock_guard<std::mutex> lock(cout_mutex);
+                            std::cerr << "[DBG-TX7] frag drain timeout, " << in_flight
+                                      << " CQE(s) unreaped — buffers stranded\n";
+                        }
+                    }
+                    break;
+                }
                 char* buf = static_cast<char*>(io_uring_cqe_get_data(cqe));
                 io_uring_cqe_seen(send_ring, cqe);
                 in_flight--;
@@ -2526,8 +2591,8 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
             for (auto& bf : all_batch_frags) {
                 if (bf.buf) { ++frag_abandoned; pool.release(bf.buf); bf.buf = nullptr; }
             }
-            if (sq_loss_out && frag_abandoned)
-                sq_loss_out->fetch_add(frag_abandoned, std::memory_order_relaxed);
+            if (txloss && frag_abandoned)
+                txloss->aborted.fetch_add(frag_abandoned, std::memory_order_relaxed);
         }
         all_batch_frags.clear();
     } else {
@@ -2545,8 +2610,8 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
             for (auto& bf : all_batch_frags) {
                 if (bf.buf) { ++abandoned; pool.release(bf.buf); bf.buf = nullptr; }
             }
-            if (sq_loss_out && abandoned)
-                sq_loss_out->fetch_add(abandoned, std::memory_order_relaxed);
+            if (txloss && abandoned)
+                txloss->aborted.fetch_add(abandoned, std::memory_order_relaxed);
         }
         all_batch_frags.clear();
     }
@@ -2841,9 +2906,17 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
     std::vector<std::atomic<bool>> tx_ts_precise(ports.size());
     for (auto& p : tx_ts_precise) p.store(false, std::memory_order_relaxed);
     std::atomic<size_t> confirmed_tx_count{0};
-    std::atomic<size_t> pool_loss{0};
-    std::atomic<size_t> sq_loss{0};
-    std::atomic<size_t> send_fail_loss{0};
+    TxLossCounters txloss;
+    // SO_RXQ_OVFL and friends are cumulative per socket, and the reader thread
+    // is shared across targets — so snapshot here and diff at the end rather
+    // than reading them as absolute per-scan figures.
+    const uint64_t rx_ovfl_v4_base    = g_recv ? g_recv->rx_kernel_ovfl_v4.load(std::memory_order_relaxed)    : 0;
+    const uint64_t rx_ovfl_v6_base    = g_recv ? g_recv->rx_kernel_ovfl_v6.load(std::memory_order_relaxed)    : 0;
+    const uint64_t rx_ovfl_icmp_base  = g_recv ? g_recv->rx_kernel_ovfl_icmp.load(std::memory_order_relaxed)  : 0;
+    const uint64_t rx_ovfl_icmp6_base = g_recv ? g_recv->rx_kernel_ovfl_icmp6.load(std::memory_order_relaxed) : 0;
+    const uint64_t rx_cqovf_base  = g_recv ? g_recv->rx_cq_overflow.load(std::memory_order_relaxed)  : 0;
+    const uint64_t rx_oversz_base = g_recv ? g_recv->rx_oversized.load(std::memory_order_relaxed)    : 0;
+    const uint64_t rx_starve_base = g_recv ? g_recv->rx_slot_starved.load(std::memory_order_relaxed) : 0;
     std::vector<std::atomic<bool>> probe_outstanding(ports.size());
     for (auto& p : probe_outstanding) p.store(false, std::memory_order_relaxed);
 
@@ -2964,7 +3037,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     opts,
                     frag_out_of_order, frag_overlap, frag_overlap_bytes, frag_zof,
                     on_pre_submit, &chunk_bytes_sent, debug_send, sock6, src_ip6,
-                    &pool_loss, &sq_loss, &send_fail_loss);
+                    &txloss);
 
                 if (bandwidth_config.enabled)
                     bws.actual_bytes_sent.fetch_add(chunk_bytes_sent, std::memory_order_relaxed);
@@ -4307,9 +4380,24 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
         std::cerr << "[DBG-FLUSH] unresolved v4=" << id_to_pidx_v4.size()
                   << " v6=" << id_to_pidx_v6.size() << "\n";
     }
-    result.loss_buffer_pool   = pool_loss.load(std::memory_order_relaxed);
-    result.loss_sq_abandoned  = sq_loss.load(std::memory_order_relaxed);
-    result.loss_kernel_reject = send_fail_loss.load(std::memory_order_relaxed);
+    result.loss_buffer_pool   = txloss.buffer_pool.load(std::memory_order_relaxed);
+    result.loss_build_fail    = txloss.build_fail.load(std::memory_order_relaxed);
+    result.loss_kernel_reject = txloss.kernel_reject.load(std::memory_order_relaxed);
+    result.loss_drain_timeout = txloss.drain_timeout.load(std::memory_order_relaxed);
+    result.loss_no_socket     = txloss.no_socket.load(std::memory_order_relaxed);
+    result.loss_aborted       = txloss.aborted.load(std::memory_order_relaxed);
+    if (g_recv) {
+        auto rx_delta = [](uint64_t now, uint64_t base) -> uint64_t {
+            return now > base ? now - base : 0;   // counters only ever climb
+        };
+        result.rx_kernel_ovfl  = rx_delta(g_recv->rx_kernel_ovfl_v4.load(std::memory_order_relaxed),    rx_ovfl_v4_base)
+                                + rx_delta(g_recv->rx_kernel_ovfl_v6.load(std::memory_order_relaxed),    rx_ovfl_v6_base)
+                                + rx_delta(g_recv->rx_kernel_ovfl_icmp.load(std::memory_order_relaxed),  rx_ovfl_icmp_base)
+                                + rx_delta(g_recv->rx_kernel_ovfl_icmp6.load(std::memory_order_relaxed), rx_ovfl_icmp6_base);
+        result.rx_cq_overflow  = rx_delta(g_recv->rx_cq_overflow.load(std::memory_order_relaxed),  rx_cqovf_base);
+        result.rx_oversized    = rx_delta(g_recv->rx_oversized.load(std::memory_order_relaxed),    rx_oversz_base);
+        result.rx_slot_starved = rx_delta(g_recv->rx_slot_starved.load(std::memory_order_relaxed), rx_starve_base);
+    }
     if (debug_demux) {
         result.demux_counts += demux_counts;
         result.demux_debug_entries.insert(result.demux_debug_entries.end(),
@@ -5427,6 +5515,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
                        &icmp_rcvbuf, sizeof(icmp_rcvbuf)) < 0)
             setsockopt(ctx->icmp_sock, SOL_SOCKET, SO_RCVBUF,
                        &icmp_rcvbuf, sizeof(icmp_rcvbuf));
+        setsockopt(ctx->icmp_sock, SOL_SOCKET, SO_RXQ_OVFL, &rxq_ovfl, sizeof(rxq_ovfl));
         struct sock_filter icmp_filter[] = {
             // A = pkt[0]; A &= 0x0f; A <<= 2; X = A  (IP hdr length in bytes)
             { BPF_LD  | BPF_B   | BPF_ABS,  0, 0, 0    },
@@ -5470,6 +5559,8 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
             ctx->icmp_msgs[s].msg_namelen = sizeof(ctx->icmp_src_addrs[s]);
             ctx->icmp_msgs[s].msg_iov     = &ctx->icmp_iovs[s];
             ctx->icmp_msgs[s].msg_iovlen  = 1;
+            ctx->icmp_msgs[s].msg_control    = ctx->icmp_cmsg_bufs[s].data();
+            ctx->icmp_msgs[s].msg_controllen = ctx->icmp_cmsg_bufs[s].size();
         }
     } else {
         std::cerr << "[GlobalRecv] ICMP socket failed: " << strerror(errno)
@@ -5488,6 +5579,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
                            &icmp6_rcvbuf, sizeof(icmp6_rcvbuf)) < 0)
                 setsockopt(ctx->icmpv6_sock, SOL_SOCKET, SO_RCVBUF,
                            &icmp6_rcvbuf, sizeof(icmp6_rcvbuf));
+            setsockopt(ctx->icmpv6_sock, SOL_SOCKET, SO_RXQ_OVFL, &rxq_ovfl, sizeof(rxq_ovfl));
 
             struct sock_filter icmp6_filter[] = {
                 // A = pkt[0] (ICMPv6 type — no IP header present to skip)
@@ -5518,6 +5610,8 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
                 ctx->icmpv6_msgs[s].msg_namelen = sizeof(ctx->icmpv6_src_addrs[s]);
                 ctx->icmpv6_msgs[s].msg_iov     = &ctx->icmpv6_iovs[s];
                 ctx->icmpv6_msgs[s].msg_iovlen  = 1;
+                ctx->icmpv6_msgs[s].msg_control    = ctx->icmpv6_cmsg_bufs[s].data();
+                ctx->icmpv6_msgs[s].msg_controllen = ctx->icmpv6_cmsg_bufs[s].size();
             }
         } else {
             std::cerr << "[GlobalRecv] ICMPv6 socket failed: " << strerror(errno)
@@ -5899,6 +5993,18 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
 
                 // SECURITY: bounds-check before any array access.
                 if (icmp_slot < GlobalRecvCtx::N_ICMP_SLOTS) {
+                    if (bytes > 0) {
+                        for (struct cmsghdr* c = CMSG_FIRSTHDR(&ctx->icmp_msgs[icmp_slot]);
+                             c; c = CMSG_NXTHDR(&ctx->icmp_msgs[icmp_slot], c)) {
+                            if (c->cmsg_level != SOL_SOCKET) continue;
+                            if (c->cmsg_type == SO_RXQ_OVFL) {
+                                uint32_t ovfl_i4 = 0;
+                                std::memcpy(&ovfl_i4, CMSG_DATA(c), sizeof(ovfl_i4));
+                                if (ovfl_i4 > 0)
+                                    ctx->rx_kernel_ovfl_icmp.store(ovfl_i4, std::memory_order_relaxed);
+                            }
+                        }
+                    }
                     do {
                         if (bytes <= 0) break;
 
@@ -5977,6 +6083,18 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
 
                 // SECURITY: bounds-check before any array access.
                 if (icmpv6_slot < GlobalRecvCtx::N_ICMPV6_SLOTS) {
+                    if (bytes > 0) {
+                        for (struct cmsghdr* c = CMSG_FIRSTHDR(&ctx->icmpv6_msgs[icmpv6_slot]);
+                             c; c = CMSG_NXTHDR(&ctx->icmpv6_msgs[icmpv6_slot], c)) {
+                            if (c->cmsg_level != SOL_SOCKET) continue;
+                            if (c->cmsg_type == SO_RXQ_OVFL) {
+                                uint32_t ovfl_i6 = 0;
+                                std::memcpy(&ovfl_i6, CMSG_DATA(c), sizeof(ovfl_i6));
+                                if (ovfl_i6 > 0)
+                                    ctx->rx_kernel_ovfl_icmp6.store(ovfl_i6, std::memory_order_relaxed);
+                            }
+                        }
+                    }
                     do {
                         if (bytes <= 0) break;
 
@@ -6079,6 +6197,13 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                                     kernel_rx_us =
                                         static_cast<int64_t>(tv->tv_sec) * 1'000'000LL +
                                         static_cast<int64_t>(tv->tv_usec);
+                                } else if (c->cmsg_type == SO_RXQ_OVFL) {
+                                    uint32_t ovfl6 = 0;
+                                    std::memcpy(&ovfl6, CMSG_DATA(c), sizeof(ovfl6));
+                                    // Cumulative since socket creation — store,
+                                    // never accumulate.  receive_response() diffs it.
+                                    if (ovfl6 > 0)
+                                        ctx->rx_kernel_ovfl_v6.store(ovfl6, std::memory_order_relaxed);
                                 }
                             }
                             pkt.kernel_rx_us = kernel_rx_us;
@@ -6088,6 +6213,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                     }
                 } else if (tcp6_bytes > static_cast<int>(RawPacket::MAX_LEN)) {
                     ++dbg_oversized_drops;
+                    ctx->rx_oversized.fetch_add(1, std::memory_order_relaxed);
                 }
 
                 sm6.src_len            = sizeof(sm6.src_addr);
@@ -6169,7 +6295,18 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                             } else if (c->cmsg_type == SO_RXQ_OVFL) {
                                 uint32_t ovfl = 0;
                                 std::memcpy(&ovfl, CMSG_DATA(c), sizeof(ovfl));
-                                if (ovfl > 0) dbg_rxq_ovfl_total = ovfl;
+                                // Cumulative since socket creation — store,
+                                // never accumulate.  receive_response() diffs it.
+                                if (ovfl > 0) {
+                                    dbg_rxq_ovfl_total = ovfl;
+                                    ctx->rx_kernel_ovfl_v4.store(ovfl, std::memory_order_relaxed);
+                                    if (ovfl != dbg_rxq_ovfl_last_reported) {
+                                        dbg_rxq_ovfl_last_reported = ovfl;
+                                        std::lock_guard<std::mutex> lock(cout_mutex);
+                                        std::cerr << "[DBG-RX9] kernel dropped " << ovfl
+                                                  << " packet(s) — recv buffer overflow\n";
+                                    }
+                                }
                             }
                         }
                         pkt.kernel_rx_us = kernel_rx_us;
@@ -6178,11 +6315,14 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                     }
                 }
              } else if (tcp_bytes > static_cast<int>(RawPacket::MAX_LEN)) {
-	        ++dbg_oversized_drops;
-	        std::lock_guard<std::mutex> lock(cout_mutex);
-	        std::cerr << "[DBG-RX8] oversized packet dropped: " << tcp_bytes
-		          << " bytes > MAX_LEN=" << RawPacket::MAX_LEN
-		          << " (total oversized drops=" << dbg_oversized_drops << ")\n";
+                ++dbg_oversized_drops;
+                ctx->rx_oversized.fetch_add(1, std::memory_order_relaxed);
+                if (dbg_oversized_drops <= 10 || dbg_oversized_drops % 1000 == 0) {
+                    std::lock_guard<std::mutex> lock(cout_mutex);
+                    std::cerr << "[DBG-RX8] oversized packet dropped: " << tcp_bytes
+                              << " bytes > MAX_LEN=" << RawPacket::MAX_LEN
+                              << " (total oversized drops=" << dbg_oversized_drops << ")\n";
+                }
             } else if (tcp_bytes < 0 &&
                        tcp_bytes != -EAGAIN &&
                        tcp_bytes != -EWOULDBLOCK &&
@@ -6214,6 +6354,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                     if (pending_rearm_set.insert(slot_idx).second)
                         pending_rearm.push_back(slot_idx);
                     ++lost_slot_warnings;
+                    ctx->rx_slot_starved.fetch_add(1, std::memory_order_relaxed);
                     if (lost_slot_warnings <= 10 ||
                         lost_slot_warnings % 1000 == 0) {
                         std::lock_guard<std::mutex> lock(cout_mutex);
@@ -6277,6 +6418,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
         if (ring.cq.koverflow) {
             uint64_t cur = *ring.cq.koverflow;
             if (cur != dbg_cq_overflow_last) {
+                ctx->rx_cq_overflow.store(cur, std::memory_order_relaxed);
                 dbg_cq_overflow_last = cur;
                 std::lock_guard<std::mutex> lock(cout_mutex);
                 std::cerr << "[recv_reader] CQ overflow (" << cur
@@ -6517,8 +6659,15 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
         }
         result.packets_sent += batch_result.packets_sent;
         result.loss_buffer_pool   += batch_result.loss_buffer_pool;
-        result.loss_sq_abandoned  += batch_result.loss_sq_abandoned;
+        result.loss_build_fail    += batch_result.loss_build_fail;
         result.loss_kernel_reject += batch_result.loss_kernel_reject;
+        result.loss_drain_timeout += batch_result.loss_drain_timeout;
+        result.loss_no_socket     += batch_result.loss_no_socket;
+        result.loss_aborted       += batch_result.loss_aborted;
+        result.rx_kernel_ovfl     += batch_result.rx_kernel_ovfl;
+        result.rx_cq_overflow     += batch_result.rx_cq_overflow;
+        result.rx_oversized       += batch_result.rx_oversized;
+        result.rx_slot_starved    += batch_result.rx_slot_starved;
         result.rtt_debug_entries.insert(result.rtt_debug_entries.end(),
             batch_result.rtt_debug_entries.begin(), batch_result.rtt_debug_entries.end());
         result.demux_counts += batch_result.demux_counts;
