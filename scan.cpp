@@ -4242,21 +4242,20 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                         state.retries_cap = g_dynamic_max_retries.load(std::memory_order_relaxed);
                     }
                     if (state.retry_count < 6 && sport_range_cfg.stage_is_range[state.retry_count]) {
-                        state.src_port = fast_uniform_port(rng,
+                        state.src_port = pick_unique_ephemeral_port(rng,
                             sport_range_cfg.stage_min[state.retry_count],
-                            sport_range_cfg.stage_max[state.retry_count]);
+                            sport_range_cfg.stage_max[state.retry_count],
+                            state);
                     } else if (state.retry_count < 6 && gsport_cfg.stage_is_set[state.retry_count]) {
                         state.src_port = gsport_cfg.stage_port[state.retry_count];
-                    } else if (state.retry_count >= 1 && state.retry_count <= 5) {
-                        state.src_port = RETRY_WEB_SPORTS[state.retry_count];   // constant web-like port per stage
                     } else {
-                        state.src_port = fast_uniform_port(rng, 32768, 60999);  // safety fallback, shouldn't hit
+                        state.src_port = pick_unique_ephemeral_port(rng, 32768, 60999, state);
                     }
                     state.record_src_port(state.src_port, state.retry_count);
                     size_t pir;
                     if (state.retry_count == 1) {
                         pir = ports_in_retry.fetch_add(1, std::memory_order_relaxed) + 1;
-                        g_ports_in_retry_global.fetch_add(1, std::memory_order_relaxed);   // NEW
+                        g_ports_in_retry_global.fetch_add(1, std::memory_order_relaxed);
                         state.counted_in_retry = true;
                     } else {
                         pir = ports_in_retry.load(std::memory_order_relaxed);
