@@ -860,9 +860,19 @@ struct RecPross {
     int learned_rtt_ms = 0;
     std::unordered_map<uint16_t, PacketDetails> packet_details;
     int packets_sent = 0;
-    uint64_t loss_buffer_pool  = 0;
-    uint64_t loss_sq_abandoned = 0;
-    uint64_t loss_kernel_reject = 0;
+    // ── TX-side drops, one bucket per CAUSE (see TxLossCounters) ─────────
+    uint64_t loss_buffer_pool   = 0;   // pool.acquire() returned null
+    uint64_t loss_build_fail    = 0;   // build_packet() rejected the task
+    uint64_t loss_kernel_reject = 0;   // sendmsg CQE res < 0
+    uint64_t loss_drain_timeout = 0;   // CQE never reaped, buffer stranded
+    uint64_t loss_no_socket     = 0;   // IPv6 task with no v6 socket
+    uint64_t loss_aborted       = 0;   // batch abandoned: abort / submit error
+    // ── RX-side drops, deltas over this scan.  Socket-wide: concurrent
+    //    targets sharing the reader thread will see overlapping numbers.
+    uint64_t rx_kernel_ovfl  = 0;      // SO_RXQ_OVFL — kernel recv buffer full
+    uint64_t rx_cq_overflow  = 0;      // io_uring CQ overflow on the recv ring
+    uint64_t rx_oversized    = 0;      // frame larger than RawPacket::MAX_LEN
+    uint64_t rx_slot_starved = 0;      // no free slot, re-arm deferred
     uint8_t received_ttl = 0;
     std::vector<std::pair<int, double>> rtt_debug_entries;
     std::vector<DemuxDebugEntry> demux_debug_entries;
@@ -1106,6 +1116,24 @@ uint32_t get_local_ip(const char *remote_ip);
 bool set_static_arp_entry(const char* ifname, const uint8_t ip_bytes[4], const uint8_t mac[6]);
 void delete_static_arp_entry(const char* ifname, const uint8_t ip_bytes[4]);
 
+// ── TX-side loss accounting ───────────────────────────────────────────────
+// Every path in send_tcp_packets() that destroys a packet increments exactly
+// one of these.  Buckets are named for the CAUSE, not the symptom, so the
+// incident report points at the thing you actually need to fix.
+//
+// NOTE ON UNITS: in the fragmented path (--frag*) `kernel_reject`, `aborted`
+// and `drain_timeout` count FRAGMENTS, because that is the granularity of a
+// sendmsg there.  `buffer_pool`, `build_fail` and `no_socket` always count
+// whole packets.  Don't mix them without saying which you mean.
+struct TxLossCounters {
+    std::atomic<uint64_t> buffer_pool   {0}; // pool.acquire() returned null
+    std::atomic<uint64_t> build_fail    {0}; // build_packet() rejected the task
+    std::atomic<uint64_t> kernel_reject {0}; // sendmsg CQE res < 0
+    std::atomic<uint64_t> drain_timeout {0}; // CQE never reaped, buffer stranded
+    std::atomic<uint64_t> no_socket     {0}; // IPv6 task with sock6 < 0
+    std::atomic<uint64_t> aborted       {0}; // terminate / submit error / no ring
+};
+
 int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_ip, 
                      std::mt19937 &rng, PacketBufferPool &pool, uint16_t win_size,
                      struct io_uring *send_ring, size_t batch_size, uint8_t custom_ttl,
@@ -1114,9 +1142,12 @@ int send_tcp_packets(int sock, const std::span<PacketTask> tasks, uint32_t src_i
                      const TcpBuildOptions& opts,
                      bool frag_out_of_order = false, bool frag_overlap = false,
                      uint16_t frag_overlap_bytes = 0, bool frag_zof = false,
-                     std::function<void(const std::vector<uint16_t>&,const std::vector<uint16_t>&)> on_pre_submit = nullptr,
+                     std::function<void(const std::vector<uint16_t>&,
+                                        const std::vector<uint16_t>&,
+                                        bool, bool)> on_pre_submit = nullptr,
                      uint64_t* out_bytes_sent = nullptr, bool debug_send = false,
-                     int sock6 = -1, const uint8_t* src_ip6 = nullptr,std::atomic<size_t>* pool_loss_out = nullptr,std::atomic<size_t>* sq_loss_out = nullptr,std::atomic<size_t>* send_fail_loss_out = nullptr);
+                     int sock6 = -1, const uint8_t* src_ip6 = nullptr,
+                     TxLossCounters* txloss = nullptr);
                      
 
 struct SlotMeta {
@@ -1197,6 +1228,10 @@ struct GlobalRecvCtx {
     std::array<struct msghdr,      N_ICMPV6_SLOTS>         icmpv6_msgs{};
     std::array<struct sockaddr_in6,N_ICMPV6_SLOTS>         icmpv6_src_addrs{};
     std::array<socklen_t,          N_ICMPV6_SLOTS>         icmpv6_src_lens{};
+    // Ancillary-data buffers for SO_RXQ_OVFL on the ICMP sockets.  64 bytes
+    // is comfortably more than CMSG_SPACE(sizeof(uint32_t)) needs.
+    std::array<std::array<uint8_t, 64>, N_ICMP_SLOTS>   icmp_cmsg_bufs{};
+    std::array<std::array<uint8_t, 64>, N_ICMPV6_SLOTS> icmpv6_cmsg_bufs{};
 
     // ip (network byte order) → index into results vector
     std::unordered_map<uint32_t, size_t> ip_to_idx;
@@ -1213,6 +1248,23 @@ struct GlobalRecvCtx {
     std::thread       reader_thread;
     std::atomic<bool> reader_started{false};
     std::atomic<bool> reader_stop{false};
+
+    // ── RX loss telemetry ────────────────────────────────────────────────
+    // Written by the single reader thread, snapshotted by receive_response()
+    // at scan start and end.  All are cumulative since socket creation, so
+    // callers must take a delta, never read them as absolute scan figures.
+    //
+    // SO_RXQ_OVFL is a PER-SOCKET kernel counter, and this context owns four
+    // independent raw sockets (v4 TCP, v6 TCP, v4 ICMP, v6 ICMP) — so each
+    // gets its own field.  RecPross::rx_kernel_ovfl is the SUM of all four,
+    // computed in receive_response().
+    std::atomic<uint64_t> rx_kernel_ovfl_v4   {0};  // SO_RXQ_OVFL, tcp_sock
+    std::atomic<uint64_t> rx_kernel_ovfl_v6   {0};  // SO_RXQ_OVFL, tcp6_sock
+    std::atomic<uint64_t> rx_kernel_ovfl_icmp {0};  // SO_RXQ_OVFL, icmp_sock
+    std::atomic<uint64_t> rx_kernel_ovfl_icmp6{0};  // SO_RXQ_OVFL, icmpv6_sock
+    std::atomic<uint64_t> rx_cq_overflow {0};  // io_uring CQ overflow
+    std::atomic<uint64_t> rx_oversized   {0};  // frame > RawPacket::MAX_LEN
+    std::atomic<uint64_t> rx_slot_starved{0};  // no free slot on re-arm
 
     moodycamel::ConcurrentQueue<RawPacket>* queue_for(uint32_t src_addr) {
         auto it = target_queues.find(src_addr);
