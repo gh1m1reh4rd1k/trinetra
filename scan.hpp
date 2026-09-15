@@ -934,6 +934,17 @@ struct PortState {
     }
 };
 
+inline uint16_t pick_unique_ephemeral_port(std::mt19937& rng, uint16_t lo, uint16_t hi,
+                                            const PortState& state, int max_tries = 16) {
+    for (int i = 0; i < max_tries; ++i) {
+        uint16_t candidate = fast_uniform_port(rng, lo, hi);
+        if (!state.accepts_src_port(candidate)) return candidate;
+    }
+    for (uint32_t p = lo; p <= hi; ++p)
+        if (!state.accepts_src_port(static_cast<uint16_t>(p))) return static_cast<uint16_t>(p);
+    return fast_uniform_port(rng, lo, hi);   // range exhausted — statistically unreachable at 5 draws
+}
+
 struct PacketTask {
     sockaddr_in dest; sockaddr_in6 dest6{}; bool is_ipv6 = false; uint16_t src_port;uint32_t seq;uint32_t ack;uint8_t flags;std::string data;std::chrono::steady_clock::time_point syn_sent_time;uint32_t sent_tsval;ScanType scan_type;uint16_t dest_port;
     uint32_t timestamp_val;uint32_t timestamp_ecr;bool include_timestamp;uint8_t window_scale;uint16_t mss_value;uint32_t custom_timestamp;uint32_t timestamp_ecr_custom;uint16_t nops_count;bool sack_permitted;
