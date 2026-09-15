@@ -2958,9 +2958,6 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                 
             }
             {
-                // TX buckets count packets we destroyed before they reached the
-                // wire.  RX buckets count what the kernel/ring dropped on the
-                // way back.  They are NOT the same thing and are not summed.
                 const uint64_t tx_loss = result.loss_buffer_pool
                                        + result.loss_build_fail
                                        + result.loss_kernel_reject
@@ -2971,7 +2968,7 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                                        + result.rx_cq_overflow
                                        + result.rx_oversized;
 
-                if (tx_loss || rx_loss) {
+                if (tx_loss || rx_loss || result.rx_slot_starved) {
                     const uint64_t attempted =
                         static_cast<uint64_t>(result.packets_sent) + tx_loss;
                     const double pct = attempted
@@ -3009,7 +3006,7 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                         std::cout << "     note        : transmit attempts, not probe failures —\n"
                                      "                   retries may still have resolved the port.\n";
                     }
-                    if (rx_loss) {
+                    if (rx_loss || result.rx_slot_starved) {
                         std::cout << "     note        : RX counters are socket-wide; concurrent\n"
                                      "                   targets will show overlapping figures.\n";
                     }
