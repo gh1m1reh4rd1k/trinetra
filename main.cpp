@@ -214,7 +214,7 @@ int main(int argc, char *argv[]) {
             print_filtered_if_few = false, graceful_scan = false,use_manual_tcp_checksum = false,
             sack_permitted = true, use_custom_data = false, generate_random_data = false,debug_packet = false,use_trial_api = false,expect_domain_for_trial = false,use_shodan_enum = false,
             force_sqpoll = false;
-       uint16_t custom_badsum_value = 0, manual_tcp_checksum = 0,base_source_port = 443, retry_source_port = 8443, win_size = 0, custom_ip_flags = 0x4000,
+       uint16_t custom_badsum_value = 0, manual_tcp_checksum = 0,base_source_port = 0, retry_source_port = 8443, win_size = 0, custom_ip_flags = 0x4000,
                 fixed_ip_id = 0, data_length = 0, nops_count = 0, mss_value = 1460,frag_offset_size  = 8,mtu_size = 0;
        int user_rcvbuf_size = -1,port_timeout_min_ms = 5,port_timeout_max_ms = 700;
        uint8_t custom_ttl = 64, window_scale = 7,custom_dscp = 0,custom_ip_tos = 0;SportRangeConfig sport_range_cfg;GsportConfig gsport_cfg;
