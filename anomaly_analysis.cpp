@@ -218,21 +218,39 @@ uint16_t infer_initial(uint8_t recv, int& hop, bool& valid, double& conf) {
 template <typename Hist>
 class TargetHistoryStore {
 public:
-    explicit TargetHistoryStore(size_t max_targets) : max_targets_(max_targets) {}
+    explicit TargetHistoryStore(size_t max_targets, size_t max_summaries = 0)
+        : max_targets_(max_targets),
+          max_summaries_(max_summaries ? max_summaries : max_targets * 4) {}
+
     std::shared_ptr<Hist> get(const std::string& key) {
         std::lock_guard<std::mutex> g(store_mu_);
+
         auto it = index_.find(key);
         if (it != index_.end()) {
             order_.splice(order_.end(), order_, it->second.order_it);
             return it->second.hist;
         }
+
+        auto hist = std::make_shared<Hist>();
+        auto sit = summaries_.find(key);
+        if (sit != summaries_.end()) {
+            for (double v : sit->second) hist->score_hist.push_back(v);
+            summary_order_.erase(summary_index_.at(key));
+            summary_index_.erase(key);
+            summaries_.erase(sit);
+        }
         if (index_.size() >= max_targets_ && !order_.empty()) {
-            index_.erase(order_.front());
+            const std::string& victim_key = order_.front();
+            auto vit = index_.find(victim_key);
+            if (vit != index_.end()) {
+                snapshot_before_evict(victim_key, *vit->second.hist);
+            }
+            index_.erase(victim_key);
             order_.pop_front();
         }
+
         order_.push_back(key);
         auto order_it = std::prev(order_.end());
-        auto hist = std::make_shared<Hist>();
         index_.emplace(key, Entry{hist, order_it});
         return hist;
     }
@@ -242,11 +260,38 @@ private:
         std::shared_ptr<Hist> hist;
         typename std::list<std::string>::iterator order_it;
     };
-
+    static constexpr size_t kSummaryPoints = 40;
+    void snapshot_before_evict(const std::string& key, Hist& h) {
+        std::vector<double> tail;
+        {
+            std::lock_guard<std::mutex> lg(h.data_mu);
+            const size_t n = h.score_hist.size();
+            const size_t take = std::min(n, kSummaryPoints);
+            tail.reserve(take);
+            for (size_t i = n - take; i < n; ++i) tail.push_back(h.score_hist[i]);
+        }
+        if (tail.empty()) return;
+        auto existing = summary_index_.find(key);
+        if (existing != summary_index_.end()) {
+            summary_order_.erase(existing->second);
+            summary_index_.erase(existing);
+        } else if (summaries_.size() >= max_summaries_ && !summary_order_.empty()) {
+            summaries_.erase(summary_order_.front());
+            summary_index_.erase(summary_order_.front());
+            summary_order_.pop_front();
+        }
+        summary_order_.push_back(key);
+        summary_index_.emplace(key, std::prev(summary_order_.end()));
+        summaries_.emplace(key, std::move(tail));
+    }
     size_t max_targets_;
+    size_t max_summaries_;
     std::unordered_map<std::string, Entry> index_;
     std::list<std::string> order_;
-    std::mutex store_mu_;   // guards only map/eviction bookkeeping, held briefly
+    std::unordered_map<std::string, std::vector<double>> summaries_;
+    std::unordered_map<std::string, typename std::list<std::string>::iterator> summary_index_;
+    std::list<std::string> summary_order_;
+    std::mutex store_mu_;
 };
 
 double bounded_adaptive_threshold_from_stats(double base_threshold, const RobustStats& stats) {
