@@ -2958,21 +2958,61 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                 
             }
             {
-                uint64_t total_loss = result.loss_buffer_pool
-                                     + result.loss_sq_abandoned
-                                     + result.loss_kernel_reject;
-                if (total_loss > 0) {
+                // TX buckets count packets we destroyed before they reached the
+                // wire.  RX buckets count what the kernel/ring dropped on the
+                // way back.  They are NOT the same thing and are not summed.
+                const uint64_t tx_loss = result.loss_buffer_pool
+                                       + result.loss_build_fail
+                                       + result.loss_kernel_reject
+                                       + result.loss_drain_timeout
+                                       + result.loss_no_socket
+                                       + result.loss_aborted;
+                const uint64_t rx_loss = result.rx_kernel_ovfl
+                                       + result.rx_cq_overflow
+                                       + result.rx_oversized;
+
+                if (tx_loss || rx_loss) {
+                    const uint64_t attempted =
+                        static_cast<uint64_t>(result.packets_sent) + tx_loss;
+                    const double pct = attempted
+                        ? (100.0 * static_cast<double>(tx_loss)
+                                 / static_cast<double>(attempted))
+                        : 0.0;
+
                     std::lock_guard<std::mutex> lock(cout_mutex);
                     std::cout << "\nIncident\n";
-                    if (result.loss_buffer_pool)
-                        std::cout << "  -> CheckPoint  : BufferPool   | Reason : pool exhausted        | Packet Loss : "
-                                  << result.loss_buffer_pool << "\n";
-                    if (result.loss_sq_abandoned)
-                        std::cout << "  -> CheckPoint  : SQ           | Reason : SQ full / backpressure | Packet Loss : "
-                                  << result.loss_sq_abandoned << "\n";
-                    if (result.loss_kernel_reject)
-                        std::cout << "  -> CheckPoint  : KernelReject | Reason : sendmsg rejected       | Packet Loss : "
-                                  << result.loss_kernel_reject << "\n";
+
+                    auto checkpoint = [](const char* name, const char* reason, uint64_t n) {
+                        if (!n) return;
+                        std::cout << "  -> CheckPoint  : " << std::left << std::setw(13) << name
+                                  << "| Reason : " << std::setw(31) << reason
+                                  << "| Drops : " << n << "\n";
+                    };
+
+                    checkpoint("BufferPool",   "pool exhausted",                result.loss_buffer_pool);
+                    checkpoint("Build",        "packet build rejected",         result.loss_build_fail);
+                    checkpoint("KernelReject", "sendmsg returned error",        result.loss_kernel_reject);
+                    checkpoint("DrainTimeout", "CQE unreaped, buffer stranded", result.loss_drain_timeout);
+                    checkpoint("NoSocket",     "IPv6 task, no v6 socket",       result.loss_no_socket);
+                    checkpoint("Abandoned",    "batch aborted / submit error",  result.loss_aborted);
+                    checkpoint("RxKernelDrop", "SO_RXQ_OVFL, recv buffer full", result.rx_kernel_ovfl);
+                    checkpoint("RxCqOverflow", "io_uring CQ overflow",          result.rx_cq_overflow);
+                    checkpoint("RxOversized",  "frame exceeded MAX_LEN",        result.rx_oversized);
+                    checkpoint("RxSlotStarve", "no free slot, re-arm deferred", result.rx_slot_starved);
+
+                    std::cout << std::right;
+
+                    if (tx_loss) {
+                        std::cout << "  -> TX total    : " << tx_loss << " of " << attempted
+                                  << " attempted (" << std::fixed << std::setprecision(2)
+                                  << pct << "%)\n";
+                        std::cout << "     note        : transmit attempts, not probe failures —\n"
+                                     "                   retries may still have resolved the port.\n";
+                    }
+                    if (rx_loss) {
+                        std::cout << "     note        : RX counters are socket-wide; concurrent\n"
+                                     "                   targets will show overlapping figures.\n";
+                    }
                 }
             }
 	    if (!multi_ip) {
