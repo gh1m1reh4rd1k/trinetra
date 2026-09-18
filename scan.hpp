@@ -67,10 +67,6 @@ extern std::vector<int>          global_raw_sockets;
 extern std::vector<io_uring*>    global_uring_rings;
 extern std::vector<std::thread*> global_worker_threads;
 extern std::mutex                global_resources_mutex;
-extern std::atomic<double> g_congestion_ratio;   
-extern std::atomic<size_t> g_ports_in_retry_global;
-extern std::atomic<size_t> g_active_ports_global;
-extern std::atomic<int>    g_dynamic_max_retries; 
 
 struct CongestionTuneConfig {
     uint64_t retry_delay_min_us = 3000;      // --retry-delay-min
@@ -85,13 +81,22 @@ struct CongestionTuneConfig {
     double   buf_peak_factor    = 1.3;       // --buf-peak
     unsigned batch_settle_us    = 500;       // --batch-settle
     size_t   sqpoll_threshold   = 300000;    // --sqpoll-threshold
-    int      min_retries        = 2;         // NEW — floor, no CLI yet
-    int      max_retries        = 5;         // NEW — ceiling, no CLI yet
-    int      dispatch_jitter_floor_ms = 60;  // NEW — RTO floor so internal batch/coalesce
+    int      min_retries        = 2;         // — floor, no CLI yet
+    int      max_retries        = 5;         // — ceiling, no CLI yet
+    int      dispatch_jitter_floor_ms = 60;  // — RTO floor so internal batch/coalesce
                                               // scheduling delay isn't mistaken for a dropped packet
 };
 
 extern CongestionTuneConfig g_cong_tune;
+
+struct RetryBudgetState {
+    std::atomic<double> congestion_ratio{0.0};
+    std::atomic<int>    dynamic_max_retries{2};
+    std::atomic<size_t> ports_in_retry{0};
+    std::atomic<size_t> active_ports{0};
+
+    RetryBudgetState() { dynamic_max_retries.store(g_cong_tune.min_retries); }
+};
 void track_raw_socket(int fd);
 void untrack_raw_socket(int fd);
 void track_uring_ring(io_uring* ring);
@@ -514,7 +519,6 @@ public:
         for (auto it = actions_to_run.rbegin(); it != actions_to_run.rend(); ++it) {
             try {
                 (*it)();
-            // NEW:
 	    } catch (const std::exception& e) {
 	        std::cerr << "RAIIManager cleanup threw: " << e.what() << std::endl;
 	    } catch (...) {
@@ -1206,7 +1210,7 @@ struct RawPacket {
 
 struct GlobalRecvCtx {
     int                      tcp_sock    = -1;
-    int                      icmp_sock   = -1;   // NEW: ICMP recv merged into ring
+    int                      icmp_sock   = -1;   // ICMP recv merged into ring
     int                      tcp6_sock   = -1;   // IPv6 TCP raw recv, -1 if v6 unused
     int                      icmpv6_sock = -1;   // IPv6 ICMP raw recv, -1 if v6 unused
     struct io_uring          ring{};
@@ -1396,7 +1400,7 @@ struct RTTTracker {
         int base_rtt = current_rtt_ms.load();
         int rttvar   = rtt_var_ms.load();
         int rto      = base_rtt + g_cong_tune.rto_mult * rttvar;      // Jacobson/Karels RTO
-        rto = std::max(rto, g_cong_tune.dispatch_jitter_floor_ms);    // NEW — never let the RTO
+        rto = std::max(rto, g_cong_tune.dispatch_jitter_floor_ms);    // never let the RTO
                                                                        // collapse below our own
                                                                        // batch/coalesce latency
         if (retry_count <= 0) return rto;
@@ -1417,7 +1421,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                       ScanType scan_type, uint8_t custom_ttl, uint8_t custom_dscp, 
                       uint16_t custom_ip_flags, IpIdMode ip_id_mode, uint16_t fixed_ip_id,
                       const TcpBuildOptions& opts,
-                      RTTTracker& shared_rtt_tracker,
+                      RTTTracker& shared_rtt_tracker,RetryBudgetState& retry_budget,
                       bool debug_rtt = false, bool debug_ttl = false, bool debug_demux = false, bool debug_strack = false,
                       bool frag_out_of_order = false, bool frag_overlap = false,
                       uint16_t frag_overlap_bytes = 0, bool frag_zof = false,
