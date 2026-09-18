@@ -1247,6 +1247,10 @@ struct GlobalRecvCtx {
     // is comfortably more than CMSG_SPACE(sizeof(uint32_t)) needs.
     std::array<std::array<uint8_t, 64>, N_ICMP_SLOTS>   icmp_cmsg_bufs{};
     std::array<std::array<uint8_t, 64>, N_ICMPV6_SLOTS> icmpv6_cmsg_bufs{};
+    std::vector<uint8_t>     slot_armed;
+    std::vector<uint8_t>     slot6_armed;
+    std::array<uint8_t, N_ICMP_SLOTS>   icmp_armed{};
+    std::array<uint8_t, N_ICMPV6_SLOTS> icmpv6_armed{};
 
     // ip (network byte order) → index into results vector
     std::unordered_map<uint32_t, size_t> ip_to_idx;
