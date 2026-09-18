@@ -24,7 +24,6 @@
 #include "arp_handler.hpp"
 
 
-
 double estimate_scan_duration_ms(size_t batch_probe_volume,
                                   const RateConfig&       rate_cfg,
                                   const JitterConfig&     jitter_cfg,
@@ -3493,6 +3492,8 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
     RawPacket* mixed = mixed_storage.data();
     std::vector<RawPacket> icmp_pkts_storage(8);
     RawPacket* icmp_pkts = icmp_pkts_storage.data();
+    std::vector<RawPacket> icmpv6_pkts_storage(8);
+    RawPacket* icmpv6_pkts = icmpv6_pkts_storage.data();
     while (active_count.load(std::memory_order_relaxed) > 0 && !terminate_flag) {
         size_t got = 0;
         do {
@@ -3543,11 +3544,16 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
             break;  // re-check active_count / process whatever we got, same as before
         }
         size_t icmp_got = 0;
+        size_t icmpv6_got = 0;
 
         for (size_t pi = 0; pi < got; ++pi) {
             RawPacket& rp   = pkt_batch[pi];
             if (rp.pkt_type == RawPacket::PktType::ICMP) {
                 if (icmp_got < 8) icmp_pkts[icmp_got++] = std::move(rp);
+                continue;
+            }
+            if (rp.pkt_type == RawPacket::PktType::ICMPV6) {
+                if (icmpv6_got < 8) icmpv6_pkts[icmpv6_got++] = std::move(rp);
                 continue;
             }
             int        bytes = rp.len;
@@ -3804,7 +3810,11 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                 if (mixed[mi].pkt_type == RawPacket::PktType::ICMP && icmp_got < 8) {
                     icmp_pkts[icmp_got++] = std::move(mixed[mi]);
                 } else if (mixed[mi].pkt_type == RawPacket::PktType::ICMPV6) {
-                
+                    if (icmpv6_got < 8) {
+                        icmpv6_pkts[icmpv6_got++] = std::move(mixed[mi]);
+                    } else {
+                        my_queue->enqueue(std::move(mixed[mi]));
+                    }
                 } else {
                     my_queue->enqueue(std::move(mixed[mi]));
                 }
@@ -4038,6 +4048,186 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                             std::string("│   ├─ 🔴 Port ") +
                             std::to_string(blocked_port) +
                             "/tcp  filtered  [" + code_str + "]\n";
+                    }
+                }
+            }
+        }
+        {
+            for (size_t i6 = 0; i6 < icmpv6_got; ++i6) {
+                const RawPacket& rp6   = icmpv6_pkts[i6];
+                const uint8_t*   i6buf = rp6.data;
+                const ssize_t    i6nb  = static_cast<ssize_t>(rp6.len);
+
+                constexpr int ICMP6_HDR_LEN = 8;
+                if (i6nb < ICMP6_HDR_LEN) continue;
+
+                const uint8_t i6_type = i6buf[0];
+                const uint8_t i6_code = i6buf[1];
+
+                struct in_addr i6_replier{};
+
+                if (i6_type == 1 && i6_code == 0) {
+                    std::string msg = "[ICMPv6 FATAL] Type 1 Code 0: No Route to Destination"
+                                       " — aborting scan of " + std::string(dest_ip) + "\n";
+                    if (tl_port_output_buf) {
+                        *tl_port_output_buf += msg;
+                    } else {
+                        std::lock_guard<std::mutex> lk(cout_mutex);
+                        std::cerr << msg;
+                    }
+                    shutdown_sender_thread();
+                    return result;
+                }
+
+                if (i6_type == 2) {
+                    result.icmp_warnings.emplace_back(
+                        IcmpFilterReason::FragNeeded,
+                        std::string("Packet Too Big (ICMPv6 type 2 code 0)"),
+                        i6_replier);
+                    continue;
+                }
+
+                if (i6_type == 3 && (i6_code == 0 || i6_code == 1)) {
+                    const char* w6 = (i6_code == 0)
+                        ? "Hop Limit Exceeded in Transit (ICMPv6 type 3 code 0)"
+                        : "Fragment Reassembly Time Exceeded (ICMPv6 type 3 code 1)";
+                    IcmpFilterReason wr6 = (i6_code == 0)
+                        ? IcmpFilterReason::TtlExpired
+                        : IcmpFilterReason::FragReassemblyTimeout;
+                    result.icmp_warnings.emplace_back(wr6, std::string(w6), i6_replier);
+                    continue;
+                }
+
+                if (i6_type != 1) continue;
+                if (i6_code != 1 && i6_code != 5 && i6_code != 6) continue;
+                if (!target_is_ipv6) continue;
+
+                if (i6nb < ICMP6_HDR_LEN +
+                        static_cast<int>(sizeof(struct ip6_hdr)) + 8) continue;
+
+                const struct ip6_hdr* inner6 =
+                    reinterpret_cast<const struct ip6_hdr*>(i6buf + ICMP6_HDR_LEN);
+                if (inner6->ip6_nxt != IPPROTO_TCP) continue;
+                if (std::memcmp(&inner6->ip6_dst, &dest6.sin6_addr,
+                                sizeof(struct in6_addr)) != 0) continue;
+
+                const uint8_t* t6 = i6buf + ICMP6_HDR_LEN + sizeof(struct ip6_hdr);
+                uint16_t raw16 = 0;
+                uint32_t raw32 = 0;
+                std::memcpy(&raw16, t6, sizeof(raw16));
+                const uint16_t inner6_src_port = ntohs(raw16);
+                std::memcpy(&raw16, t6 + 2, sizeof(raw16));
+                const uint16_t blocked6_port = ntohs(raw16);
+                std::memcpy(&raw32, t6 + 4, sizeof(raw32));
+                const uint32_t inner6_seq = ntohl(raw32);
+
+                if (blocked6_port == 0) continue;
+
+                const int32_t b6idx = port_to_idx[blocked6_port];
+                if (b6idx < 0) {
+                    if (debug_demux) {
+                        demux_counts.unknown_port++;
+                        demux_log("DROP unknown-port (icmpv6)", blocked6_port,
+                                   "not part of this scan, icmpv6_code=" +
+                                   std::to_string(i6_code),
+                                   inner6_src_port, 0, -1, 0, true);
+                    }
+                    continue;
+                }
+                PortState& state6 = port_states_arr[b6idx];
+                if (!state6.accepts_src_port(inner6_src_port)) {
+                    if (debug_demux) {
+                        demux_counts.bad_src_port++;
+                        demux_log("DROP bad-src-port (icmpv6)", blocked6_port,
+                                   "embedded src_port=" + std::to_string(inner6_src_port) +
+                                   " was never used to probe this port, icmpv6_code=" +
+                                   std::to_string(i6_code),
+                                   inner6_src_port, 0,
+                                   state6.attempt_for_src_port(inner6_src_port), 0, true);
+                    }
+                    continue;
+                }
+                if (use_token && inner6_seq != state6.seq) {
+                    if (debug_demux) {
+                        demux_counts.bad_token++;
+                        demux_log("DROP bad-token (icmpv6)", blocked6_port,
+                                   "embedded seq=" + std::to_string(inner6_seq) +
+                                   " expected=" + std::to_string(state6.seq) +
+                                   " (spoofed or stale ICMPv6), icmpv6_code=" +
+                                   std::to_string(i6_code),
+                                   inner6_src_port, 0,
+                                   state6.attempt_for_src_port(inner6_src_port), 0, true);
+                    }
+                    continue;
+                }
+                if (port_final[b6idx].load(std::memory_order_acquire)) continue;
+
+                if (!global_rtt_tracker.should_mark_filtered(state6.retry_count,
+                                                             state6.retries_cap)) continue;
+                if (state6.reported_state != PortState::PortReportedState::None) continue;
+
+                if (debug_demux) {
+                    demux_counts.matched++;
+                    int icmp6_matched_attempt = state6.attempt_for_src_port(inner6_src_port);
+                    demux_log("MATCH (icmpv6-filtered)", blocked6_port,
+                               "idx=" + std::to_string(b6idx) +
+                               " attempt=" + std::to_string(icmp6_matched_attempt) +
+                               " icmpv6_code=" + std::to_string(i6_code),
+                               inner6_src_port, 0, icmp6_matched_attempt, 0, true);
+                }
+                {
+                    bool expected6 = false;
+                    if (replied_this_attempt[b6idx].compare_exchange_strong(expected6, true,
+                            std::memory_order_acq_rel)) {
+                        g_confirmed_reply_count.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+
+                IcmpFilterReason reason6   = IcmpFilterReason::None;
+                const char*      code6_str = "";
+                switch (i6_code) {
+                    case 1:
+                        reason6   = IcmpFilterReason::CommAdminProhibited;
+                        code6_str = "ICMPv6 type 1 code 1: comm-admin-prohibited"
+                                    " (ip6tables REJECT / firewall policy)";
+                        break;
+                    case 5:
+                        reason6   = IcmpFilterReason::HostAdminProhibited;
+                        code6_str = "ICMPv6 type 1 code 5: source address failed"
+                                    " ingress/egress policy";
+                        break;
+                    case 6:
+                        reason6   = IcmpFilterReason::NetAdminProhibited;
+                        code6_str = "ICMPv6 type 1 code 6: reject route to destination"
+                                    " (ACL/router policy blocks subnet)";
+                        break;
+                    default: break;
+                }
+
+                result.filtered_ports.push_back(blocked6_port);
+                result.icmp_filter_reasons[blocked6_port] = { reason6, i6_replier };
+                state6.reported_state         = PortState::PortReportedState::Filtered;
+                state6.final_state_determined = true;
+                port_final[b6idx].store(true, std::memory_order_release);
+                active_count.fetch_sub(1, std::memory_order_relaxed);
+                retry_budget.active_ports.fetch_sub(1, std::memory_order_relaxed);
+                tx_ts_table[b6idx].store(0, std::memory_order_release);
+                probe_outstanding[b6idx].store(false, std::memory_order_release);
+                if (state6.counted_in_retry) {
+                    state6.counted_in_retry = false;
+                    ports_in_retry.fetch_sub(1, std::memory_order_relaxed);
+                    retry_budget.ports_in_retry.fetch_sub(1, std::memory_order_relaxed);
+                }
+                strack_log(blocked6_port, StrackFinalState::Filtered,
+                           state6.attempt_for_src_port(inner6_src_port), inner6_src_port,
+                           state6.rtt_measured ? state6.ewma_rtt : -1.0, true, state6);
+
+                if (print_individual_closed_filtered) {
+                    if (tl_port_output_buf) {
+                        *tl_port_output_buf +=
+                            std::string("│   ├─ 🔴 Port ") +
+                            std::to_string(blocked6_port) +
+                            "/tcp  filtered  [" + code6_str + "]\n";
                     }
                 }
             }
@@ -5679,6 +5869,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
     std::memset(ctx->buf_storage.get(), 0, N_SLOTS * SLOT_SIZE);
     ctx->bufs = ctx->buf_storage.get();
     ctx->slots.resize(N_SLOTS);
+    ctx->slot_armed.assign(N_SLOTS, 0);
 
     for (size_t s = 0; s < N_SLOTS; ++s) {
         ctx->slots[s].src_len            = sizeof(ctx->slots[s].src_addr);
@@ -5699,6 +5890,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
         std::memset(ctx->buf6_storage.get(), 0, N_SLOTS6 * SLOT_SIZE);
         ctx->bufs6 = ctx->buf6_storage.get();
         ctx->slots6.resize(N_SLOTS6);
+        ctx->slot6_armed.assign(N_SLOTS6, 0);
 
         for (size_t s = 0; s < N_SLOTS6; ++s) {
             ctx->slots6[s].src_len            = sizeof(ctx->slots6[s].src_addr);
@@ -5743,6 +5935,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
             io_uring_prep_recvmsg(sqe, ctx->tcp_sock, &ctx->slots[s].msg, 0);
         }
         io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(s));
+        ctx->slot_armed[s] = 1;
     }
 
     for (size_t s = 0; s < N_SLOTS6; ++s) {
@@ -5756,6 +5949,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
         }
         io_uring_sqe_set_data64(sqe,
             GlobalRecvCtx::TCP6_SLOT_FLAG | static_cast<uint64_t>(s));
+        ctx->slot6_armed[s] = 1;
     }
     if (ctx->icmp_sock >= 0) {
         for (size_t s = 0; s < GlobalRecvCtx::N_ICMP_SLOTS; ++s) {
@@ -5774,6 +5968,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
             }
             io_uring_sqe_set_data64(sqe,
                 GlobalRecvCtx::ICMP_SLOT_FLAG | static_cast<uint64_t>(s));
+            ctx->icmp_armed[s] = 1;
         }
     }
     if (ctx->icmpv6_sock >= 0) {
@@ -5793,6 +5988,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
             }
             io_uring_sqe_set_data64(sqe,
                 GlobalRecvCtx::ICMPV6_SLOT_FLAG | static_cast<uint64_t>(s));
+            ctx->icmpv6_armed[s] = 1;
         }
     }
     // ── end ICMPv6 SQE arming ───────────────────────────────────────────────
@@ -5858,6 +6054,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                     io_uring_prep_recvmsg(rsqe, ctx->tcp_sock, &sm.msg, 0);
                 }
                 io_uring_sqe_set_data64(rsqe, static_cast<uint64_t>(slot_idx));
+                ctx->slot_armed[slot_idx] = 1;
             } else if (slot_idx < tcp6_base) {
                 // ICMP slot
                 size_t icmp_slot = slot_idx - icmp_base;
@@ -5884,6 +6081,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                 io_uring_sqe_set_data64(rsqe,
                     GlobalRecvCtx::ICMP_SLOT_FLAG |
                     static_cast<uint64_t>(icmp_slot));
+                ctx->icmp_armed[icmp_slot] = 1;
             } else if (slot_idx < icmpv6_base) {
                 // TCP6 slot
                 size_t slot6_idx = slot_idx - tcp6_base;
@@ -5908,6 +6106,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                 }
                 io_uring_sqe_set_data64(rsqe,
                     GlobalRecvCtx::TCP6_SLOT_FLAG | static_cast<uint64_t>(slot6_idx));
+                ctx->slot6_armed[slot6_idx] = 1;
             } else {
                 // ICMPv6 slot
                 size_t icmpv6_slot = slot_idx - icmpv6_base;
@@ -5932,6 +6131,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                 io_uring_sqe_set_data64(rsqe,
                     GlobalRecvCtx::ICMPV6_SLOT_FLAG |
                     static_cast<uint64_t>(icmpv6_slot));
+                ctx->icmpv6_armed[icmpv6_slot] = 1;
             }
             // Swap-erase: O(1) removal, order doesn't matter for rearm queue.
             pending_rearm_set.erase(slot_idx);
@@ -5986,6 +6186,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
 
                 // SECURITY: bounds-check before any array access.
                 if (icmp_slot < GlobalRecvCtx::N_ICMP_SLOTS) {
+                    ctx->icmp_armed[icmp_slot] = 0;
                     if (bytes > 0) {
                         for (struct cmsghdr* c = CMSG_FIRSTHDR(&ctx->icmp_msgs[icmp_slot]);
                              c; c = CMSG_NXTHDR(&ctx->icmp_msgs[icmp_slot], c)) {
@@ -6057,6 +6258,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                             io_uring_sqe_set_data64(rsqe,
                                 GlobalRecvCtx::ICMP_SLOT_FLAG |
                                 static_cast<uint64_t>(icmp_slot));
+                            ctx->icmp_armed[icmp_slot] = 1;
                         } else {
                             // SECURITY: defer rather than lose the slot.
                             size_t icmp_sentinel = slots.size() + icmp_slot;
@@ -6076,6 +6278,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
 
                 // SECURITY: bounds-check before any array access.
                 if (icmpv6_slot < GlobalRecvCtx::N_ICMPV6_SLOTS) {
+                    ctx->icmpv6_armed[icmpv6_slot] = 0;
                     if (bytes > 0) {
                         for (struct cmsghdr* c = CMSG_FIRSTHDR(&ctx->icmpv6_msgs[icmpv6_slot]);
                              c; c = CMSG_NXTHDR(&ctx->icmpv6_msgs[icmpv6_slot], c)) {
@@ -6135,6 +6338,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                             io_uring_sqe_set_data64(rsqe,
                                 GlobalRecvCtx::ICMPV6_SLOT_FLAG |
                                 static_cast<uint64_t>(icmpv6_slot));
+                            ctx->icmpv6_armed[icmpv6_slot] = 1;
                         } else {
                             // SECURITY: defer rather than lose the slot. Sentinel
                             // range: [slots.size()+N_ICMP_SLOTS+slots6.size(), ...)
@@ -6155,6 +6359,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
 
                 // SECURITY: bounds-check before any array access.
                 if (slot6_idx >= ctx->slots6.size()) continue;
+                ctx->slot6_armed[slot6_idx] = 0;
                 SlotMeta6& sm6 = ctx->slots6[slot6_idx];
 
                 if (tcp6_bytes == -ENETDOWN || tcp6_bytes == -ENETUNREACH ||
@@ -6226,6 +6431,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                         }
                         io_uring_sqe_set_data64(rsqe,
                             GlobalRecvCtx::TCP6_SLOT_FLAG | static_cast<uint64_t>(slot6_idx));
+                        ctx->slot6_armed[slot6_idx] = 1;
                     } else {
                         size_t tcp6_sentinel = slots.size() + GlobalRecvCtx::N_ICMP_SLOTS + slot6_idx;
                         if (pending_rearm_set.insert(tcp6_sentinel).second)
@@ -6241,6 +6447,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
 
             // SECURITY: bounds-check user_data before any dereference.
             if (slot_idx >= slots.size()) continue;
+            ctx->slot_armed[slot_idx] = 0;
             SlotMeta& sm = slots[slot_idx];
 
             if (tcp_bytes == -ENETDOWN || tcp_bytes == -ENETUNREACH ||
@@ -6343,6 +6550,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                         io_uring_prep_recvmsg(rsqe, ctx->tcp_sock, &sm.msg, 0);
                     }
                     io_uring_sqe_set_data64(rsqe, static_cast<uint64_t>(slot_idx));
+                    ctx->slot_armed[slot_idx] = 1;
                 } else {
                     if (pending_rearm_set.insert(slot_idx).second)
                         pending_rearm.push_back(slot_idx);
@@ -6415,12 +6623,14 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                 dbg_cq_overflow_last = cur;
                 std::lock_guard<std::mutex> lock(cout_mutex);
                 std::cerr << "[recv_reader] CQ overflow (" << cur
-                          << " lost) — re-arming all slots\n";
+                          << " lost) — re-arming idle slots\n";
                 for (size_t s = 0; s < slots.size(); ++s) {
+                    if (ctx->slot_armed[s]) continue;
                     if (pending_rearm_set.insert(s).second)
                         pending_rearm.push_back(s);
                 }
                 for (size_t s = 0; s < GlobalRecvCtx::N_ICMP_SLOTS; ++s) {
+                    if (ctx->icmp_armed[s]) continue;
                     size_t sentinel = slots.size() + s;
                     if (pending_rearm_set.insert(sentinel).second)
                         pending_rearm.push_back(sentinel);
@@ -6430,11 +6640,13 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                 const size_t tcp6_ovfl_base   = slots.size() + GlobalRecvCtx::N_ICMP_SLOTS;
                 const size_t icmpv6_ovfl_base = tcp6_ovfl_base + ctx->slots6.size();
                 for (size_t s = 0; s < ctx->slots6.size(); ++s) {
+                    if (ctx->slot6_armed[s]) continue;
                     size_t sentinel = tcp6_ovfl_base + s;
                     if (pending_rearm_set.insert(sentinel).second)
                         pending_rearm.push_back(sentinel);
                 }
                 for (size_t s = 0; s < GlobalRecvCtx::N_ICMPV6_SLOTS; ++s) {
+                    if (ctx->icmpv6_armed[s]) continue;
                     size_t sentinel = icmpv6_ovfl_base + s;
                     if (pending_rearm_set.insert(sentinel).second)
                         pending_rearm.push_back(sentinel);
