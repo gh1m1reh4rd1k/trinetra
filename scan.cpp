@@ -2909,7 +2909,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
     const uint64_t rx_ovfl_icmp_base  = g_recv ? g_recv->rx_kernel_ovfl_icmp.load(std::memory_order_relaxed)  : 0;
     const uint64_t rx_ovfl_icmp6_base = g_recv ? g_recv->rx_kernel_ovfl_icmp6.load(std::memory_order_relaxed) : 0;
     const uint64_t rx_cqovf_base  = g_recv ? g_recv->rx_cq_overflow.load(std::memory_order_relaxed)  : 0;
-    const uint64_t rx_oversz_base = g_recv ? g_recv->rx_oversized.load(std::memory_order_relaxed)    : 0;
+    const uint64_t rx_trunc_base = g_recv ? g_recv->rx_truncated.load(std::memory_order_relaxed)    : 0;
     const uint64_t rx_starve_base = g_recv ? g_recv->rx_slot_starved.load(std::memory_order_relaxed) : 0;
     std::vector<std::atomic<bool>> probe_outstanding(ports.size());
     for (auto& p : probe_outstanding) p.store(false, std::memory_order_relaxed);
@@ -4578,7 +4578,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                                 + rx_delta(g_recv->rx_kernel_ovfl_icmp.load(std::memory_order_relaxed),  rx_ovfl_icmp_base)
                                 + rx_delta(g_recv->rx_kernel_ovfl_icmp6.load(std::memory_order_relaxed), rx_ovfl_icmp6_base);
         result.rx_cq_overflow  = rx_delta(g_recv->rx_cq_overflow.load(std::memory_order_relaxed),  rx_cqovf_base);
-        result.rx_oversized    = rx_delta(g_recv->rx_oversized.load(std::memory_order_relaxed),    rx_oversz_base);
+        result.rx_truncated    = rx_delta(g_recv->rx_truncated.load(std::memory_order_relaxed),    rx_trunc_base);
         result.rx_slot_starved = rx_delta(g_recv->rx_slot_starved.load(std::memory_order_relaxed), rx_starve_base);
     }
     if (debug_demux) {
@@ -6008,7 +6008,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
     std::vector<size_t> pending_rearm;
     std::unordered_set<size_t> pending_rearm_set; 
     uint64_t lost_slot_warnings  = 0;
-    uint64_t dbg_oversized_drops = 0;
+    uint64_t dbg_oversized_truncated = 0;
     uint64_t dbg_rxq_ovfl_total  = 0;
     uint64_t dbg_rxq_ovfl_last_reported = 0;
     uint64_t dbg_cq_overflow_last = 0;
@@ -6108,7 +6108,6 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                     GlobalRecvCtx::TCP6_SLOT_FLAG | static_cast<uint64_t>(slot6_idx));
                 ctx->slot6_armed[slot6_idx] = 1;
             } else {
-                // ICMPv6 slot
                 size_t icmpv6_slot = slot_idx - icmpv6_base;
                 if (icmpv6_slot >= GlobalRecvCtx::N_ICMPV6_SLOTS) {
                     pending_rearm_set.erase(pending_rearm[pi]);
@@ -6133,7 +6132,6 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                     static_cast<uint64_t>(icmpv6_slot));
                 ctx->icmpv6_armed[icmpv6_slot] = 1;
             }
-            // Swap-erase: O(1) removal, order doesn't matter for rearm queue.
             pending_rearm_set.erase(slot_idx);
             pending_rearm[pi] = pending_rearm.back();
             pending_rearm.pop_back();
@@ -6169,22 +6167,18 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
             for (unsigned pi = 0; pi < n_peeked; ++pi)
                 batch[n++] = { io_uring_cqe_get_data64(peeked[pi]), peeked[pi]->res };
 
-            io_uring_cq_advance(&ring, n_peeked);   // one advance per peek chunk
+            io_uring_cq_advance(&ring, n_peeked);   
 
-            if (n_peeked < want) break;   // ring drained, no point looping again
+            if (n_peeked < want) break;   
         }
 
         for (size_t ci = 0; ci < n; ++ci) {
             const uint64_t ud    = batch[ci].user_data;
             const int      bytes = batch[ci].bytes;
             if (ud & GlobalRecvCtx::WAKE_ACK_FLAG) continue;
-
-            // ── ICMP dispatch ──────────────────────────────────────────────
             if (ud & GlobalRecvCtx::ICMP_SLOT_FLAG) {
                 const size_t icmp_slot = static_cast<size_t>(
                     ud & ~GlobalRecvCtx::ICMP_SLOT_FLAG);
-
-                // SECURITY: bounds-check before any array access.
                 if (icmp_slot < GlobalRecvCtx::N_ICMP_SLOTS) {
                     ctx->icmp_armed[icmp_slot] = 0;
                     if (bytes > 0) {
@@ -6260,23 +6254,17 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                                 static_cast<uint64_t>(icmp_slot));
                             ctx->icmp_armed[icmp_slot] = 1;
                         } else {
-                            // SECURITY: defer rather than lose the slot.
                             size_t icmp_sentinel = slots.size() + icmp_slot;
                             if (pending_rearm_set.insert(icmp_sentinel).second)
                                 pending_rearm.push_back(icmp_sentinel);
                         }
                     }
                 }
-                // Corrupt icmp_slot: skip without re-arming (nothing to re-arm).
                 continue;
             }
-
-            // ── ICMPv6 dispatch ──────────────────────────────────────────────
             if (ud & GlobalRecvCtx::ICMPV6_SLOT_FLAG) {
                 const size_t icmpv6_slot = static_cast<size_t>(
                     ud & ~GlobalRecvCtx::ICMPV6_SLOT_FLAG);
-
-                // SECURITY: bounds-check before any array access.
                 if (icmpv6_slot < GlobalRecvCtx::N_ICMPV6_SLOTS) {
                     ctx->icmpv6_armed[icmpv6_slot] = 0;
                     if (bytes > 0) {
@@ -6296,7 +6284,7 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
 
                         const uint8_t* pkt  = ctx->icmpv6_bufs[icmpv6_slot].data();
                         const int      plen = bytes;
-                        constexpr int ICMP6_HDR_LEN = 8;   // type,code,cksum,4 bytes of type-specific data
+                        constexpr int ICMP6_HDR_LEN = 8; 
                         if (plen < ICMP6_HDR_LEN + static_cast<int>(sizeof(struct ip6_hdr)) + 8) break;
 
                         const struct ip6_hdr* inner_ip6h =
@@ -6340,8 +6328,6 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                                 static_cast<uint64_t>(icmpv6_slot));
                             ctx->icmpv6_armed[icmpv6_slot] = 1;
                         } else {
-                            // SECURITY: defer rather than lose the slot. Sentinel
-                            // range: [slots.size()+N_ICMP_SLOTS+slots6.size(), ...)
                             size_t icmpv6_sentinel = slots.size() + GlobalRecvCtx::N_ICMP_SLOTS
                                                     + ctx->slots6.size() + icmpv6_slot;
                             if (pending_rearm_set.insert(icmpv6_sentinel).second)
@@ -6351,13 +6337,9 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                 }
                 continue;
             }
-
-            // ── TCP6 dispatch ─────────────────────────────────────────────
             if (ud & GlobalRecvCtx::TCP6_SLOT_FLAG) {
                 const size_t slot6_idx  = static_cast<size_t>(ud & ~GlobalRecvCtx::TCP6_SLOT_FLAG);
                 const int    tcp6_bytes = bytes;
-
-                // SECURITY: bounds-check before any array access.
                 if (slot6_idx >= ctx->slots6.size()) continue;
                 ctx->slot6_armed[slot6_idx] = 0;
                 SlotMeta6& sm6 = ctx->slots6[slot6_idx];
@@ -6372,18 +6354,26 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                     break;
                 }
 
-                if (tcp6_bytes > 0 && tcp6_bytes <= static_cast<int>(RawPacket::MAX_LEN)) {
+                if (tcp6_bytes > 0) {
+                    const bool tcp6_was_oversized =
+                        tcp6_bytes > static_cast<int>(RawPacket::MAX_LEN);
+                    const int  tcp6_use_bytes = tcp6_was_oversized
+                        ? static_cast<int>(RawPacket::MAX_LEN) : tcp6_bytes;
+                    if (tcp6_was_oversized) {
+                        ++dbg_oversized_truncated;
+                        ctx->rx_truncated.fetch_add(1, std::memory_order_relaxed);
+                    }
                     const char* buffer6 = reinterpret_cast<const char*>(
                         ctx->bufs6 + slot6_idx * SLOT_SIZE);
 
-                    if (tcp6_bytes >= static_cast<int>(sizeof(struct tcphdr))) {
+                    if (tcp6_use_bytes >= static_cast<int>(sizeof(struct tcphdr))) {
                         IPv6Key key = make_ipv6_key(sm6.src_addr.sin6_addr);
                         auto* q = ctx->queue_for6(key);
                         if (q) {
                             RawPacket pkt;
                             pkt.pkt_type = RawPacket::PktType::TCP6;
-                            pkt.len      = tcp6_bytes;
-                            std::memcpy(pkt.data, buffer6, tcp6_bytes);
+                            pkt.len      = tcp6_use_bytes;
+                            std::memcpy(pkt.data, buffer6, tcp6_use_bytes);
 
                             int64_t kernel_rx_us = 0;
                             for (struct cmsghdr* c = CMSG_FIRSTHDR(&sm6.msg);
@@ -6398,8 +6388,6 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                                 } else if (c->cmsg_type == SO_RXQ_OVFL) {
                                     uint32_t ovfl6 = 0;
                                     std::memcpy(&ovfl6, CMSG_DATA(c), sizeof(ovfl6));
-                                    // Cumulative since socket creation — store,
-                                    // never accumulate.  receive_response() diffs it.
                                     if (ovfl6 > 0)
                                         ctx->rx_kernel_ovfl_v6.store(ovfl6, std::memory_order_relaxed);
                                 }
@@ -6409,9 +6397,6 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                             woken_ips6.insert(key);
                         }
                     }
-                } else if (tcp6_bytes > static_cast<int>(RawPacket::MAX_LEN)) {
-                    ++dbg_oversized_drops;
-                    ctx->rx_oversized.fetch_add(1, std::memory_order_relaxed);
                 }
 
                 sm6.src_len            = sizeof(sm6.src_addr);
@@ -6460,25 +6445,38 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                 break;
             }
 
-            if (tcp_bytes > 0 &&
-                tcp_bytes <= static_cast<int>(RawPacket::MAX_LEN)) {
+            if (tcp_bytes > 0) {
+                const bool tcp_was_oversized =
+                    tcp_bytes > static_cast<int>(RawPacket::MAX_LEN);
+                const int  tcp_use_bytes = tcp_was_oversized
+                    ? static_cast<int>(RawPacket::MAX_LEN) : tcp_bytes;
+                if (tcp_was_oversized) {
+                    ++dbg_oversized_truncated;
+                    ctx->rx_truncated.fetch_add(1, std::memory_order_relaxed);
+                    if (dbg_oversized_truncated <= 10 || dbg_oversized_truncated % 1000 == 0) {
+                        std::lock_guard<std::mutex> lock(cout_mutex);
+                        std::cerr << "[DBG-RX8] oversized packet truncated: " << tcp_bytes
+                                  << " bytes > MAX_LEN=" << RawPacket::MAX_LEN
+                                  << " (total truncated=" << dbg_oversized_truncated << ")\n";
+                    }
+                }
                 const char* buffer = reinterpret_cast<const char*>(
                     recv_bufs + slot_idx * SLOT_SIZE);
                 const struct ip* iph = reinterpret_cast<const struct ip*>(buffer);
                 int iphdrlen = iph->ip_hl * 4;
 
                 if (iphdrlen >= static_cast<int>(sizeof(struct ip)) &&
-                    iphdrlen <= tcp_bytes &&
+                    iphdrlen <= tcp_use_bytes &&
                     iph->ip_p == IPPROTO_TCP &&
-                    tcp_bytes >= iphdrlen +
+                    tcp_use_bytes >= iphdrlen +
                         static_cast<int>(sizeof(struct tcphdr)))
                 {
                     auto* q = ctx->queue_for(iph->ip_src.s_addr);
                     if (q) {
                         RawPacket pkt;
                         pkt.pkt_type = RawPacket::PktType::TCP;
-                        pkt.len      = tcp_bytes;
-                        std::memcpy(pkt.data, buffer, tcp_bytes);
+                        pkt.len      = tcp_use_bytes;
+                        std::memcpy(pkt.data, buffer, tcp_use_bytes);
 
                         int64_t kernel_rx_us = 0;
                         for (struct cmsghdr* c = CMSG_FIRSTHDR(&sm.msg);
@@ -6513,15 +6511,6 @@ void recv_reader_thread_func(GlobalRecvCtx* ctx) {
                         q->enqueue(std::move(pkt));
                         woken_ips.insert(iph->ip_src.s_addr);
                     }
-                }
-             } else if (tcp_bytes > static_cast<int>(RawPacket::MAX_LEN)) {
-                ++dbg_oversized_drops;
-                ctx->rx_oversized.fetch_add(1, std::memory_order_relaxed);
-                if (dbg_oversized_drops <= 10 || dbg_oversized_drops % 1000 == 0) {
-                    std::lock_guard<std::mutex> lock(cout_mutex);
-                    std::cerr << "[DBG-RX8] oversized packet dropped: " << tcp_bytes
-                              << " bytes > MAX_LEN=" << RawPacket::MAX_LEN
-                              << " (total oversized drops=" << dbg_oversized_drops << ")\n";
                 }
             } else if (tcp_bytes < 0 &&
                        tcp_bytes != -EAGAIN &&
@@ -6875,7 +6864,7 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
         result.loss_aborted       += batch_result.loss_aborted;
         result.rx_kernel_ovfl     += batch_result.rx_kernel_ovfl;
         result.rx_cq_overflow     += batch_result.rx_cq_overflow;
-        result.rx_oversized       += batch_result.rx_oversized;
+        result.rx_truncated       += batch_result.rx_truncated;
         result.rx_slot_starved    += batch_result.rx_slot_starved;
         result.rtt_debug_entries.insert(result.rtt_debug_entries.end(),
             batch_result.rtt_debug_entries.begin(), batch_result.rtt_debug_entries.end());
