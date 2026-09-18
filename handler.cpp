@@ -2966,7 +2966,7 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                                        + result.loss_aborted;
                 const uint64_t rx_loss = result.rx_kernel_ovfl
                                        + result.rx_cq_overflow
-                                       + result.rx_oversized;
+                                       + result.rx_truncated;
 
                 if (tx_loss || rx_loss || result.rx_slot_starved) {
                     const uint64_t attempted =
@@ -2979,11 +2979,12 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                     std::lock_guard<std::mutex> lock(cout_mutex);
                     std::cout << "\nIncident\n";
 
-                    auto checkpoint = [](const char* name, const char* reason, uint64_t n) {
+                    auto checkpoint = [](const char* name, const char* reason, uint64_t n,
+                                          const char* label = "Drops") {
                         if (!n) return;
                         std::cout << "  -> CheckPoint  : " << std::left << std::setw(13) << name
                                   << "| Reason : " << std::setw(31) << reason
-                                  << "| Drops : " << n << "\n";
+                                  << "| " << label << " : " << n << "\n";
                     };
 
                     checkpoint("BufferPool",   "pool exhausted",                result.loss_buffer_pool);
@@ -2994,7 +2995,7 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                     checkpoint("Abandoned",    "batch aborted / submit error",  result.loss_aborted);
                     checkpoint("RxKernelDrop", "SO_RXQ_OVFL, recv buffer full", result.rx_kernel_ovfl);
                     checkpoint("RxCqOverflow", "io_uring CQ overflow",          result.rx_cq_overflow);
-                    checkpoint("RxOversized",  "frame exceeded MAX_LEN",        result.rx_oversized);
+                    checkpoint("RxTruncated",  "frame exceeded MAX_LEN",        result.rx_truncated, "Truncated");
                     checkpoint("RxSlotStarve", "no free slot, re-arm deferred", result.rx_slot_starved);
 
                     std::cout << std::right;
