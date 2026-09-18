@@ -116,11 +116,7 @@ namespace color {
 }
 
 extern std::unordered_map<std::string, std::vector<std::string>> g_not_scanned_map;
-std::atomic<double> g_congestion_ratio(0.0);
-std::atomic<int>    g_dynamic_max_retries(2); 
 CongestionTuneConfig g_cong_tune; 
-std::atomic<size_t> g_ports_in_retry_global(0);  
-std::atomic<size_t> g_active_ports_global(0);  
 std::atomic<bool> terminate_flag(false);
 std::atomic<int> filtered_ports_printed_count(0);
 std::atomic<size_t> total_packets_sent(0);
@@ -237,7 +233,6 @@ void print_output(PrintOutputType type,
 {
     std::lock_guard<std::mutex> lock(cout_mutex);
 
-    // NEW:
     auto format_time = []() -> std::string {
         time_t now = time(nullptr);
         struct tm t;
@@ -2732,6 +2727,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                       struct io_uring *send_ring, bool fast_scan, size_t batch_size, ScanType scan_type,uint8_t custom_ttl, uint8_t custom_dscp,uint16_t custom_ip_flags, IpIdMode ip_id_mode, uint16_t fixed_ip_id,
                       const TcpBuildOptions& opts,
                       RTTTracker& shared_rtt_tracker, uint32_t shared_tsval_offset,
+                      RetryBudgetState& retry_budget,
                       bool debug_rtt,bool debug_ttl,bool debug_demux,bool debug_strack,bool frag_out_of_order,bool frag_overlap, uint16_t frag_overlap_bytes,bool
                       frag_zof,const SportRangeConfig& sport_range_cfg,const GsportConfig& gsport_cfg,int initial_rtt_ms,int port_timeout_min_ms, int port_timeout_max_ms,RateConfig rate_config,JitterConfig 
                       jitter_config,BatchDelayConfig
@@ -2740,8 +2736,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                       BandwidthConfig bandwidth_config, BandwidthLimiterState* bandwidth_state,
                       uint64_t initial_dispatch_delay_us, bool debug_send,
                       int sock6, const uint8_t* src_ip6) {
-    // Local aliases: same names the body below has always used, now backed
-    // by the shared opts struct instead of ~29 individual parameters.
+
     const bool&        use_manual_tcp_checksum = opts.use_manual_tcp_checksum;
     const uint16_t&    manual_tcp_checksum     = opts.manual_tcp_checksum;
     const uint8_t&     window_scale            = opts.window_scale;
@@ -3084,11 +3079,11 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
         rs.rate_window_start = std::chrono::steady_clock::now();
         if (rate_config.enabled) {
         if (rate_config.dynamic_mode) {                              
-		bool no_retries_yet = (g_ports_in_retry_global.load(std::memory_order_relaxed) == 0);
+		bool no_retries_yet = (retry_budget.ports_in_retry.load(std::memory_order_relaxed) == 0);
 		if (rate_config.gate_by_retry && no_retries_yet) {
 		    rs.rate_window_target = UINT32_MAX;   
 		} else {
-		    double ratio  = g_congestion_ratio.load(std::memory_order_relaxed);
+		    double ratio  = retry_budget.congestion_ratio.load(std::memory_order_relaxed);
 		    if (ratio <= 0.0) {
 			rs.rate_window_target = UINT32_MAX; 
 		    } else {
@@ -3479,7 +3474,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
     auto last_timeout_check = std::chrono::steady_clock::now();
 
     std::atomic<size_t> active_count(active_ports.size());
-    g_active_ports_global.fetch_add(active_ports.size(), std::memory_order_relaxed);   // NEW
+    retry_budget.active_ports.fetch_add(active_ports.size(), std::memory_order_relaxed); 
     std::atomic<size_t> ports_in_retry{0};
     bool needs_submit = false;
     constexpr int64_t IDLE_NO_DEADLINE_WAIT_NS = 250 * 1000 * 1000; 
@@ -3783,13 +3778,13 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     if (state_resolved && state.final_state_determined &&
                         !port_final[didx].exchange(true, std::memory_order_acq_rel)) {
                         active_count.fetch_sub(1, std::memory_order_relaxed);
-                        g_active_ports_global.fetch_sub(1, std::memory_order_relaxed);
+                        retry_budget.active_ports.fetch_sub(1, std::memory_order_relaxed);
                         tx_ts_table[didx].store(0, std::memory_order_release);
                         probe_outstanding[didx].store(false, std::memory_order_release);
                         if (state.counted_in_retry) {
                             state.counted_in_retry = false;
                             ports_in_retry.fetch_sub(1, std::memory_order_relaxed);
-                            g_ports_in_retry_global.fetch_sub(1, std::memory_order_relaxed);  
+                            retry_budget.ports_in_retry.fetch_sub(1, std::memory_order_relaxed);  
                         }
                         StrackFinalState sfs =
                             state.reported_state == PortState::PortReportedState::Open   ? StrackFinalState::Open   :
@@ -4025,13 +4020,13 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                 state.final_state_determined = true;
                 port_final[bidx].store(true, std::memory_order_release);
                 active_count.fetch_sub(1, std::memory_order_relaxed);
-                g_active_ports_global.fetch_sub(1, std::memory_order_relaxed); 
+                retry_budget.active_ports.fetch_sub(1, std::memory_order_relaxed); 
                 tx_ts_table[bidx].store(0, std::memory_order_release);
                 probe_outstanding[bidx].store(false, std::memory_order_release);
                 if (state.counted_in_retry) {
                     state.counted_in_retry = false;
                     ports_in_retry.fetch_sub(1, std::memory_order_relaxed);
-                    g_ports_in_retry_global.fetch_sub(1, std::memory_order_relaxed);  
+                    retry_budget.ports_in_retry.fetch_sub(1, std::memory_order_relaxed);  
                 }
                 strack_log(blocked_port, StrackFinalState::Filtered,
                            state.attempt_for_src_port(inner_src_port), inner_src_port,
@@ -4239,7 +4234,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     state.sent_tsval    = generate_tcp_tsval() + state.tsval_offset;
 
                     if (state.retry_count == 1) {
-                        state.retries_cap = g_dynamic_max_retries.load(std::memory_order_relaxed);
+                        state.retries_cap = retry_budget.dynamic_max_retries.load(std::memory_order_relaxed);
                     }
                     if (state.retry_count < 6 && sport_range_cfg.stage_is_range[state.retry_count]) {
                         state.src_port = pick_unique_ephemeral_port(rng,
@@ -4255,22 +4250,21 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     size_t pir;
                     if (state.retry_count == 1) {
                         pir = ports_in_retry.fetch_add(1, std::memory_order_relaxed) + 1;
-                        g_ports_in_retry_global.fetch_add(1, std::memory_order_relaxed);
+                        retry_budget.ports_in_retry.fetch_add(1, std::memory_order_relaxed);
                         state.counted_in_retry = true;
                     } else {
                         pir = ports_in_retry.load(std::memory_order_relaxed);
                     }
-                    // NEW
 		    uint64_t timeout_us = static_cast<uint64_t>(
 		        global_rtt_tracker.get_timeout_for_retry(state.retry_count)) * 1000ULL;
-		    size_t global_active = g_active_ports_global.load(std::memory_order_relaxed);
-		    double filtered_ratio = static_cast<double>(g_ports_in_retry_global.load(std::memory_order_relaxed)) /
+		    size_t global_active = retry_budget.active_ports.load(std::memory_order_relaxed);
+		    double filtered_ratio = static_cast<double>(retry_budget.ports_in_retry.load(std::memory_order_relaxed)) /
 		        static_cast<double>(global_active > 0 ? global_active : 1);
 		        
-		    double prev_g = g_congestion_ratio.load(std::memory_order_relaxed);
+		    double prev_g = retry_budget.congestion_ratio.load(std::memory_order_relaxed);
 		    double alpha  = (filtered_ratio > prev_g) ? g_cong_tune.alpha_up : g_cong_tune.alpha_down;
 		    double new_g  = alpha * filtered_ratio + (1 - alpha) * prev_g;
-		    g_congestion_ratio.store(new_g, std::memory_order_relaxed);
+		    retry_budget.congestion_ratio.store(new_g, std::memory_order_relaxed);
 		    // corrected — direct relationship, not inverted
 		    {
 		        double ratio_c = std::pow(new_g, g_cong_tune.curve_exp);
@@ -4278,7 +4272,7 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
 		        int dyn  = g_cong_tune.min_retries +
 			          static_cast<int>(std::lround(ratio_c * span)); 
 		        dyn = std::clamp(dyn, g_cong_tune.min_retries, g_cong_tune.max_retries);
-		        g_dynamic_max_retries.store(dyn, std::memory_order_relaxed);
+		        retry_budget.dynamic_max_retries.store(dyn, std::memory_order_relaxed);
 		    }
 
 		    const uint64_t MIN_DELAY_US = g_cong_tune.retry_delay_min_us;
@@ -4317,11 +4311,11 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     state.final_state_determined = true;
                     port_final[pidx].store(true, std::memory_order_release);
                     active_count.fetch_sub(1, std::memory_order_relaxed);
-                    g_active_ports_global.fetch_sub(1, std::memory_order_relaxed);   // NEW
+                    retry_budget.active_ports.fetch_sub(1, std::memory_order_relaxed);   
                     if (state.counted_in_retry) {
                         state.counted_in_retry = false;
                         ports_in_retry.fetch_sub(1, std::memory_order_relaxed);
-                        g_ports_in_retry_global.fetch_sub(1, std::memory_order_relaxed);  
+                        retry_budget.ports_in_retry.fetch_sub(1, std::memory_order_relaxed);  
                     }
                 }
             }
@@ -5391,7 +5385,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
         std::cerr << "[GlobalRecv] TCP socket failed: " << strerror(errno) << "\n";
         return nullptr;
     }
-    track_raw_socket(ctx->tcp_sock);   // NEW
+    track_raw_socket(ctx->tcp_sock);  
     int rcvbuf = user_rcvbuf_size > 0 ? user_rcvbuf_size : 64 * 1024 * 1024;
     if (setsockopt(ctx->tcp_sock, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf)) < 0)
         setsockopt(ctx->tcp_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
@@ -5500,14 +5494,14 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
                 close(ctx->tcp6_sock);
                 ctx->tcp6_sock = -1;
             }
-            if (ctx->tcp6_sock >= 0) track_raw_socket(ctx->tcp6_sock);   // NEW
+            if (ctx->tcp6_sock >= 0) track_raw_socket(ctx->tcp6_sock);  
         }
     }
     ctx->icmp_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (ctx->icmp_sock >= 0) {
         int icmp_fl = fcntl(ctx->icmp_sock, F_GETFL, 0);
         if (icmp_fl >= 0) fcntl(ctx->icmp_sock, F_SETFL, icmp_fl | O_NONBLOCK);
-        track_raw_socket(ctx->icmp_sock);   // NEW
+        track_raw_socket(ctx->icmp_sock); 
 
         int icmp_rcvbuf = 8 * 1024 * 1024;
         if (setsockopt(ctx->icmp_sock, SOL_SOCKET, SO_RCVBUFFORCE,
@@ -5571,7 +5565,7 @@ std::unique_ptr<GlobalRecvCtx> init_global_recv_ctx(
         if (ctx->icmpv6_sock >= 0) {
             int icmp6_fl = fcntl(ctx->icmpv6_sock, F_GETFL, 0);
             if (icmp6_fl >= 0) fcntl(ctx->icmpv6_sock, F_SETFL, icmp6_fl | O_NONBLOCK);
-            track_raw_socket(ctx->icmpv6_sock);   // NEW
+            track_raw_socket(ctx->icmpv6_sock);  
 
             int icmp6_rcvbuf = 8 * 1024 * 1024;
             if (setsockopt(ctx->icmpv6_sock, SOL_SOCKET, SO_RCVBUFFORCE,
@@ -6612,6 +6606,10 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
                        dest_ip_key6_valid, dest_ip_key6};
     
     RTTTracker shared_rtt_tracker(initial_rtt_ms);
+    // Per-target retry budget — see RetryBudgetState in scan.hpp. Constructed
+    // fresh for every target (same lifetime as shared_rtt_tracker above) so
+    // no target's congestion signal can leak into another target's retry cap.
+    RetryBudgetState retry_budget;
     const uint32_t shared_tsval_offset = static_cast<uint32_t>(rng());
     uint64_t pending_dispatch_delay_us = 0;   // computed for batch i, consumed by batch i's receive_response() call
     for (const auto& range : batches) {
@@ -6625,7 +6623,7 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
         RecPross batch_result = receive_response(ip, batch_ports, effective_src_ip, rng, pool, 
                                  send_sock, source_port, retry_source_port, seq_num, win_size, print_individual_closed_filtered, print_filtered_if_few,send_ring, fast_scan, scan_batch_size, scan_type,
                                  custom_ttl,custom_dscp,custom_ip_flags, ip_id_mode, fixed_ip_id,
-                                 opts, shared_rtt_tracker, shared_tsval_offset,
+                                 opts, shared_rtt_tracker, shared_tsval_offset, retry_budget,
                                    debug_rtt,debug_ttl,debug_demux,debug_strack,frag_out_of_order,frag_overlap, frag_overlap_bytes,frag_zof,sport_range_cfg,gsport_cfg,initial_rtt_ms,port_timeout_min_ms,port_timeout_max_ms,rate_config,jitter_config,batch_delay_config,
                                  g_recv,g_send, idle_ring_ok ? &idle_ring : nullptr, &rate_state,
                                  bandwidth_config, &bandwidth_state,
@@ -6680,10 +6678,10 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
         if (batch_delay_config.enabled && !terminate_flag) {
 	    uint64_t sleep_us = 0;
 	    if (batch_delay_config.dynamic_mode) {                       
-		if (g_ports_in_retry_global.load(std::memory_order_relaxed) == 0) {
+		if (retry_budget.ports_in_retry.load(std::memory_order_relaxed) == 0) {
 		    sleep_us = 0;                                      
 		} else {
-		    double ratio  = g_congestion_ratio.load(std::memory_order_relaxed);
+		    double ratio  = retry_budget.congestion_ratio.load(std::memory_order_relaxed);
 		    double curved = std::pow(ratio, g_cong_tune.curve_exp);
 		    sleep_us = batch_delay_config.min_us +
 		        static_cast<uint64_t>(curved *
