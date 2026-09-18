@@ -875,7 +875,7 @@ struct RecPross {
     //    targets sharing the reader thread will see overlapping numbers.
     uint64_t rx_kernel_ovfl  = 0;      // SO_RXQ_OVFL — kernel recv buffer full
     uint64_t rx_cq_overflow  = 0;      // io_uring CQ overflow on the recv ring
-    uint64_t rx_oversized    = 0;      // frame larger than RawPacket::MAX_LEN
+    uint64_t rx_truncated    = 0; 
     uint64_t rx_slot_starved = 0;      // no free slot, re-arm deferred
     uint8_t received_ttl = 0;
     std::vector<std::pair<int, double>> rtt_debug_entries;
@@ -1267,22 +1267,12 @@ struct GlobalRecvCtx {
     std::thread       reader_thread;
     std::atomic<bool> reader_started{false};
     std::atomic<bool> reader_stop{false};
-
-    // ── RX loss telemetry ────────────────────────────────────────────────
-    // Written by the single reader thread, snapshotted by receive_response()
-    // at scan start and end.  All are cumulative since socket creation, so
-    // callers must take a delta, never read them as absolute scan figures.
-    //
-    // SO_RXQ_OVFL is a PER-SOCKET kernel counter, and this context owns four
-    // independent raw sockets (v4 TCP, v6 TCP, v4 ICMP, v6 ICMP) — so each
-    // gets its own field.  RecPross::rx_kernel_ovfl is the SUM of all four,
-    // computed in receive_response().
     std::atomic<uint64_t> rx_kernel_ovfl_v4   {0};  // SO_RXQ_OVFL, tcp_sock
     std::atomic<uint64_t> rx_kernel_ovfl_v6   {0};  // SO_RXQ_OVFL, tcp6_sock
     std::atomic<uint64_t> rx_kernel_ovfl_icmp {0};  // SO_RXQ_OVFL, icmp_sock
     std::atomic<uint64_t> rx_kernel_ovfl_icmp6{0};  // SO_RXQ_OVFL, icmpv6_sock
     std::atomic<uint64_t> rx_cq_overflow {0};  // io_uring CQ overflow
-    std::atomic<uint64_t> rx_oversized   {0};  // frame > RawPacket::MAX_LEN
+    std::atomic<uint64_t> rx_truncated   {0};
     std::atomic<uint64_t> rx_slot_starved{0};  // no free slot on re-arm
 
     moodycamel::ConcurrentQueue<RawPacket>* queue_for(uint32_t src_addr) {
