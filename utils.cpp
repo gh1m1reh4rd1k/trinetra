@@ -18,11 +18,11 @@
 #include <cctype>
 #include <chrono>
 #include <ctime>
-#include <net/if.h>       
-#include <netpacket/packet.h> 
-#include <ifaddrs.h>         
-#include <sys/ioctl.h> 
-#include <immintrin.h>  
+#include <net/if.h>
+#include <netpacket/packet.h>
+#include <ifaddrs.h>
+#include <sys/ioctl.h>
+#include <immintrin.h>
 #include <emmintrin.h>
 #include <linux/rtnetlink.h>
 #include <linux/netlink.h>
@@ -31,17 +31,16 @@
 #include <thread>
 #include <atomic>
 #include <unordered_set>
-#include "dns_enum.hpp"   // AsyncDnsJob / DnsRRType / dns_query_batch — shared vectorized DNS engine
-
+#include <unordered_map>
+#include <memory>
+#include <vector>
+#include <string>
+#include <cerrno>
+#include "dns_enum.hpp"
 
 bool custom_dns_configured();
 bool resolve_ptr_via_configured_dns(const std::string& ip, std::string& out_domain);
 
-// Implemented in handler.cpp, where g_dns_servers/g_dns_tls_servers live.
-// Returns the plain-UDP --dns-servers list, or empty if only
-// --dns-servers-tls (DoT) was configured, or empty if nothing was set.
-// dns_query_batch() speaks plain UDP only, so an empty return here with
-// custom_dns_configured()==true means "DoT-only, can't be batched".
 std::vector<std::string> get_configured_plain_dns_servers();
 
 static inline uint64_t process_scalar_remainder(const uint8_t* data, int len) {
@@ -59,61 +58,58 @@ static inline uint64_t process_scalar_remainder(const uint8_t* data, int len) {
     return sum;
 }
 
-
 unsigned short checksum(void *b, int len) {
     const uint8_t* data = static_cast<const uint8_t*>(b);
     uint64_t sum = 0;
 
 #ifdef __AVX2__
-    // AVX2 implementation
+
     if (len >= 32) {
         __m256i zero = _mm256_setzero_si256();
         __m256i sum_vec = _mm256_setzero_si256();
         int avx2_len = len - (len % 32);
-        
+
         for (int i = 0; i < avx2_len; i += 32) {
             __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
             __m256i sum_part = _mm256_sad_epu8(v, zero);
             sum_vec = _mm256_add_epi64(sum_vec, sum_part);
         }
-        
+
         sum += _mm256_extract_epi64(sum_vec, 0);
         sum += _mm256_extract_epi64(sum_vec, 1);
         sum += _mm256_extract_epi64(sum_vec, 2);
         sum += _mm256_extract_epi64(sum_vec, 3);
-        
+
         data += avx2_len;
         len -= avx2_len;
     }
 #elif defined(__SSE2__)
-    // SSE2 implementation
+
     if (len >= 16) {
         __m128i zero = _mm_setzero_si128();
         __m128i sum_vec = _mm_setzero_si128();
         int sse2_len = len - (len % 16);
-        
+
         for (int i = 0; i < sse2_len; i += 16) {
             __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
             __m128i sum_part = _mm_sad_epu8(v, zero);
             sum_vec = _mm_add_epi64(sum_vec, sum_part);
         }
-        
+
         sum += _mm_extract_epi64(sum_vec, 0);
         sum += _mm_extract_epi64(sum_vec, 1);
-        
+
         data += sse2_len;
         len -= sse2_len;
     }
 #endif
 
-    // Process remaining bytes
     sum += process_scalar_remainder(data, len);
 
-    // Fold 64-bit sum to 16-bit checksum
     while (sum >> 16) {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    
+
     return static_cast<uint16_t>(~sum);
 }
 
@@ -121,7 +117,7 @@ std::vector<int> parse_ports(const std::string &port_spec) {
     std::vector<int> ports;
     std::stringstream ss(port_spec);
     std::string token;
-    
+
     while (std::getline(ss, token, ',')) {
         token.erase(0, token.find_first_not_of(" \t"));
         token.erase(token.find_last_not_of(" \t") + 1);
@@ -129,20 +125,20 @@ std::vector<int> parse_ports(const std::string &port_spec) {
             std::cerr << "Empty port specification ignored\n";
             continue;
         }
-        
+
         size_t dash_pos = token.find('-');
         if (dash_pos != std::string::npos) {
             try {
                 int start_port = std::stoi(token.substr(0, dash_pos));
                 int end_port = std::stoi(token.substr(dash_pos + 1));
-                
+
                 if (start_port > 0 && start_port <= 65535 && end_port > 0 && end_port <= 65535 && start_port <= end_port) {
                     ports.reserve(ports.size() + (end_port - start_port + 1));
                     for (int port = start_port; port <= end_port; ++port) {
                         ports.push_back(port);
                     }
                 } else {
-                    if (start_port <= 0 || start_port > 65535) 
+                    if (start_port <= 0 || start_port > 65535)
                         std::cerr << "Start port out of range (1-65535): " << start_port << std::endl;
                     else if (end_port <= 0 || end_port > 65535)
                         std::cerr << "End port out of range (1-65535): " << end_port << std::endl;
@@ -165,12 +161,12 @@ std::vector<int> parse_ports(const std::string &port_spec) {
             }
         }
     }
-    
+
     if (ports.empty()) {
         std::cerr << "No valid ports parsed from: " << port_spec << std::endl;
         return ports;
     }
-    
+
     std::sort(ports.begin(), ports.end());
     ports.erase(std::unique(ports.begin(), ports.end()), ports.end());
     return ports;
@@ -178,7 +174,7 @@ std::vector<int> parse_ports(const std::string &port_spec) {
 
 std::vector<int> read_ports_from_file(const std::string& filename) {
     std::vector<int> ports;
- 
+
     int fd = open(filename.c_str(), O_RDONLY);
     if (fd < 0) {
         std::cerr << "Failed to open " << filename << ": " << strerror(errno) << std::endl;
@@ -188,7 +184,7 @@ std::vector<int> read_ports_from_file(const std::string& filename) {
         int fd;
         ~FDGuard() { if (fd >= 0) close(fd); }
     } guard{fd};
- 
+
     struct stat st;
     if (fstat(fd, &st) < 0) {
         std::cerr << "Failed to get file size for " << filename
@@ -199,7 +195,7 @@ std::vector<int> read_ports_from_file(const std::string& filename) {
         std::cerr << filename << " is empty" << std::endl;
         return ports;
     }
- 
+
     size_t file_size = static_cast<size_t>(st.st_size);
     void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
     if (mapped == MAP_FAILED) {
@@ -210,20 +206,20 @@ std::vector<int> read_ports_from_file(const std::string& filename) {
         void* ptr; size_t size;
         ~MapGuard() { if (ptr != MAP_FAILED) munmap(ptr, size); }
     } map_guard{mapped, file_size};
- 
+
     ports.reserve((file_size / 7) + 100);
     const char* data    = static_cast<const char*>(mapped);
     const char* end     = data + file_size;
     const char* current = data;
- 
+
     while (current < end) {
         while (current < end &&
                (*current == ' ' || *current == '\t' || *current == '\r')) ++current;
         if (current >= end) break;
- 
+
         const char* num_start = current;
         while (current < end && *current >= '0' && *current <= '9') ++current;
- 
+
         if (current > num_start) {
             int port  = 0;
             bool valid = true;
@@ -242,7 +238,7 @@ std::vector<int> read_ports_from_file(const std::string& filename) {
         while (current < end && *current != '\n') ++current;
         if (current < end) ++current;
     }
- 
+
     if (ports.empty()) {
         std::cerr << "No valid ports found in " << filename << std::endl;
         return ports;
@@ -275,8 +271,6 @@ bool parse_cidr_generic(const std::string& cidr, int family,
     std::string prefix_str = cidr.substr(slash + 1);
     if (prefix_str.empty()) return false;
 
-    // Reject anything but plain digits up front -- std::stoi alone would
-    // silently accept "24abc" and stop at the first non-digit.
     for (char c : prefix_str) {
         if (!isdigit(static_cast<unsigned char>(c))) return false;
     }
@@ -290,7 +284,7 @@ bool parse_cidr_generic(const std::string& cidr, int family,
     }
     if (p < 0 || p > max_prefix) return false;
 
-    unsigned char buf[16]; // big enough for either family
+    unsigned char buf[16];
     if (inet_pton(family, ip.c_str(), buf) != 1) return false;
 
     ip_out = ip;
@@ -319,6 +313,81 @@ int make_sockaddr_from_ip(const std::string& ip, uint16_t port,
     return 0;
 }
 
+namespace {
+
+struct V6AddrRecord {
+    std::string ifname;
+    struct in6_addr addr;
+    uint8_t prefix;
+};
+
+struct LocalIfaceSnapshot {
+    std::chrono::steady_clock::time_point taken;
+    std::unordered_map<std::string, unsigned int> iface_flags;
+    std::unordered_map<std::string, std::string> addr_owner;
+    std::vector<V6AddrRecord> v6;
+};
+
+std::string make_addr_key(int family, const void* addr, size_t len) {
+    std::string key;
+    key.reserve(len + 1);
+    key.push_back(static_cast<char>(family));
+    key.append(static_cast<const char*>(addr), len);
+    return key;
+}
+
+uint8_t netmask6_prefix(const struct sockaddr* mask) {
+    if (!mask || mask->sa_family != AF_INET6) return 64;
+    const auto* m6 = reinterpret_cast<const struct sockaddr_in6*>(mask);
+    uint8_t prefix = 0;
+    for (int i = 0; i < 16; ++i) {
+        prefix = static_cast<uint8_t>(prefix + __builtin_popcount(m6->sin6_addr.s6_addr[i]));
+    }
+    return prefix;
+}
+
+std::shared_ptr<const LocalIfaceSnapshot> get_local_iface_snapshot(int& err_out) {
+    static std::mutex snapshot_mutex;
+    static std::shared_ptr<const LocalIfaceSnapshot> cached;
+    static const std::chrono::milliseconds max_age(250);
+
+    std::lock_guard<std::mutex> lock(snapshot_mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (cached && (now - cached->taken) < max_age) return cached;
+
+    struct ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) != 0) {
+        err_out = errno;
+        return nullptr;
+    }
+
+    auto snap = std::make_shared<LocalIfaceSnapshot>();
+    snap->taken = now;
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        const std::string name = ifa->ifa_name ? ifa->ifa_name : "";
+        snap->iface_flags[name] |= ifa->ifa_flags;
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            const auto* sin = reinterpret_cast<const struct sockaddr_in*>(ifa->ifa_addr);
+            snap->addr_owner.emplace(make_addr_key(AF_INET, &sin->sin_addr, 4), name);
+        } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+            const auto* sin6 = reinterpret_cast<const struct sockaddr_in6*>(ifa->ifa_addr);
+            snap->addr_owner.emplace(make_addr_key(AF_INET6, &sin6->sin6_addr, 16), name);
+            V6AddrRecord rec;
+            rec.ifname = name;
+            rec.addr = sin6->sin6_addr;
+            rec.prefix = netmask6_prefix(ifa->ifa_netmask);
+            snap->v6.push_back(std::move(rec));
+        }
+    }
+    freeifaddrs(ifaddr);
+
+    cached = snap;
+    return cached;
+}
+
+}
+
 static std::string autodetect_interface_impl(int family, const void* addr, size_t addr_len) {
     static std::unordered_map<std::string, std::string> iface_cache;
     static std::mutex cache_mutex;
@@ -333,28 +402,20 @@ static std::string autodetect_interface_impl(int family, const void* addr, size_
         if (it != iface_cache.end()) return it->second;
     }
 
-    struct ifaddrs *ifaddr;
     std::string interface;
-    if (getifaddrs(&ifaddr) == -1) {
-        std::cerr << "getifaddrs failed: " << strerror(errno) << std::endl;
+    int snap_err = 0;
+    auto snap = get_local_iface_snapshot(snap_err);
+    if (!snap) {
+        std::cerr << "getifaddrs failed: " << strerror(snap_err) << std::endl;
         std::string default_iface, default_gw;
         if (get_default_route(family, default_iface, default_gw) && !default_iface.empty()) {
             return default_iface;
         }
         return "eth0";
     }
-    for (struct ifaddrs *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-        if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != family) continue;
-        const void* candidate = (family == AF_INET)
-            ? static_cast<const void*>(&reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr)->sin_addr)
-            : static_cast<const void*>(&reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr)->sin6_addr);
-        if (memcmp(candidate, addr, addr_len) == 0) {
-            interface = ifa->ifa_name;
-            break;
-        }
-    }
-    freeifaddrs(ifaddr);
-    
+    auto owner = snap->addr_owner.find(make_addr_key(family, addr, addr_len));
+    if (owner != snap->addr_owner.end()) interface = owner->second;
+
     if (interface.empty()) {
         std::string default_iface, default_gw;
         if (get_default_route(family, default_iface, default_gw) && !default_iface.empty()) {
@@ -377,13 +438,13 @@ std::string autodetect_interface(const struct in6_addr& local_ip6) {
     return autodetect_interface_impl(AF_INET6, &local_ip6, sizeof(local_ip6));
 }
 
-
 bool get_interface_ip6(const char* ifname, uint8_t* ip6, uint8_t* prefix_len) {
     if (!ip6 || !ifname) return false;
 
-    struct ifaddrs* ifaddr = nullptr;
-    if (getifaddrs(&ifaddr) != 0) {
-        std::cerr << "get_interface_ip6: getifaddrs failed: " << strerror(errno) << "\n";
+    int snap_err = 0;
+    auto snap = get_local_iface_snapshot(snap_err);
+    if (!snap) {
+        std::cerr << "get_interface_ip6: getifaddrs failed: " << strerror(snap_err) << "\n";
         return false;
     }
 
@@ -391,36 +452,22 @@ bool get_interface_ip6(const char* ifname, uint8_t* ip6, uint8_t* prefix_len) {
     uint8_t best_ip[16] = {0};
     uint8_t best_prefix = 64;
 
-    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET6) continue;
-        if (strcmp(ifa->ifa_name, ifname) != 0) continue;
-
-        struct sockaddr_in6* sin6 = (struct sockaddr_in6*)ifa->ifa_addr;
-        if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) continue;
-        bool is_link_local = IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr);
-
-        uint8_t prefix = 64;
-        if (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET6) {
-            struct sockaddr_in6* mask6 = (struct sockaddr_in6*)ifa->ifa_netmask;
-            prefix = 0;
-            for (int i = 0; i < 16; ++i) {
-                uint8_t byte = mask6->sin6_addr.s6_addr[i];
-                while (byte) { prefix += (byte & 1); byte >>= 1; }
-            }
-        }
+    for (const auto& rec : snap->v6) {
+        if (rec.ifname != ifname) continue;
+        if (IN6_IS_ADDR_LOOPBACK(&rec.addr)) continue;
+        const bool is_link_local = IN6_IS_ADDR_LINKLOCAL(&rec.addr);
 
         if (!is_link_local) {
-            memcpy(best_ip, &sin6->sin6_addr, 16);
-            best_prefix = prefix;
+            memcpy(best_ip, &rec.addr, 16);
+            best_prefix = rec.prefix;
             found_global = true;
             break;
         } else if (!found_any) {
-            memcpy(best_ip, &sin6->sin6_addr, 16);
-            best_prefix = prefix;
+            memcpy(best_ip, &rec.addr, 16);
+            best_prefix = rec.prefix;
         }
         found_any = true;
     }
-    freeifaddrs(ifaddr);
 
     if (!found_global && !found_any) return false;
     memcpy(ip6, best_ip, 16);
@@ -430,38 +477,26 @@ bool get_interface_ip6(const char* ifname, uint8_t* ip6, uint8_t* prefix_len) {
 
 Ipv6Scope classify_ipv6_scope(const struct in6_addr& a) {
     if (IN6_IS_ADDR_LINKLOCAL(&a)) return Ipv6Scope::LinkLocal;
-    if ((a.s6_addr[0] & 0xFE) == 0xFC) return Ipv6Scope::UniqueLocal; // fc00::/7
+    if ((a.s6_addr[0] & 0xFE) == 0xFC) return Ipv6Scope::UniqueLocal;
     return Ipv6Scope::Global;
 }
 
 std::vector<Ipv6AddrInfo> get_all_interface_ip6(const std::string& ifname) {
     std::vector<Ipv6AddrInfo> out;
-    struct ifaddrs* ifaddr = nullptr;
-    if (getifaddrs(&ifaddr) != 0) return out;
+    int snap_err = 0;
+    auto snap = get_local_iface_snapshot(snap_err);
+    if (!snap) return out;
 
-    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET6) continue;
-        if (ifname != ifa->ifa_name) continue;
-
-        auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr);
-        if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) continue;
+    for (const auto& rec : snap->v6) {
+        if (ifname != rec.ifname) continue;
+        if (IN6_IS_ADDR_LOOPBACK(&rec.addr)) continue;
 
         Ipv6AddrInfo info{};
-        memcpy(info.addr, &sin6->sin6_addr, 16);
-        info.scope = classify_ipv6_scope(sin6->sin6_addr);
-        info.prefix_len = 64;
-        if (ifa->ifa_netmask && ifa->ifa_netmask->sa_family == AF_INET6) {
-            auto* mask6 = reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_netmask);
-            uint8_t p = 0;
-            for (int i = 0; i < 16; ++i) {
-                uint8_t byte = mask6->sin6_addr.s6_addr[i];
-                while (byte) { p += (byte & 1); byte >>= 1; }
-            }
-            info.prefix_len = p;
-        }
+        memcpy(info.addr, &rec.addr, 16);
+        info.scope = classify_ipv6_scope(rec.addr);
+        info.prefix_len = rec.prefix;
         out.push_back(info);
     }
-    freeifaddrs(ifaddr);
     return out;
 }
 
@@ -475,7 +510,7 @@ std::string format_ipv6(const uint8_t* ip6) {
 const std::unordered_map<uint16_t, std::string>& read_services_from_file(const std::string &filename) {
     static std::unordered_map<uint16_t, std::string> service_map;
     static std::once_flag once_flag;
-    
+
     std::call_once(once_flag, [&]() {
         int fd = open(filename.c_str(), O_RDONLY);
         if (fd < 0) {
@@ -518,7 +553,7 @@ const std::unordered_map<uint16_t, std::string>& read_services_from_file(const s
             }
             if (ptr == service_start) {
                 line_start = line_end + 1;
-                continue; 
+                continue;
             }
             std::string_view service_name(service_start, ptr - service_start);
             while (ptr < line_end && (*ptr == '\t' || *ptr == ' ')) {
@@ -543,9 +578,9 @@ const std::unordered_map<uint16_t, std::string>& read_services_from_file(const s
                     ptr++;
                 }
                 std::string_view protocol(proto_start, ptr - proto_start);
-                if (protocol.length() == 3 && 
-                    protocol[0] == 't' && 
-                    protocol[1] == 'c' && 
+                if (protocol.length() == 3 &&
+                    protocol[0] == 't' &&
+                    protocol[1] == 'c' &&
                     protocol[2] == 'p') {
                     is_tcp = true;
                 }
@@ -558,14 +593,14 @@ const std::unordered_map<uint16_t, std::string>& read_services_from_file(const s
         munmap(mapped_data, file_size);
         close(fd);
     });
-    
+
     return service_map;
 }
 
 namespace {
 std::unordered_map<std::string, std::string> g_ptr_cache;
 std::mutex g_ptr_cache_mutex;
-} // namespace
+}
 
 bool ptr_cache_lookup(const std::string& ip, std::string& out_domain) {
     std::lock_guard<std::mutex> lock(g_ptr_cache_mutex);
@@ -582,10 +617,6 @@ void ptr_cache_store(const std::string& ip, const std::string& domain) {
 
 namespace {
 
-// PTR qname builders (in-addr.arpa / ip6.arpa). Small, self-contained
-// duplicates of the same logic dns_enum.cpp keeps private to itself —
-// kept local here rather than exported cross-file to avoid coupling two
-// translation units' internal helpers together.
 std::string reverse_arpa_v4(const std::string& ip) {
     struct in_addr a{};
     if (inet_pton(AF_INET, ip.c_str(), &a) != 1) return "";
@@ -611,13 +642,8 @@ std::string reverse_arpa(const std::string& ip) {
     return (get_ip_version(ip.c_str()) == 4) ? reverse_arpa_v4(ip) : reverse_arpa_v6(ip);
 }
 
-} // namespace
+}
 
-// Reads /etc/resolv.conf for "nameserver <ip>" lines. Used as the server
-// list for the batched raw-UDP engine whenever no --dns-servers override
-// is configured (plain getaddrinfo() has no concept of "servers", so it
-// can't back a vectorized batch — this is what lets the default path be
-// vectorized too, not just the --dns-servers path).
 std::vector<std::string> get_system_resolvers() {
     std::vector<std::string> servers;
     std::ifstream f("/etc/resolv.conf");
@@ -640,8 +666,6 @@ void reverse_dns_lookup_batch(const std::vector<std::string>& ips,
     out_hostnames.clear();
     if (ips.empty()) return;
 
-    // De-dupe and serve whatever's already cached without touching the
-    // network at all.
     std::vector<std::string> to_query;
     to_query.reserve(ips.size());
     std::unordered_set<std::string> seen;
@@ -661,7 +685,7 @@ void reverse_dns_lookup_batch(const std::vector<std::string>& ips,
     if (servers.empty() && !dot_only) servers = get_system_resolvers();
 
     if (!dot_only && !servers.empty()) {
-        // --- Vectorized path: one shared UDP socket pool, whole batch at once.
+
         std::vector<AsyncDnsJob> jobs;
         jobs.reserve(to_query.size());
         for (auto& ip : to_query) {
@@ -673,7 +697,7 @@ void reverse_dns_lookup_batch(const std::vector<std::string>& ips,
         for (auto& ip : to_query) still_missing.insert(ip);
 
         auto run_pass = [&](std::vector<AsyncDnsJob>& job_list) {
-            auto results = dns_query_batch(job_list, servers, timeout_ms, concurrency, /*use_edns0=*/true);
+            auto results = dns_query_batch(job_list, servers, timeout_ms, concurrency,  true);
             for (auto& r : results) {
                 std::string name;
                 for (auto& rec : r.records) {
@@ -684,12 +708,11 @@ void reverse_dns_lookup_batch(const std::vector<std::string>& ips,
                     ptr_cache_store(r.tag, name);
                     still_missing.erase(r.tag);
                 } else if (r.answered) {
-                    // Definitive "no PTR" (e.g. NXDOMAIN) — cache the negative
-                    // so we don't re-query it next run.
+
                     ptr_cache_store(r.tag, "");
                     still_missing.erase(r.tag);
                 }
-                // else: no definitive answer yet (timeout/loss) — retried below.
+
             }
         };
         run_pass(jobs);
@@ -707,10 +730,6 @@ void reverse_dns_lookup_batch(const std::vector<std::string>& ips,
         return;
     }
 
-    // --- DoT-only fallback: raw UDP can't speak TLS, so this batch is
-    // resolved via a bounded thread pool over the existing single-target
-    // TLS PTR resolver. Capped lower than the UDP path since each lookup
-    // is a full TLS handshake, not a fire-and-forget datagram.
     const int pool_size = std::max(1, std::min(concurrency, 64));
     std::mutex out_mutex;
     std::atomic<size_t> next{0};
@@ -732,30 +751,26 @@ void reverse_dns_lookup_batch(const std::vector<std::string>& ips,
     for (auto& t : pool) t.join();
 }
 
-// Single-target convenience wrapper — kept for every existing call site
-// (scan.cpp etc.) that only has one IP in hand. Internally just runs the
-// vectorized engine with a batch of 1, so behavior/caching semantics stay
-// identical whether callers use the old or new entry point.
 std::string reverse_dns_lookup(const std::string& ip_address) {
     std::unordered_map<std::string, std::string> out;
-    reverse_dns_lookup_batch({ip_address}, out, /*timeout_ms=*/2000, /*retries=*/2, /*concurrency=*/1);
+    reverse_dns_lookup_batch({ip_address}, out,  2000,  2,  1);
     auto it = out.find(ip_address);
     return it != out.end() ? it->second : "";
 }
 
 bool get_interface_mac(int sock, const char* ifname, uint8_t* mac) {
     if (!mac || !ifname) return false;
- 
+
     if (strcmp(ifname, "lo") == 0) {
         static const uint8_t loopback_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
         memcpy(mac, loopback_mac, 6);
         return true;
     }
- 
+
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
- 
+
     if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0) {
         memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
         return true;
@@ -766,22 +781,22 @@ bool get_interface_mac(int sock, const char* ifname, uint8_t* mac) {
         std::cerr << "get_interface_mac: getifaddrs failed: " << strerror(errno) << "\n";
         return false;
     }
- 
+
     bool found = false;
     for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
         if (!ifa->ifa_name || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_PACKET) continue;
- 
+
         struct sockaddr_ll* sll =
             reinterpret_cast<struct sockaddr_ll*>(ifa->ifa_addr);
         if (sll->sll_halen != 6) continue;
- 
+
         memcpy(mac, sll->sll_addr, 6);
         found = true;
         if (strcmp(ifa->ifa_name, ifname) == 0) break;
     }
     freeifaddrs(ifaddr);
- 
+
     if (!found) {
         std::cerr << "get_interface_mac: no hardware address found for '"
                   << ifname << "'\n";
@@ -826,28 +841,27 @@ bool parse_mac(const std::string& mac_str, uint8_t* out_mac) {
     return true;
 }
 
-
-static const size_t MAX_RESPONSE_SIZE = 10 * 1024 * 1024;  
+static const size_t MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s) {
     size_t newLength = size * nmemb;
-    
+
     if (size == 0 || nmemb == 0 || newLength / size != nmemb) {
-        return 0;  
+        return 0;
     }
-    
+
     if (s->size() + newLength > MAX_RESPONSE_SIZE) {
-        return 0; 
+        return 0;
     }
-    
+
     try {
         s->append((char*)contents, newLength);
     } catch(const std::bad_alloc& e) {
-        return 0; 
+        return 0;
     } catch(const std::exception& e) {
-        return 0; 
+        return 0;
     }
-    
+
     return newLength;
 }
 
@@ -856,7 +870,7 @@ std::string format_mac(const uint8_t* mac) {
         return "00:00:00:00:00:00";
     }
     static const char hex_chars[] = "0123456789abcdef";
-    char buf[18];                       
+    char buf[18];
     for (int i = 0; i < 6; ++i) {
         int pos = i * 3;
         buf[pos]     = hex_chars[(mac[i] >> 4) & 0x0F];
@@ -934,7 +948,6 @@ bool route_lookup(const std::string& target_ip, int family,
             if (attr->rta_type == RTA_MULTIPATH) multipath_attr = attr;
         }
 
-        // ECMP: no single top-level gateway/oif -- take the first nexthop.
         if (multipath_attr && oif < 0) {
             auto* rtnh = reinterpret_cast<struct rtnexthop*>(RTA_DATA(multipath_attr));
             int rtnh_len = static_cast<int>(RTA_PAYLOAD(multipath_attr));
@@ -995,8 +1008,8 @@ bool get_default_route(int family, std::string& out_iface, std::string& out_gate
             if (nh->nlmsg_type != RTM_NEWROUTE) continue;
 
             auto* rtm = reinterpret_cast<struct rtmsg*>(NLMSG_DATA(nh));
-            if (rtm->rtm_dst_len != 0) continue;              // only prefix-length-0 = default route
-            if (rtm->rtm_table != RT_TABLE_MAIN) continue;     // ignore other routing tables
+            if (rtm->rtm_dst_len != 0) continue;
+            if (rtm->rtm_table != RT_TABLE_MAIN) continue;
 
             auto* attr = RTM_RTA(rtm);
             int attr_len = static_cast<int>(RTM_PAYLOAD(nh));
@@ -1078,7 +1091,7 @@ bool neighbor_cache_has_entry(int family, const std::string& target_ip) {
 
 bool conntrack_has_entry(const std::string& target_ip) {
     std::ifstream f("/proc/net/nf_conntrack");
-    if (!f.is_open()) return false; 
+    if (!f.is_open()) return false;
     std::string line;
     while (std::getline(f, line)) {
         if (line.find("dst=" + target_ip) != std::string::npos ||
@@ -1092,15 +1105,11 @@ bool neighbor_cache_has_entry_v4(const std::string& target_ip) {
 }
 
 bool is_point_to_point_interface(const std::string& ifname) {
-    struct ifaddrs* ifa_list = nullptr;
-    if (getifaddrs(&ifa_list) != 0) return false;
-    bool result = false;
-    for (auto* ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_name || ifname != ifa->ifa_name) continue;
-        if (ifa->ifa_flags & IFF_POINTOPOINT) { result = true; break; }
-    }
-    freeifaddrs(ifa_list);
-    return result;
+    int snap_err = 0;
+    auto snap = get_local_iface_snapshot(snap_err);
+    if (!snap) return false;
+    auto it = snap->iface_flags.find(ifname);
+    return it != snap->iface_flags.end() && (it->second & IFF_POINTOPOINT) != 0;
 }
 
 bool is_vlan_interface(const std::string& ifname) {
@@ -1111,7 +1120,7 @@ bool is_vlan_interface(const std::string& ifname) {
         auto pipe_pos = line.find('|');
         if (pipe_pos == std::string::npos) continue;
         std::string name = line.substr(0, pipe_pos);
-        // trim trailing/leading whitespace
+
         size_t start = name.find_first_not_of(" \t");
         size_t end   = name.find_last_not_of(" \t");
         if (start == std::string::npos) continue;
@@ -1143,7 +1152,7 @@ std::string get_current_time() {
 namespace {
 
 struct IpRangeV4 { uint32_t start, end; std::string label; };
-struct IpRangeV6 { unsigned __int128 start, end; std::string label; }; // GCC/Clang extension, fine on this Linux-only target
+struct IpRangeV6 { unsigned __int128 start, end; std::string label; };
 
 std::vector<IpRangeV4> g_v4_ranges;
 std::vector<IpRangeV6> g_v6_ranges;
@@ -1205,7 +1214,7 @@ void for_each_line(const std::string& path,
         const char* line_end = static_cast<const char*>(memchr(p, '\n', end - p));
         if (!line_end) line_end = end;
         size_t len = line_end - p;
-        if (len > 0 && p[len - 1] == '\r') --len;   // CRLF files
+        if (len > 0 && p[len - 1] == '\r') --len;
         if (len > 0) handle_line(p, len);
         p = line_end + 1;
     }
@@ -1352,33 +1361,24 @@ bool get_icmp_ratelimit(int& ratelimit_ms, int& ratemask) {
 
 bool is_target_local_to_host(const std::string& target_ip) {
     struct in_addr a4{};
+    struct in6_addr a6{};
+    int family = 0;
     if (inet_pton(AF_INET, target_ip.c_str(), &a4) == 1) {
-        uint32_t h = ntohl(a4.s_addr);
-        if ((h >> 24) == 0x7Fu) return true; // 127.0.0.0/8
+        family = AF_INET;
+        if ((ntohl(a4.s_addr) >> 24) == 0x7Fu) return true;
+    } else if (inet_pton(AF_INET6, target_ip.c_str(), &a6) == 1) {
+        family = AF_INET6;
+        if (IN6_IS_ADDR_LOOPBACK(&a6)) return true;
     } else {
-        struct in6_addr a6{};
-        if (inet_pton(AF_INET6, target_ip.c_str(), &a6) == 1 && IN6_IS_ADDR_LOOPBACK(&a6)) {
-            return true; // ::1
-        }
+        return false;
     }
 
-    struct ifaddrs* ifaddr = nullptr;
-    if (getifaddrs(&ifaddr) != 0) return false;
-    bool match = false;
-    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr) continue;
-        char buf[INET6_ADDRSTRLEN] = {0};
-        if (ifa->ifa_addr->sa_family == AF_INET) {
-            auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
-            inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
-        } else if (ifa->ifa_addr->sa_family == AF_INET6) {
-            auto* sin6 = reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr);
-            inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf));
-        } else {
-            continue;
-        }
-        if (target_ip == buf) { match = true; break; }
-    }
-    freeifaddrs(ifaddr);
-    return match;
+    int snap_err = 0;
+    auto snap = get_local_iface_snapshot(snap_err);
+    if (!snap) return false;
+
+    const void* raw = (family == AF_INET) ? static_cast<const void*>(&a4.s_addr)
+                                          : static_cast<const void*>(&a6);
+    const size_t len = (family == AF_INET) ? 4 : 16;
+    return snap->addr_owner.find(make_addr_key(family, raw, len)) != snap->addr_owner.end();
 }
