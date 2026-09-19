@@ -104,6 +104,7 @@ std::unordered_map<std::string, std::vector<std::string>> g_not_scanned_map;
 std::vector<std::string> g_dns_servers;
 std::vector<std::string> g_dns_tls_servers;
 std::unordered_set<std::string> g_seen_target_ips;
+std::vector<std::pair<std::string, std::string>> g_eliminated_targets;
 std::atomic<int> crash_signal{0};
 int g_target_ip_pref = 0;
 bool g_saw_literal_target = false;
@@ -360,7 +361,10 @@ static bool parse_targets(
                 }
             }
            
-            add_unique_ip(bulk_ips, seen, std::move(out_ip));
+            const std::string literal_ip = out_ip;
+            if (!add_unique_ip(bulk_ips, seen, std::move(out_ip))) {
+                g_eliminated_targets.emplace_back(token, literal_ip);
+            }
         }
 
         // ── Step F: global limit check ──────────────────────────────────
@@ -370,11 +374,6 @@ static bool parse_targets(
             return false;
         }
     }
-
-    // ── Batch-resolve every hostname collected above in one shot ───────
-    // (instead of the old one-getaddrinfo-call-per-token loop). This is
-    // the actual concurrency win: everything in pending_hostnames goes
-    // through a single dns_query_batch() wave.
     if (!pending_hostnames.empty()) {
         std::unordered_map<std::string, std::string> resolved_ip;
         std::unordered_map<std::string, std::vector<std::string>> resolved_all_ips;
@@ -388,10 +387,11 @@ static bool parse_targets(
 
         for (const auto& token : pending_hostnames) {
             const std::string& out_ip = resolved_ip.at(token);
-            // Remember the original hostname for this IP so grepable
-            // output can show "domain (ip)" instead of a bare IP.
-            ip_to_domain_map[out_ip] = token;
-            add_unique_ip(bulk_ips, seen, out_ip);
+            if (add_unique_ip(bulk_ips, seen, out_ip)) {
+                ip_to_domain_map[out_ip] = token;
+            } else {
+                g_eliminated_targets.emplace_back(token, out_ip);
+            }
 
             if (ips.size() + bulk_ips.size() > MAX_TOTAL_IPS) {
                 std::cerr << "Too many IPs after expansion (limit "
