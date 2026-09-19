@@ -1,4 +1,5 @@
 #include "net_capture.hpp"
+#include "utils.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cctype>
@@ -67,6 +68,7 @@ std::string pick_default_iface() {
 
 constexpr int kProtoColW = 7;  
 constexpr int kIpColW    = 43;  
+constexpr int kDomainColW = 30;
 constexpr int kPortColW  = 10; 
 constexpr int kStateColW = 8;
 
@@ -730,6 +732,37 @@ int run_netradar(const Options& opts) {
         std::cerr << "netradar: " << cap.last_error() << "\n";
         return 1;
     }
+    // One vectorized PTR pass over all unique responder IPs (after capture,
+    // so our own PTR queries are never seen as DNS findings).
+    std::vector<std::string> ips;
+    ips.reserve(rows.size());
+    for (const auto& r : rows) ips.push_back(r.responder_ip);
+
+    // Ctrl-C ends the capture by setting the global terminate_flag; clear it
+    // for the resolve phase so the batch resolver isn't aborted, then restore.
+    const bool was_interrupted = terminate_flag.load(std::memory_order_relaxed);
+    terminate_flag.store(false, std::memory_order_relaxed);
+    if (!ips.empty()) {
+        std::cerr << "[netradar] resolving domains for " << ips.size()
+                  << " host(s)... (Ctrl-C again to skip)\n";
+    }
+
+    std::unordered_map<std::string, std::string> hostnames;
+    reverse_dns_lookup_batch(ips, hostnames);
+
+    terminate_flag.store(was_interrupted, std::memory_order_relaxed);
+
+    std::vector<std::string> domain_cells(rows.size());
+    size_t domain_col_w = static_cast<size_t>(kDomainColW);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        auto it = hostnames.find(rows[i].responder_ip);
+        std::string d = (it != hostnames.end()) ? it->second : "";
+        if (!d.empty() && d.back() == '.') d.pop_back();
+        if (d.empty()) d = "-";
+        domain_col_w = std::max(domain_col_w, d.size() + 2);
+        domain_cells[i] = std::move(d);
+    }
+
     std::vector<std::string> port_cells(rows.size());
     size_t port_col_w = static_cast<size_t>(kPortColW);
     for (size_t i = 0; i < rows.size(); ++i) {
@@ -744,6 +777,7 @@ int run_netradar(const Options& opts) {
 
     std::cout << colorize(pad("PROTO", kProtoColW), kColorHeader, color)
                << colorize(pad("RESPONDER", kIpColW), kColorHeader, color)
+               << colorize(pad("DOMAIN", domain_col_w), kColorHeader, color)
                << colorize(pad("PORT", port_col_w), kColorHeader, color)
                << colorize(pad("STATE", kStateColW), kColorHeader, color)
                << "\n";
@@ -756,6 +790,7 @@ int run_netradar(const Options& opts) {
 
         std::cout << colorize(pad(proto_label(row.proto, row.ip_version), kProtoColW), proto_color, color)
                    << pad(row.responder_ip, kIpColW)
+                   << pad(domain_cells[i], domain_col_w)
                    << pad(port_cells[i], port_col_w)
                    << colorize(pad(state_text, kStateColW), state_color, color)
                    << "\n";
