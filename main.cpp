@@ -2840,7 +2840,7 @@ int main(int argc, char *argv[]) {
         (ru_total_end.ru_stime.tv_usec - ru_total_start.ru_stime.tv_usec) / 1e6;
 
     std::cout << "\n";
-    if (ips.size() > 1) {
+    if (ips.size() > 1 || !g_eliminated_targets.empty()) {
     
         if (total_elapsed_ms < 1.0) {
             double total_elapsed_us = total_elapsed_ms * 1000;
@@ -2854,10 +2854,10 @@ int main(int argc, char *argv[]) {
             std::cout << "Overall scan completed in " << std::fixed << std::setprecision(2) 
                       << total_elapsed_seconds << " seconds\n";
         }
-        // CPU Time here is process-wide (RUSAGE_SELF sums all threads on
-        // Linux) — this is the efficiency number to watch when tuning
-        // SQPOLL/spin/thread-count knobs; Duration above is the
-        // user-facing speed number and the two are independent axes.
+        for (const auto& [eliminated_target, eliminated_ip] : g_eliminated_targets) {
+            std::cout << "Eliminated : " << sanitize_echo(eliminated_target)
+                      << " (duplicate ip [" << eliminated_ip << "])\n";
+        }
         std::cout << "CPU time used: " << std::fixed << std::setprecision(3)
                   << total_cpu_seconds << " seconds (user+sys)\n";
     
@@ -2865,9 +2865,6 @@ int main(int argc, char *argv[]) {
     if (!config.output_file.empty()) {
         save_scan_results(all_results, config.output_file, teeOut.str() + teeErr.str());
     }
-
-    // Restore the real streambufs (not strictly required before process exit,
-    // but keeps cout/cerr well-behaved if anything runs after this point).
     std::cout.rdbuf(teeOut_orig);
     std::cerr.rdbuf(teeErr_orig);
 
