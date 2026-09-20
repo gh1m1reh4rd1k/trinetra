@@ -42,6 +42,7 @@
 #include <sys/utsname.h>
 #include "dns_enum.hpp"
 #include "ssl_enum.hpp"
+#include "discover.hpp"
 
 
 namespace color {
@@ -294,8 +295,10 @@ int main(int argc, char *argv[]) {
        bool dns_enum_enabled = false;
        bool ssl_enum_enabled = false;
        bool netradar_enabled = false;
-       int  netradar_duration_ms = 0;      // 0 = run until interrupted; set via --time
-       bool netradar_time_specified = false; // true if --time was passed at all, regardless of --netradar
+       int  netradar_duration_ms = 0;     
+       bool netradar_time_specified = false;
+       bool discover_enabled = false;
+       std::string discover_country;  
    } config;
    
     std::vector<std::string> ips;
@@ -484,6 +487,19 @@ int main(int argc, char *argv[]) {
             }
             config.netradar_duration_ms = ms;
             config.netradar_time_specified = true;
+        }},
+        
+        {"--discover", [&](int& idx) {
+            std::string name = get_next_arg(idx, "--discover");
+            while (idx + 1 < argc && argv[idx + 1][0] != '-') { name += ' '; name += argv[++idx]; }
+            for (unsigned char ch : name) {
+                if (ch < 0x20 || ch == 0x7F) {
+                    std::cerr << "--discover: country contains a disallowed control character\n";
+                    exit(1);
+                }
+            }
+            config.discover_country = name;
+            config.discover_enabled = true;
         }},
         
         {"--sport-range", [&](int& idx) {
@@ -1725,6 +1741,22 @@ int main(int argc, char *argv[]) {
         std::cerr << "Error: -4/-6 only apply to DNS domain-name resolution — "
                       "not to literal IPs or CIDR ranges.\n";
         return 1;
+    }
+    
+    if (config.discover_enabled) {
+        if (!ips.empty() || !config.ip_file.empty() || config.scan_type_specified) {
+            std::cerr << "--discover runs on its own: don't combine it with targets, -iL or scan flags.\n";
+            return 1;
+        }
+        std::cout.rdbuf(teeOut_orig);
+        std::cerr.rdbuf(teeErr_orig);
+        discover::Options dopts;
+        dopts.country     = config.discover_country;
+        dopts.want_v4     = !saw_dash6;      
+        dopts.want_v6     = !saw_dash4;      
+        dopts.verbose     = config.sv_verbose;
+        dopts.output_file = config.output_file;
+        return discover::run(dopts);
     }
 
     if (config.use_split || config.graceful_scan) {
