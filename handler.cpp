@@ -2436,8 +2436,6 @@ void thread_worker(const std::vector<std::string>& thread_ips,
                    const VersionDetectOptions& sv_opts) {
                    
     
-    // Local aliases: same names the body below has always used, now backed
-    // by the shared opts struct instead of ~29 individual parameters.
     const uint8_t&     window_scale            = opts.window_scale;
     const bool&        use_tfo_cookie          = opts.use_tfo_cookie;
     const bool&        tfo_cookie_as_hex       = opts.tfo_cookie_as_hex;
@@ -2446,7 +2444,6 @@ void thread_worker(const std::vector<std::string>& thread_ips,
     const uint64_t&    tfo_cookie_num          = opts.tfo_cookie_num;
     const size_t&      tfo_cookie_length       = opts.tfo_cookie_length;
 
-    // NEW:
     std::random_device rd;
     thread_local std::mt19937 rng(rd() + std::hash<std::thread::id>{}(std::this_thread::get_id()));
     std::uniform_int_distribution<uint16_t> port_dist(1, 65535); 
@@ -2501,7 +2498,6 @@ void thread_worker(const std::vector<std::string>& thread_ips,
     std::vector<std::array<uint8_t, 4>> statically_arped_ips;
     bool multi_ip = (thread_ips.size() > 1);
     std::unordered_set<uint32_t> counted_down_ips;
-    // NEW:
     std::vector<std::unique_ptr<uint8_t[]>> same_subnet_target_ips;
     std::vector<uint32_t> same_subnet_ip_ints;
     std::vector<size_t> same_subnet_indices;
@@ -3567,6 +3563,12 @@ void print_full_help() {
 		std::cerr << "                                      For eg: shiv --netradar (run until Ctrl-C, then print the report)\n";
 		std::cerr << "                                      For eg: shiv --netradar --time 30s (capture for 30 seconds)\n";
 		std::cerr << "                                      For eg: shiv --netradar --time 5m --interface eth0 (5 minutes on a specific interface)\n\n";
+		
+	        std::cerr << color::green << "Country Range Discovery (--discover) Options:\n" << color::reset;
+		std::cerr << color::yellow << " --discover" << color::reset << " <country> Fetch a country's public IPv4/IPv6 ranges from RIR/NetworksDB\n";
+		std::cerr << "             Accepts a name (nepal, \"south korea\"), ISO-2 (np) or ISO-3 (npl); typos are corrected. -4/-6 pick the family, -o saves the list.\n";
+		std::cerr << "                                      For eg: shiv --discover nepal\n";
+		std::cerr << "                                      For eg: shiv --discover south korea -4 -o kr.txt\n\n";
 		
 		std::cerr << color::cyan << "Filtered State Tackle Controller / Performance Options \n" << color::reset;
 		std::cerr << color::yellow << "  --retry-delay-min" << color::reset << " <dur>       Floor for congestion-scaled retry delay (default: 3ms)\n";
