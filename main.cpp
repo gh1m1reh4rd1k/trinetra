@@ -299,6 +299,7 @@ int main(int argc, char *argv[]) {
        bool netradar_time_specified = false;
        bool discover_enabled = false;
        std::string discover_country;  
+       bool discover_owner = false;   
    } config;
    
     std::vector<std::string> ips;
@@ -489,6 +490,10 @@ int main(int argc, char *argv[]) {
             config.netradar_time_specified = true;
         }},
         
+        {"--owner", [&](int& idx) {
+            config.discover_owner = true;
+        }},
+
         {"--discover", [&](int& idx) {
             std::string name = get_next_arg(idx, "--discover");
             while (idx + 1 < argc && argv[idx + 1][0] != '-') { name += ' '; name += argv[++idx]; }
@@ -1756,7 +1761,12 @@ int main(int argc, char *argv[]) {
         dopts.want_v6     = !saw_dash4;      
         dopts.verbose     = config.sv_verbose;
         dopts.output_file = config.output_file;
+        dopts.owner       = config.discover_owner;
         return discover::run(dopts);
+    }
+    if (config.discover_owner && !config.discover_enabled) {
+        std::cerr << "--owner only applies to --discover.\n";
+        return 1;
     }
 
     if (config.use_split || config.graceful_scan) {
