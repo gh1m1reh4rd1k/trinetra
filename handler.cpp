@@ -3568,7 +3568,11 @@ void print_full_help() {
 		std::cerr << color::yellow << " --discover" << color::reset << " <country> Fetch a country's public IPv4/IPv6 ranges from RIR/NetworksDB\n";
 		std::cerr << "             Accepts a name (nepal, \"south korea\"), ISO-2 (np) or ISO-3 (npl); typos are corrected. -4/-6 pick the family, -o saves the list.\n";
 		std::cerr << "                                      For eg: shiv --discover nepal\n";
-		std::cerr << "                                      For eg: shiv --discover south korea -4 -o kr.txt\n\n";
+		std::cerr << "                                      For eg: shiv --discover south korea -4 -o kr.txt\n";
+		std::cerr << color::yellow << " --owner" << color::reset << "     Annotate each printed range with who it belongs to.\n";
+		std::cerr << "             Looks up one sample address per range (Team Cymru ASN DNS lookup, PTR as fallback) - never every address in it.\n";
+		std::cerr << "             Owner is appended as a '#' comment, so saved files stay usable with -iL.\n";
+		std::cerr << "                                      For eg: shiv --discover nepal --owner\n\n";
 		
 		std::cerr << color::cyan << "Filtered State Tackle Controller / Performance Options \n" << color::reset;
 		std::cerr << color::yellow << "  --retry-delay-min" << color::reset << " <dur>       Floor for congestion-scaled retry delay (default: 3ms)\n";
