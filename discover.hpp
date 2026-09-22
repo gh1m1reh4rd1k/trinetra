@@ -33,6 +33,10 @@ struct Options {
     int         total_timeout_sec   = 60;
     bool        verbose = false;
     std::string output_file;           
+    bool        owner = false;
+    int         dns_timeout_ms  = 2000;   
+    int         dns_concurrency = 64;      
+    std::vector<std::string> dns_servers;  
 };
 
 int run(const Options& opts);
