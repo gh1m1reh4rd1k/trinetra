@@ -34,8 +34,9 @@ struct Options {
     bool        verbose = false;
     std::string output_file;           
     bool        owner = false;
-    int         dns_timeout_ms  = 2000;   
-    int         dns_concurrency = 64;      
+    int         dns_timeout_ms  = 2500;   
+    int         dns_concurrency = 8;      
+    bool        owner_ptr_fallback = false;
     std::vector<std::string> dns_servers;  
 };
 
