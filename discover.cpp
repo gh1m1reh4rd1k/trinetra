@@ -3,6 +3,8 @@
 #include <curl/curl.h>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -21,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
@@ -32,9 +35,6 @@
 #include <vector>
 
 extern std::atomic<bool> terminate_flag;
-
-// Defined in handler.cpp (populated by --dns-servers) with external linkage;
-// reused by --owner below so it respects any resolvers the user already chose.
 extern std::vector<std::string> g_dns_servers;
 
 namespace discover {
@@ -503,12 +503,6 @@ std::vector<V6> merge_v6(std::vector<V6> v) {
     }
     return out;
 }
-
-// `samples`, when non-null, records one (cidr-string, sample-address) pair per
-// emitted line -- a single representative host inside that block, used later
-// to look up who *owns* the block without touching every address in it.
-// Purely additive: `out` is filled identically whether or not `samples` is
-// passed, so every existing caller (including the self-test) is unaffected.
 size_t emit_v4(V4 iv, std::string& out, std::vector<std::pair<std::string, uint32_t>>* samples = nullptr) {
     size_t lines = 0;
     uint64_t cur = iv.first, end = iv.second;
@@ -575,24 +569,11 @@ size_t emit_v6(V6 iv, std::string& out, std::vector<std::pair<std::string, u128>
 
 }  
 
-// ---------------------------------------------------------------------------
-// --owner: who does this range belong to?
-//
-// Rather than looking up every address in a discovered range, one sample
-// address per emitted range is checked (see the `samples` param on emit_v4 /
-// emit_v6 above). The sample is resolved via Team Cymru's DNS-based IP-to-ASN
-// service (the standard, lightweight way to map an address to the network
-// that announces it -- the same technique nmap's asn-query script and mtr
-// use): a TXT query on the reversed address under origin.asn.cymru.com
-// returns the announcing ASN, then a second TXT query on that ASN returns
-// the organisation name. If no ASN is announced for the address (unrouted /
-// reserved space), this falls back to a classic PTR lookup so something is
-// still shown when possible.
-//
-// This is a small, self-contained DNS client (own packet building/parsing),
-// matching how the rest of discover.cpp already does its own networking
-// (curl for HTTP) rather than reaching into scan.cpp/dns_enum.cpp internals.
 namespace {
+
+constexpr size_t kMaxOwnerLookups = 20000;
+constexpr size_t kBulkChunkSize   = 500;
+constexpr int    kCymruWhoisPort  = 43;
 
 std::vector<std::string> owner_system_resolvers() {
     std::vector<std::string> out;
@@ -617,9 +598,18 @@ std::string trim_field(std::string s) {
     return s.substr(a, b - a + 1);
 }
 
-// Decodes a (possibly compressed) DNS name starting at `pos` in `buf`.
-// Returns the position immediately after the name *in the original stream*
-// (i.e. after the first compression pointer taken, if any), per RFC 1035.
+std::vector<std::string> split_pipe(const std::string& line) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (;;) {
+        size_t p = line.find('|', start);
+        out.push_back(trim_field(line.substr(start, p == std::string::npos ? std::string::npos : p - start)));
+        if (p == std::string::npos) break;
+        start = p + 1;
+    }
+    return out;
+}
+
 size_t decode_dns_name(const uint8_t* buf, size_t len, size_t pos, std::string& out) {
     out.clear();
     size_t cur = pos;
@@ -649,7 +639,6 @@ std::vector<uint8_t> build_dns_query(uint16_t id, const std::string& qname, uint
     std::vector<uint8_t> pkt;
     pkt.reserve(qname.size() + 18);
     auto put16 = [&](uint16_t v) { uint16_t n = htons(v); pkt.push_back(static_cast<uint8_t>(n & 0xFF)); pkt.push_back(static_cast<uint8_t>(n >> 8)); };
-    // header: id, flags(RD=1), qdcount=1, an/ns/ar=0
     pkt.push_back(static_cast<uint8_t>(id >> 8)); pkt.push_back(static_cast<uint8_t>(id & 0xFF));
     put16(0x0100);
     put16(1); put16(0); put16(0); put16(0);
@@ -666,11 +655,10 @@ std::vector<uint8_t> build_dns_query(uint16_t id, const std::string& qname, uint
     }
     pkt.push_back(0);
     put16(qtype);
-    put16(1); // IN
+    put16(1);
     return pkt;
 }
 
-// Extracts the first RR of type `want_type` from the answer section.
 bool parse_dns_answer(const uint8_t* buf, size_t len, uint16_t want_type,
                        size_t answers_start, uint16_t ancount, std::string& out) {
     size_t pos = answers_start;
@@ -680,12 +668,12 @@ bool parse_dns_answer(const uint8_t* buf, size_t len, uint16_t want_type,
         if (pos + 10 > len) return false;
         uint16_t rtype, rdlen;
         memcpy(&rtype, buf + pos, 2); rtype = ntohs(rtype); pos += 2;
-        pos += 2;  // class
-        pos += 4;  // ttl
+        pos += 2;
+        pos += 4;
         memcpy(&rdlen, buf + pos, 2); rdlen = ntohs(rdlen); pos += 2;
         if (pos + rdlen > len) return false;
         if (rtype == want_type) {
-            if (want_type == 16) {  // TXT: one or more length-prefixed strings
+            if (want_type == 16) {
                 std::string txt;
                 size_t p = pos, end = pos + rdlen;
                 while (p < end) {
@@ -697,7 +685,7 @@ bool parse_dns_answer(const uint8_t* buf, size_t len, uint16_t want_type,
                 out = txt;
                 return true;
             }
-            if (want_type == 12) {  // PTR
+            if (want_type == 12) {
                 std::string name2;
                 decode_dns_name(buf, len, pos, name2);
                 out = name2;
@@ -724,6 +712,9 @@ bool udp_dns_query_one(const std::string& server, const std::string& qname, uint
     int fd = socket(fam, SOCK_DGRAM, 0);
     if (fd < 0) return false;
 
+    timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     bool sent;
     if (fam == AF_INET) {
         sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(53); sa.sin_addr = a4;
@@ -734,10 +725,6 @@ bool udp_dns_query_one(const std::string& server, const std::string& qname, uint
     }
     if (!sent) { close(fd); return false; }
 
-    pollfd pfd{fd, POLLIN, 0};
-    int pr = poll(&pfd, 1, timeout_ms);
-    if (pr <= 0) { close(fd); return false; }
-
     uint8_t buf[2048];
     ssize_t n = recv(fd, buf, sizeof(buf), 0);
     close(fd);
@@ -747,7 +734,7 @@ bool udp_dns_query_one(const std::string& server, const std::string& qname, uint
     uint16_t rid; memcpy(&rid, buf, 2);
     if (ntohs(rid) != id) return false;
     uint16_t rflags; memcpy(&rflags, buf + 2, 2); rflags = ntohs(rflags);
-    if ((rflags & 0x000F) != 0) return false;  // rcode != NOERROR
+    if ((rflags & 0x000F) != 0) return false;
     uint16_t qdc, anc;
     memcpy(&qdc, buf + 4, 2); qdc = ntohs(qdc);
     memcpy(&anc, buf + 6, 2); anc = ntohs(anc);
@@ -757,7 +744,7 @@ bool udp_dns_query_one(const std::string& server, const std::string& qname, uint
     for (uint16_t i = 0; i < qdc; ++i) {
         std::string dummy;
         pos = decode_dns_name(buf, len, pos, dummy);
-        pos += 4;  // qtype + qclass
+        pos += 4;
         if (pos > len) return false;
     }
     return parse_dns_answer(buf, len, qtype, pos, anc, out);
@@ -772,62 +759,121 @@ bool udp_dns_query(const std::vector<std::string>& servers, const std::string& q
     return false;
 }
 
-std::string cymru_qname_v4(uint32_t ip) {
-    std::ostringstream ss;
-    ss << ((ip) & 0xFF) << "." << ((ip >> 8) & 0xFF) << "." << ((ip >> 16) & 0xFF) << "." << ((ip >> 24) & 0xFF)
-       << ".origin.asn.cymru.com";
-    return ss.str();
-}
 std::string ptr_qname_v4(uint32_t ip) {
     std::ostringstream ss;
     ss << ((ip) & 0xFF) << "." << ((ip >> 8) & 0xFF) << "." << ((ip >> 16) & 0xFF) << "." << ((ip >> 24) & 0xFF)
        << ".in-addr.arpa";
     return ss.str();
 }
-// Both cymru's origin6 zone and ip6.arpa use the same nibble-reversed form.
 std::string nibble_reversed_v6(u128 ip) {
     std::ostringstream ss;
     for (int i = 0; i < 32; ++i) ss << std::hex << static_cast<int>((ip >> (i * 4)) & 0xF) << ".";
     return ss.str();
 }
-std::string cymru_qname_v6(u128 ip) { return nibble_reversed_v6(ip) + "origin6.asn.cymru.com"; }
-std::string ptr_qname_v6(u128 ip)   { return nibble_reversed_v6(ip) + "ip6.arpa"; }
+std::string ptr_qname_v6(u128 ip) { return nibble_reversed_v6(ip) + "ip6.arpa"; }
 
-struct OwnerResult { std::string label; bool ok = false; };
-
-// Given an ASN-lookup TXT reply ("ASN | PREFIX | CC | REGISTRY | DATE") and a
-// PTR-fallback qname, produces a human-readable owner label.
-OwnerResult resolve_owner_label(const std::string& asn_qname, const std::string& ptr_qname,
-                                 int timeout_ms, const std::vector<std::string>& servers) {
-    OwnerResult r;
-    std::string txt;
-    if (udp_dns_query(servers, asn_qname, /*TXT=*/16, timeout_ms, txt)) {
-        std::string asn_field = trim_field(txt.substr(0, txt.find('|')));
-        if (size_t sp = asn_field.find(' '); sp != std::string::npos) asn_field = asn_field.substr(0, sp);
-        if (!asn_field.empty() && asn_field != "NA") {
-            std::string name_txt;
-            if (udp_dns_query(servers, "AS" + asn_field + ".asn.cymru.com", 16, timeout_ms, name_txt)) {
-                std::string org = trim_field(name_txt.substr(name_txt.rfind('|') + 1));
-                if (!org.empty()) { r.label = org + " (AS" + asn_field + ")"; r.ok = true; return r; }
-            }
-            r.label = "AS" + asn_field;
-            r.ok = true;
-            return r;
-        }
-    }
-    std::string ptr;
-    if (udp_dns_query(servers, ptr_qname, /*PTR=*/12, timeout_ms, ptr)) {
-        if (!ptr.empty() && ptr.back() == '.') ptr.pop_back();
-        if (!ptr.empty()) { r.label = "ptr:" + ptr; r.ok = true; }
-    }
-    return r;
+std::string v4_to_string(uint32_t ip) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+                  (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+    return buf;
 }
 
-// Caps the number of owner lookups fired off in one run, independent of how
-// many ranges got printed -- this is the actual guard against "massive IP
-// lookup": however many addresses a discovered range covers, only one lookup
-// happens per emitted range, and never more than this many overall.
-constexpr size_t kMaxOwnerLookups = 20000;
+std::string v6_to_string(u128 ip) {
+    in6_addr a{};
+    for (int i = 0; i < 16; ++i) a.s6_addr[15 - i] = static_cast<uint8_t>((ip >> (i * 8)) & 0xFF);
+    char buf[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &a, buf, sizeof(buf));
+    return buf;
+}
+
+int connect_with_timeout(const char* host, int port, int timeout_ms) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    char portbuf[8];
+    std::snprintf(portbuf, sizeof(portbuf), "%d", port);
+    if (getaddrinfo(host, portbuf, &hints, &res) != 0 || !res) return -1;
+
+    int fd = -1;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) continue;
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int rc = connect(fd, p->ai_addr, p->ai_addrlen);
+        bool connected = (rc == 0);
+        if (!connected && errno == EINPROGRESS) {
+            pollfd pfd{fd, POLLOUT, 0};
+            if (poll(&pfd, 1, timeout_ms) > 0) {
+                int err = 0;
+                socklen_t elen = sizeof(err);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+                connected = (err == 0);
+            }
+        }
+        if (connected) {
+            fcntl(fd, F_SETFL, flags);
+            timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            freeaddrinfo(res);
+            return fd;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+bool bulk_cymru_query(const std::vector<std::string>& ip_strings, int timeout_ms,
+                       std::unordered_map<std::string, std::string>& out_labels) {
+    int fd = connect_with_timeout("whois.cymru.com", kCymruWhoisPort, timeout_ms);
+    if (fd < 0) return false;
+
+    std::string req = "begin\nverbose\n";
+    for (const auto& s : ip_strings) { req += s; req += '\n'; }
+    req += "end\n";
+
+    size_t sent = 0;
+    while (sent < req.size()) {
+        if (terminate_flag.load(std::memory_order_relaxed)) { close(fd); return false; }
+        ssize_t n = send(fd, req.data() + sent, req.size() - sent, 0);
+        if (n <= 0) { close(fd); return false; }
+        sent += static_cast<size_t>(n);
+    }
+
+    std::string resp;
+    char buf[16384];
+    for (;;) {
+        if (terminate_flag.load(std::memory_order_relaxed)) break;
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        resp.append(buf, static_cast<size_t>(n));
+    }
+    close(fd);
+    if (resp.empty()) return false;
+
+    size_t pos = 0;
+    bool first = true;
+    while (pos < resp.size()) {
+        size_t nl = resp.find('\n', pos);
+        std::string line = resp.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = (nl == std::string::npos) ? resp.size() : nl + 1;
+        if (first) { first = false; continue; }
+        if (line.empty()) continue;
+        std::vector<std::string> f = split_pipe(line);
+        if (f.size() < 7) continue;
+        const std::string& asn = f[0];
+        const std::string& ip  = f[1];
+        const std::string& name = f[6];
+        if (asn.empty() || asn == "NA") continue;
+        out_labels[ip] = name.empty() ? ("AS" + asn) : (name + " (AS" + asn + ")");
+    }
+    return true;
+}
 
 void resolve_owners(const std::vector<std::pair<std::string, uint32_t>>& v4_samples,
                      const std::vector<std::pair<std::string, u128>>& v6_samples,
@@ -840,48 +886,95 @@ void resolve_owners(const std::vector<std::pair<std::string, uint32_t>>& v4_samp
     attempted = v4_samples.size() + v6_samples.size();
     if (attempted == 0) return;
 
-    std::vector<std::string> servers = !opts.dns_servers.empty() ? opts.dns_servers
-                                      : !g_dns_servers.empty()   ? g_dns_servers
-                                                                  : owner_system_resolvers();
-    if (servers.empty()) {
-        std::cerr << "[discover] --owner: no DNS servers available, skipping owner lookups\n";
-        attempted = 0;
-        return;
-    }
-
     const size_t cap = std::min(attempted, kMaxOwnerLookups);
     if (cap < attempted)
         std::cerr << "[discover] --owner: capped at " << kMaxOwnerLookups << " of " << attempted
-                   << " ranges to bound DNS load\n";
+                   << " ranges to bound lookup load\n";
 
-    std::atomic<size_t> next{0};
-    const int nthreads = std::max(1, std::min(opts.dns_concurrency, static_cast<int>(cap)));
+    std::vector<std::string> ip_text(cap);
+    for (size_t i = 0; i < cap; ++i) {
+        ip_text[i] = (i < v4_samples.size()) ? v4_to_string(v4_samples[i].second)
+                                              : v6_to_string(v6_samples[i - v4_samples.size()].second);
+    }
+
+    std::vector<std::pair<size_t, size_t>> chunks;
+    for (size_t start = 0; start < cap; start += kBulkChunkSize)
+        chunks.emplace_back(start, std::min(start + kBulkChunkSize, cap));
+
+    const int nworkers = std::max(1, std::min({static_cast<int>(chunks.size()), opts.dns_concurrency, 8}));
+    std::atomic<size_t> next_chunk{0};
+    std::unordered_map<std::string, std::string> labels;
+    labels.reserve(cap);
+    std::mutex labels_mu;
+
     auto worker = [&]() {
         for (;;) {
-            size_t i = next.fetch_add(1);
-            if (i >= cap || terminate_flag.load(std::memory_order_relaxed)) return;
-            if (i < v4_samples.size()) {
-                uint32_t ip = v4_samples[i].second;
-                auto res = resolve_owner_label(cymru_qname_v4(ip), ptr_qname_v4(ip), opts.dns_timeout_ms, servers);
-                if (res.ok) v4_labels[i] = res.label;
-            } else {
-                size_t j = i - v4_samples.size();
-                u128 ip = v6_samples[j].second;
-                auto res = resolve_owner_label(cymru_qname_v6(ip), ptr_qname_v6(ip), opts.dns_timeout_ms, servers);
-                if (res.ok) v6_labels[j] = res.label;
+            size_t ci = next_chunk.fetch_add(1);
+            if (ci >= chunks.size() || terminate_flag.load(std::memory_order_relaxed)) return;
+            const auto [a, b] = chunks[ci];
+            std::vector<std::string> batch(ip_text.begin() + static_cast<long>(a), ip_text.begin() + static_cast<long>(b));
+            std::unordered_map<std::string, std::string> local;
+            if (bulk_cymru_query(batch, opts.dns_timeout_ms, local)) {
+                std::lock_guard<std::mutex> lk(labels_mu);
+                for (auto& kv : local) labels.emplace(std::move(kv.first), std::move(kv.second));
             }
         }
     };
+
     std::vector<std::thread> pool;
-    pool.reserve(nthreads);
-    for (int t = 0; t < nthreads; ++t) pool.emplace_back(worker);
+    pool.reserve(nworkers);
+    for (int t = 0; t < nworkers; ++t) pool.emplace_back(worker);
     for (auto& th : pool) th.join();
 
-    for (auto& s : v4_labels) if (!s.empty()) ++resolved;
-    for (auto& s : v6_labels) if (!s.empty()) ++resolved;
+    std::vector<size_t> unresolved;
+    for (size_t i = 0; i < cap; ++i) {
+        auto it = labels.find(ip_text[i]);
+        if (it != labels.end()) {
+            if (i < v4_samples.size()) v4_labels[i] = it->second;
+            else v6_labels[i - v4_samples.size()] = it->second;
+            ++resolved;
+        } else if (opts.owner_ptr_fallback) {
+            unresolved.push_back(i);
+        }
+    }
+
+    if (!unresolved.empty() && !terminate_flag.load(std::memory_order_relaxed)) {
+        std::vector<std::string> servers = !opts.dns_servers.empty() ? opts.dns_servers
+                                          : !g_dns_servers.empty()   ? g_dns_servers
+                                                                      : owner_system_resolvers();
+        if (!servers.empty()) {
+            std::atomic<size_t> uidx{0};
+            const int pfworkers = std::max(1, std::min({static_cast<int>(unresolved.size()), opts.dns_concurrency, 8}));
+            auto pworker = [&]() {
+                for (;;) {
+                    size_t k = uidx.fetch_add(1);
+                    if (k >= unresolved.size() || terminate_flag.load(std::memory_order_relaxed)) return;
+                    size_t i = unresolved[k];
+                    std::string ptr;
+                    bool ok = (i < v4_samples.size())
+                        ? udp_dns_query(servers, ptr_qname_v4(v4_samples[i].second), 12, opts.dns_timeout_ms, ptr)
+                        : udp_dns_query(servers, ptr_qname_v6(v6_samples[i - v4_samples.size()].second), 12, opts.dns_timeout_ms, ptr);
+                    if (ok && !ptr.empty()) {
+                        if (ptr.back() == '.') ptr.pop_back();
+                        std::string label = "ptr:" + ptr;
+                        if (i < v4_samples.size()) v4_labels[i] = label;
+                        else v6_labels[i - v4_samples.size()] = label;
+                    }
+                }
+            };
+            std::vector<std::thread> ppool;
+            ppool.reserve(pfworkers);
+            for (int t = 0; t < pfworkers; ++t) ppool.emplace_back(pworker);
+            for (auto& th : ppool) th.join();
+            for (size_t i : unresolved) {
+                bool got = (i < v4_samples.size()) ? !v4_labels[i].empty() : !v6_labels[i - v4_samples.size()].empty();
+                if (got) ++resolved;
+            }
+        }
+    }
 }
 
-}  // namespace
+} 
 
 namespace {
 
@@ -1064,7 +1157,30 @@ size_t write_cb(char* p, size_t sz, size_t nm, void* ud) {
     return feed(*s, p, len) ? len : 0;
 }
 
-void setup_easy(Source& s, const Options& o) {
+#if LIBCURL_VERSION_NUM >= 0x074700
+const std::string* cached_ca_bundle() {
+    static const std::string bundle = [] {
+        const char* path = nullptr;
+        curl_version_info_data* vi = curl_version_info(CURLVERSION_NOW);
+        if (vi && vi->cainfo && vi->cainfo[0]) path = vi->cainfo;
+        static const char* fallbacks[] = {
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+        };
+        std::ifstream f;
+        if (path) f.open(path, std::ios::binary);
+        for (size_t i = 0; !f.is_open() && i < 3; ++i) f.open(fallbacks[i], std::ios::binary);
+        if (!f.is_open()) return std::string();
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }();
+    return bundle.empty() ? nullptr : &bundle;
+}
+#endif
+
+void setup_easy(Source& s, const Options& o, CURLSH* share) {
     CURL* h = s.easy;
     curl_easy_setopt(h, CURLOPT_URL, s.url.c_str());
     curl_easy_setopt(h, CURLOPT_PRIVATE, &s);
@@ -1084,6 +1200,13 @@ void setup_easy(Source& s, const Options& o) {
     curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(h, CURLOPT_MAXREDIRS, 3L);
+    if (share) curl_easy_setopt(h, CURLOPT_SHARE, share);
+#if LIBCURL_VERSION_NUM >= 0x074700
+    if (const std::string* bundle = cached_ca_bundle()) {
+        curl_blob blob{const_cast<char*>(bundle->data()), bundle->size(), CURL_BLOB_COPY};
+        curl_easy_setopt(h, CURLOPT_CAINFO_BLOB, &blob);
+    }
+#endif
 #if LIBCURL_VERSION_NUM >= 0x075500          
     curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "https");
     curl_easy_setopt(h, CURLOPT_REDIR_PROTOCOLS_STR, "https");
@@ -1215,10 +1338,15 @@ int run(const Options& opts) {
         curl_global_cleanup();
         return 1;
     }
+    CURLSH* share = curl_share_init();
+    if (share) {
+        curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    }
     for (auto& s : sources) {
         s->easy = curl_easy_init();
         if (!s->easy) { s->done = true; s->note = "curl_easy_init failed"; continue; }
-        setup_easy(*s, opts);
+        setup_easy(*s, opts, share);
         curl_multi_add_handle(multi, s->easy);
         if (opts.verbose) std::cerr << "[discover]   GET " << s->url << "\n";
     }
@@ -1244,6 +1372,7 @@ int run(const Options& opts) {
         }
     }
     curl_multi_cleanup(multi);
+    if (share) curl_share_cleanup(share);
     curl_global_cleanup();
 
     if (interrupted) {
@@ -1342,7 +1471,7 @@ int run(const Options& opts) {
 
 #ifdef DISCOVER_SELFTEST
 std::atomic<bool> terminate_flag(false);
-std::vector<std::string> g_dns_servers;  // normally defined in handler.cpp; stubbed for the standalone selftest link
+std::vector<std::string> g_dns_servers; 
 
 #include <cassert>
 #include <set>
