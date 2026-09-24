@@ -863,6 +863,7 @@ struct RecPross {
     std::string mac_address;
     int learned_rtt_ms = 0;
     std::unordered_map<uint16_t, PacketDetails> packet_details;
+    std::unordered_map<uint16_t, PacketDetails> osdetect_details;
     int packets_sent = 0;
     // ── TX-side drops, one bucket per CAUSE (see TxLossCounters) ─────────
     uint64_t loss_buffer_pool   = 0;   // pool.acquire() returned null
