@@ -9,6 +9,7 @@
 #include "probe.hpp"
 #include "async_io.hpp"
 #include "netns_split.hpp"
+#include "os_detect.hpp"
 #include <stdexcept>
 #include <future>
 #include <thread>
@@ -3150,6 +3151,15 @@ void thread_worker(const std::vector<std::string>& thread_ips,
             if (!result.packet_details.empty() && !terminate_flag && debug_wsn) {
                 display_wsn_analysis(result.packet_details, window_scale, ip_str.c_str());
             }
+            
+            if (g_os_detect && !terminate_flag) {
+                const osdetect::Context os_ctx =
+                    osdetect::make_context(scan_type, opts, custom_ttl, win_size);
+                const osdetect::Result os_res =
+                    osdetect::analyze(result.packet_details, os_ctx);
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cout << osdetect::render(os_res, ip_str, sv_opts.verbose);
+            }
             const bool udp_probe_all_ports = sv_opts.udp && !ports.empty();
             if (enable_version_detection && vprobes && !terminate_flag
 	        && (!result.open_ports.empty() || udp_probe_all_ports)) {
@@ -3157,9 +3167,6 @@ void thread_worker(const std::vector<std::string>& thread_ips,
 
 	        constexpr size_t kMaxConcurrentProbes = 16;
 	        std::vector<std::future<void>> inflight;
-
-	        // --udp: probe every requested port (bypasses TCP open_ports).
-	        // Otherwise: stick to the TCP scan's open_ports, as before.
 	        std::vector<uint16_t> udp_probe_ports;
 	        if (udp_probe_all_ports) {
 	            udp_probe_ports.reserve(ports.size());
@@ -3527,6 +3534,7 @@ void print_full_help() {
 		std::cerr << color::yellow << " --interface" << color::reset << " Set desired interface\n";
 		std::cerr << color::yellow << " --grep" << color::reset << " Print a plain, copy-friendly grepable target list at the end of the scan\n";
 		std::cerr << color::yellow << " --traceroute" << color::reset << " Print traced routes informations with Geo locations,ASN etc (use -6 to trace over IPv6)\n";
+	        std::cerr << color::yellow << " --os-detect" << color::reset << " Passively fingerprint the target OS from the replies received\n";
 		std::cerr << color::yellow << " -o" << color::reset << " <File_Name>.txt Save results to file (plain text)\n\n";
 
 		std::cerr << color::green << "Multi Host Specification:\n" << color::reset;
