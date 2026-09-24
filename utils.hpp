@@ -37,6 +37,13 @@ std::vector<Ipv6AddrInfo> get_all_interface_ip6(const std::string& ifname);
 bool parse_mac(const std::string& mac_str, uint8_t* out_mac);
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s);
 std::string reverse_dns_lookup(const std::string& ip_address);
+
+void reverse_dns_lookup_batch(const std::vector<std::string>& ips,
+                               std::unordered_map<std::string, std::string>& out_hostnames,
+                               int timeout_ms = 2000,
+                               int retries = 2,
+                               int concurrency = 500);
+
 bool ptr_cache_lookup(const std::string& ip, std::string& out_domain);
 void ptr_cache_store(const std::string& ip, const std::string& domain);
 std::vector<std::string> get_system_resolvers();
@@ -49,10 +56,6 @@ bool route_lookup(const std::string& target_ip, int family,
                    std::string& out_iface, bool& out_is_onlink,
                    std::string* out_gateway = nullptr);
 
-// Option B: reads the actual default route (prefix length 0) from the
-// kernel's routing table directly, via a netlink route dump -- no probe
-// address involved, so it can't be fooled by any address (0.0.0.0 or a
-// real IP) resolving unexpectedly.
 bool get_default_route(int family, std::string& out_iface, std::string& out_gateway);
 
 bool neighbor_cache_has_entry(int family, const std::string& target_ip);
