@@ -3695,6 +3695,20 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
                     pstate_ref.retry_count, rtt_here, pstate_ref);
                 packet_details_map[dest_port]    = details;
                 result.packet_details[dest_port] = details;
+                {
+                    const uint8_t nf = details.tcp_flags;
+                    const int new_rank = ((nf & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK) && !(nf & TH_RST)) ? 2
+                                       : (nf & TH_RST) ? 1 : 0;
+                    auto od = result.osdetect_details.find(dest_port);
+                    bool store = (od == result.osdetect_details.end());
+                    if (!store) {
+                        const uint8_t of = od->second.tcp_flags;
+                        const int old_rank = ((of & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK) && !(of & TH_RST)) ? 2
+                                           : (of & TH_RST) ? 1 : 0;
+                        store = new_rank > old_rank;
+                    }
+                    if (store) result.osdetect_details[dest_port] = details;
+                }
                 if (result.received_ttl == 0 && details.ttl != 0)
                     result.received_ttl = details.ttl;
 
@@ -6849,6 +6863,7 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
             result.mac_address = batch_result.mac_address;
         }
                 result.packet_details.insert(batch_result.packet_details.begin(), batch_result.packet_details.end());
+                result.osdetect_details.insert(batch_result.osdetect_details.begin(), batch_result.osdetect_details.end());
         if (result.received_ttl == 0 && batch_result.received_ttl != 0) {
             result.received_ttl = batch_result.received_ttl;
         }
