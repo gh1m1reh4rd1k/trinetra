@@ -11,6 +11,7 @@
 #include "async_io.hpp"
 #include "netns_split.hpp"
 #include "net_capture.hpp"
+#include "os_detect.hpp"
 #include <stdexcept>
 #include <future>
 #include <thread>
@@ -1666,6 +1667,10 @@ int main(int argc, char *argv[]) {
                 std::cerr << "--retry-sport: port must be 1-65535\n";
                 exit(1);
             }
+        }},
+        
+        {"--os-detect", [&](int& idx) {
+            g_os_detect = true;
         }},
 
         {"--sqpoll", [&](int& idx) {
