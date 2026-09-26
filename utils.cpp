@@ -979,7 +979,20 @@ bool route_lookup(const std::string& target_ip, int family,
     return found;
 }
 
-bool get_default_route(int family, std::string& out_iface, std::string& out_gateway) {
+namespace {
+
+struct DefaultRouteEntry {
+    std::chrono::steady_clock::time_point taken{};
+    bool        found = false;
+    std::string iface;
+    std::string gateway;
+};
+
+std::mutex g_default_route_mutex;
+std::unordered_map<int, DefaultRouteEntry> g_default_route_cache;
+constexpr std::chrono::milliseconds kDefaultRouteTtl{2000};
+
+bool get_default_route_uncached(int family, std::string& out_iface, std::string& out_gateway) {
     int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     if (sock < 0) return false;
 
@@ -1044,9 +1057,64 @@ bool get_default_route(int family, std::string& out_iface, std::string& out_gate
     return found;
 }
 
-bool neighbor_cache_has_entry(int family, const std::string& target_ip) {
+}
+
+bool get_default_route(int family, std::string& out_iface, std::string& out_gateway) {
+    if (family != AF_INET && family != AF_INET6) return false;
+
+    {
+        std::lock_guard<std::mutex> lk(g_default_route_mutex);
+        auto it = g_default_route_cache.find(family);
+        if (it != g_default_route_cache.end() &&
+            (std::chrono::steady_clock::now() - it->second.taken) < kDefaultRouteTtl) {
+            if (!it->second.found) return false;
+            out_iface   = it->second.iface;
+            out_gateway = it->second.gateway;
+            return true;
+        }
+    }
+
+    DefaultRouteEntry entry;
+    entry.found = get_default_route_uncached(family, entry.iface, entry.gateway);
+    entry.taken = std::chrono::steady_clock::now();
+
+    {
+        std::lock_guard<std::mutex> lk(g_default_route_mutex);
+        g_default_route_cache[family] = entry;
+    }
+
+    if (!entry.found) return false;
+    out_iface   = entry.iface;
+    out_gateway = entry.gateway;
+    return true;
+}
+
+namespace {
+
+struct NeighborSnapshot {
+    std::chrono::steady_clock::time_point taken{};
+    std::unordered_set<std::string> reachable;   
+};
+
+std::mutex g_neighbor_mutex;
+std::unordered_map<int, std::shared_ptr<const NeighborSnapshot>> g_neighbor_cache;
+constexpr std::chrono::milliseconds kNeighborTtl{500};
+
+std::string make_neigh_key(int family, const void* addr, size_t len) {
+    std::string key;
+    key.reserve(len + 1);
+    key.push_back(static_cast<char>(family));
+    key.append(static_cast<const char*>(addr), len);
+    return key;
+}
+
+std::shared_ptr<const NeighborSnapshot> fetch_neighbor_snapshot(int family) {
+    auto snap = std::make_shared<NeighborSnapshot>();
+    snap->taken = std::chrono::steady_clock::now();
+
     int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-    if (sock < 0) return false;
+    if (sock < 0) return snap;                     
+    struct FDGuard { int fd; ~FDGuard() { if (fd >= 0) close(fd); } } guard{sock};
 
     struct { struct nlmsghdr nh; struct ndmsg nd; } req{};
     req.nh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ndmsg));
@@ -1055,14 +1123,9 @@ bool neighbor_cache_has_entry(int family, const std::string& target_ip) {
     req.nh.nlmsg_seq   = 1;
     req.nd.ndm_family  = static_cast<unsigned char>(family);
 
-    if (send(sock, &req, req.nh.nlmsg_len, 0) < 0) { close(sock); return false; }
+    if (send(sock, &req, req.nh.nlmsg_len, 0) < 0) return snap;
 
-    struct in_addr  want4{};
-    struct in6_addr want6{};
-    if (family == AF_INET)  inet_pton(AF_INET,  target_ip.c_str(), &want4);
-    else                     inet_pton(AF_INET6, target_ip.c_str(), &want6);
-
-    bool result = false, done = false;
+    bool done = false;
     char buf[8192];
     while (!done) {
         ssize_t len = recv(sock, buf, sizeof(buf), 0);
@@ -1073,31 +1136,99 @@ bool neighbor_cache_has_entry(int family, const std::string& target_ip) {
             if (nh->nlmsg_type != RTM_NEWNEIGH) continue;
 
             auto* ndm = reinterpret_cast<struct ndmsg*>(NLMSG_DATA(nh));
+            if (!(ndm->ndm_state & (NUD_REACHABLE | NUD_STALE | NUD_DELAY | NUD_PROBE | NUD_PERMANENT)))
+                continue;
+
             auto* attr = RTM_RTA(ndm);
             int attr_len = static_cast<int>(RTM_PAYLOAD(nh));
-            bool matches = false;
             for (; RTA_OK(attr, attr_len); attr = RTA_NEXT(attr, attr_len)) {
                 if (attr->rta_type != NDA_DST) continue;
-                if (family == AF_INET  && memcmp(RTA_DATA(attr), &want4, 4)  == 0) matches = true;
-                if (family == AF_INET6 && memcmp(RTA_DATA(attr), &want6, 16) == 0) matches = true;
+                size_t addr_len = (family == AF_INET) ? 4 : 16;
+                if (RTA_PAYLOAD(attr) < addr_len) continue;   
+                snap->reachable.insert(make_neigh_key(family, RTA_DATA(attr), addr_len));
             }
-            if (matches)
-                result = ndm->ndm_state & (NUD_REACHABLE | NUD_STALE | NUD_DELAY | NUD_PROBE | NUD_PERMANENT);
         }
     }
-    close(sock);
-    return result;
+    return snap;
+}
+
+std::shared_ptr<const NeighborSnapshot> get_neighbor_snapshot_cached(int family) {
+    std::lock_guard<std::mutex> lk(g_neighbor_mutex);
+    auto it = g_neighbor_cache.find(family);
+    if (it != g_neighbor_cache.end() &&
+        (std::chrono::steady_clock::now() - it->second->taken) < kNeighborTtl) {
+        return it->second;
+    }
+    auto fresh = fetch_neighbor_snapshot(family);
+    g_neighbor_cache[family] = fresh;
+    return fresh;
+}
+
+struct ConntrackSnapshot {
+    std::chrono::steady_clock::time_point taken{};
+    std::unordered_set<std::string> addrs;
+};
+
+std::mutex g_conntrack_mutex;
+std::shared_ptr<const ConntrackSnapshot> g_conntrack_cache;
+constexpr std::chrono::milliseconds kConntrackTtl{500};
+
+std::shared_ptr<const ConntrackSnapshot> fetch_conntrack_snapshot() {
+    auto snap = std::make_shared<ConntrackSnapshot>();
+    snap->taken = std::chrono::steady_clock::now();
+
+    std::ifstream f("/proc/net/nf_conntrack");
+    if (!f.is_open()) return snap;
+
+    std::string line, token;
+    while (std::getline(f, line)) {
+        std::istringstream iss(line);
+        while (iss >> token) {
+            for (const char* prefix : {"src=", "dst="}) {
+                size_t plen = std::strlen(prefix);
+                if (token.size() > plen && token.compare(0, plen, prefix) == 0)
+                    snap->addrs.insert(token.substr(plen));
+            }
+        }
+    }
+    return snap;
+}
+
+std::shared_ptr<const ConntrackSnapshot> get_conntrack_snapshot_cached() {
+    std::lock_guard<std::mutex> lk(g_conntrack_mutex);
+    if (g_conntrack_cache &&
+        (std::chrono::steady_clock::now() - g_conntrack_cache->taken) < kConntrackTtl) {
+        return g_conntrack_cache;
+    }
+    auto fresh = fetch_conntrack_snapshot();
+    g_conntrack_cache = fresh;
+    return fresh;
+}
+
+} 
+
+bool neighbor_cache_has_entry(int family, const std::string& target_ip) {
+    if (family != AF_INET && family != AF_INET6) return false;
+
+    struct in_addr  want4{};
+    struct in6_addr want6{};
+    const void* addr_ptr; size_t addr_len;
+    if (family == AF_INET) {
+        if (inet_pton(AF_INET, target_ip.c_str(), &want4) != 1) return false;
+        addr_ptr = &want4; addr_len = 4;
+    } else {
+        if (inet_pton(AF_INET6, target_ip.c_str(), &want6) != 1) return false;
+        addr_ptr = &want6; addr_len = 16;
+    }
+
+    auto snap = get_neighbor_snapshot_cached(family);
+    return snap->reachable.count(make_neigh_key(family, addr_ptr, addr_len)) != 0;
 }
 
 bool conntrack_has_entry(const std::string& target_ip) {
-    std::ifstream f("/proc/net/nf_conntrack");
-    if (!f.is_open()) return false;
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.find("dst=" + target_ip) != std::string::npos ||
-            line.find("src=" + target_ip) != std::string::npos) return true;
-    }
-    return false;
+    if (target_ip.empty()) return false;
+    auto snap = get_conntrack_snapshot_cached();
+    return snap->addrs.count(target_ip) != 0;
 }
 
 bool neighbor_cache_has_entry_v4(const std::string& target_ip) {
