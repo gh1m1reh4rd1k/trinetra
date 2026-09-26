@@ -477,10 +477,6 @@ std::string get_mac_vendor(const std::string &mac_address) {
     return "unknown";
 }
 
-// Interface IP/netmask doesn't change between targets within a single run,
-// but is_target_onlink() used to re-open an AF_PACKET socket and re-ioctl
-// for it on every single call — expensive when called once per target in a
-// large sweep. Cache it per interface name instead.
 struct IfaceSubnetInfo { bool ok = false; uint32_t netmask_int = 0; };
 
 static std::mutex g_iface_subnet_mutex;
@@ -506,6 +502,28 @@ static IfaceSubnetInfo get_iface_subnet_info_cached(const std::string& interface
     return g_iface_subnet_cache[interface] = info;
 }
 
+static bool classify_v4_onlink(const std::string& target_ip, uint32_t ip_int,
+                                uint32_t local_ip_int, uint32_t netmask_int, bool subnet_ok,
+                                const std::string& interface) {
+    bool topologically_onlink = subnet_ok && is_same_subnet(ip_int, local_ip_int, netmask_int);
+
+    bool route_onlink = false;
+    std::string route_iface;
+    if (!topologically_onlink) {
+        bool is_onlink_route = false;
+        if (route_lookup(target_ip, AF_INET, route_iface, is_onlink_route) && is_onlink_route)
+            route_onlink = true;
+    }
+
+    bool cache_onlink = !topologically_onlink && !route_onlink
+                         && (neighbor_cache_has_entry_v4(target_ip) || conntrack_has_entry(target_ip));
+
+    std::string check_iface = topologically_onlink ? interface : route_iface;
+    bool is_ptp = !check_iface.empty() && is_point_to_point_interface(check_iface);
+
+    return (topologically_onlink || route_onlink || cache_onlink) && !is_ptp;
+}
+
 bool is_target_onlink(const std::string& target_ip, std::string interface = "") {
     int ip_version = get_ip_version(target_ip.c_str());
     if (ip_version == 4) {
@@ -520,23 +538,8 @@ bool is_target_onlink(const std::string& target_ip, std::string interface = "") 
         uint8_t ip_bytes[4] = {0};
         if (inet_pton(AF_INET, target_ip.c_str(), ip_bytes) <= 0) return false;
         uint32_t ip_int; memcpy(&ip_int, ip_bytes, 4);
-        bool topologically_onlink = subnet_ok && is_same_subnet(ip_int, local_ip_int, netmask_int);
 
-        bool route_onlink = false;
-        std::string route_iface;
-        if (!topologically_onlink) {
-            bool is_onlink_route = false;
-            if (route_lookup(target_ip, AF_INET, route_iface, is_onlink_route) && is_onlink_route)
-                route_onlink = true;
-        }
-
-        bool cache_onlink = !topologically_onlink && !route_onlink
-                             && (neighbor_cache_has_entry_v4(target_ip) || conntrack_has_entry(target_ip));
-
-        std::string check_iface = topologically_onlink ? interface : route_iface;
-        bool is_ptp = !check_iface.empty() && is_point_to_point_interface(check_iface);
-
-        return (topologically_onlink || route_onlink || cache_onlink) && !is_ptp;
+        return classify_v4_onlink(target_ip, ip_int, local_ip_int, netmask_int, subnet_ok, interface);
     } else if (ip_version == 6) {
         struct in6_addr target6{};
         bool topologically_onlink = false;
@@ -562,7 +565,7 @@ bool is_target_onlink(const std::string& target_ip, std::string interface = "") 
                 }
             }
             for (const auto& local : get_all_interface_ip6(check_if)) {
-                if (local.scope == Ipv6Scope::LinkLocal) continue; // link-local never implies routable match
+                if (local.scope == Ipv6Scope::LinkLocal) continue; 
                 int full_bytes = local.prefix_len / 8;
                 int rem_bits   = local.prefix_len % 8;
                 bool match = (full_bytes == 0) || memcmp(target6.s6_addr, local.addr, full_bytes) == 0;
@@ -645,10 +648,6 @@ TargetLocality assess_target_locality(const std::string& target_ip, std::string 
             std::chrono::steady_clock::now().time_since_epoch()).count();
         bool in_post_split_grace = entered_at != 0 &&
             static_cast<uint64_t>(now_ms) - entered_at < kConntrackGraceMs;
-
-        // During the grace window treat as "unknown, don't penalize" rather
-        // than reading a fresh, legitimately-empty conntrack table as proof
-        // the target isn't corroborated.
         result.corroborated = in_post_split_grace ? true : conntrack_has_entry(target_ip);
     }
     return result;
@@ -717,7 +716,7 @@ std::vector<std::string> perform_sn_discovery(const std::vector<std::string>& ip
     // Our own interface IP, for the self-scan special case below.
     uint32_t own_ip_int = 0;
     if (subnet_ok) memcpy(&own_ip_int, src_ip_bytes, 4);
-    
+
     int      ifindex6           = 0;
     bool     have_v6_iface      = false;
     struct in6_addr local_ip6_prefix {};
@@ -797,33 +796,16 @@ std::vector<std::string> perform_sn_discovery(const std::vector<std::string>& ip
             continue;
         }
         uint32_t ip_int; memcpy(&ip_int, ip_bytes, 4);
-        slots[i].ip_int = ip_int;  
+        slots[i].ip_int = ip_int;
         if (subnet_ok && ip_int == own_ip_int) {
             slots[i].alive        = true;
             slots[i].mac          = format_mac(src_mac);
             slots[i].is_self_host = true;
             continue;
         }
+        bool is_onlink = classify_v4_onlink(ips[i], ip_int, local_ip_int, netmask_int, subnet_ok, interface);
 
-        // On-link decision, in order of confidence:
-        bool topologically_onlink = subnet_ok && is_same_subnet(ip_int, local_ip_int, netmask_int);
-
-        bool route_onlink = false;
-        std::string route_iface;
-        if (!topologically_onlink) {
-            bool is_onlink_route = false;
-            if (route_lookup(ips[i], AF_INET, route_iface, is_onlink_route) && is_onlink_route) {
-                route_onlink = true;
-            }
-        }
-
-        bool cache_onlink = !topologically_onlink && !route_onlink
-                             && neighbor_cache_has_entry_v4(ips[i]);
-
-        std::string check_iface = topologically_onlink ? interface : route_iface;
-        bool is_ptp = !check_iface.empty() && is_point_to_point_interface(check_iface);
-
-        if ((topologically_onlink || route_onlink || cache_onlink) && !is_ptp) {
+        if (is_onlink) {
             auto buf = std::make_unique<uint8_t[]>(4);
             memcpy(buf.get(), ip_bytes, 4);
             arp_target_ptrs.push_back(buf.get());
@@ -851,7 +833,7 @@ std::vector<std::string> perform_sn_discovery(const std::vector<std::string>& ip
                 std::vector<double> arp_rtt_ms_all(total_arp_targets, 0.0);
                 for (size_t batch_start = 0; batch_start < total_arp_targets; batch_start += ARP_BATCH_SIZE) {
                     const size_t batch_end = std::min(batch_start + ARP_BATCH_SIZE, total_arp_targets);
-                    const size_t this_batch_size = batch_end - batch_start;  
+                    const size_t this_batch_size = batch_end - batch_start;
 
                     std::vector<uint8_t*> batch_target_ptrs(
                         arp_target_ptrs.begin() + batch_start, arp_target_ptrs.begin() + batch_end);
@@ -941,7 +923,7 @@ std::vector<std::string> perform_sn_discovery(const std::vector<std::string>& ip
             size_t idx = icmp_indices[k];
             if (is_lan_host[idx]) continue;
             bool retryable = results[k].state == IcmpHostState::NoResponse
-               		    || results[k].state == IcmpHostState::FragNeeded
+                            || results[k].state == IcmpHostState::FragNeeded
                             || results[k].state == IcmpHostState::TtlExceeded
                             || results[k].state == IcmpHostState::FragTimeout
                             || results[k].state == IcmpHostState::BadSpi;
@@ -972,7 +954,7 @@ std::vector<std::string> perform_sn_discovery(const std::vector<std::string>& ip
             }
         }
     }
-    
+
     // ---- NDP pass: on-link IPv6 targets, mirrors the ARP pass above ----
     struct rusage ru_v6_start{}; getrusage(RUSAGE_SELF, &ru_v6_start);
     if (!ndp_ips.empty() && ifindex6 > 0) {
