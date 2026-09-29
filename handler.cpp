@@ -3532,10 +3532,10 @@ void print_full_help() {
 
 		std::cerr << color::green << "Enumeration Options\n" << color::reset;
 		std::cerr << color::yellow << " --enum" << color::reset << " <module,module,...> Run one or more OSINT/enumeration modules, comma-separated, any order\n";
-		std::cerr << "                                      shodan        Query Shodan InternetDB for target info\n";
-		std::cerr << "                                      ssl           SSL/TLS enumeration (chain, SANs, key strength, expiry, OCSP/CT, SNI variance)\n";
-		std::cerr << "                                      dns           Passive+active DNS/OSINT enumeration (records, AXFR , email-security posture, DNSSEC , Wayback/RDAP/ASN)\n";
-		std::cerr << "                                      trail:<key>   Use security trials API to fetch subdomains\n\n";
+		std::cerr << "                                      shodan        : Query Shodan InternetDB for target info\n";
+		std::cerr << "                                      ssl           : SSL/TLS enumeration (chain, SANs, key strength, expiry, OCSP/CT, SNI variance)\n";
+		std::cerr << "                                      dns           : Passive+active DNS/OSINT enumeration (records,AXFR,DNSSEC,Wayback/RDAP/ASN)\n";
+		std::cerr << "                                      trail:<key>   : Use security trials API to fetch subdomains\n\n";
 		std::cerr << "                                      For eg: shiv  abc.com --enum trail:<api-key> (only perform trail)\n";
 		std::cerr << "                                      For eg: shiv  abc.com -sS -Pn --enum shodan,dns (scan, then shodan + dns enum)\n";
 		std::cerr << "                                      For eg: shiv  abc.com --enum shodan,trail:<api-key>,dns (multiple modules, any order)\n\n";
@@ -3554,17 +3554,36 @@ void print_full_help() {
 		std::cerr << "                                      For eg: shiv --netradar --time 30s (capture for 30 seconds)\n";
 		std::cerr << "                                      For eg: shiv --netradar --time 5m --interface eth0 (5 minutes on a specific interface)\n\n";
 		
-	        std::cerr << color::green << "Country Range Discovery (--discover) Options:\n" << color::reset;
-		std::cerr << color::yellow << " --discover" << color::reset << " <country> Fetch a country's public IPv4/IPv6 ranges from RIR/NetworksDB\n";
-		std::cerr << "             Accepts a name (nepal, \"south korea\"), ISO-2 (np) or ISO-3 (npl); typos are corrected. -4/-6 pick the family, -o saves the list.\n";
-		std::cerr << "                                      For eg: shiv --discover nepal\n";
-		std::cerr << "                                      For eg: shiv --discover south korea -4 -o kr.txt\n";
-		std::cerr << color::yellow << " --owner" << color::reset << "     Annotate each printed range with who it belongs to.\n";
-		std::cerr << "             Looks up one sample address per range (Team Cymru ASN DNS lookup, PTR as fallback) - never every address in it.\n";
-		std::cerr << "             Owner is appended as a '#' comment, so saved files stay usable with -iL.\n";
-		std::cerr << "                                      For eg: shiv --discover nepal --owner\n\n";
+	        std::cerr << color::green << "Discovery Options:\n" << color::reset;
+		std::cerr << "  category 1 - ASN / organisation lookup:\n";
+		std::cerr << color::yellow << "   --cn" << color::reset << " <country>         List every ASN and org name for a country\n";
+		std::cerr << "            Accepts a name (nepal, \"south korea\"), ISO-2 (np) or ISO-3 (npl); typos are corrected.\n";
+		std::cerr << "                                      For eg: shiv --cn nepal\n";
+		std::cerr << color::yellow << "   --org" << color::reset << " <name>           Filter the ASN list to one organisation (typo-tolerant)\n";
+		std::cerr << "            With --cn, filters that country's list; used alone, it scans every country's list for a match.\n";
+		std::cerr << "                                      For eg: shiv --cn nepal --org \"sky broadband\"\n";
+		std::cerr << "                                      For eg: shiv --org worldlink\n\n";
+
+		std::cerr << "  category 2 - IP-range discovery:\n";
+		std::cerr << color::yellow << "   --country" << color::reset << " <country>     Fetch a country's public IPv4/IPv6 ranges from RIR/NetworksDB\n";
+		std::cerr << "            Accepts a name (nepal, \"south korea\"), ISO-2 (np) or ISO-3 (npl); typos are corrected.\n";
+		std::cerr << "                                      For eg: shiv --country nepal --ipv4 -o np.txt\n";
+		std::cerr << color::yellow << "   --owner" << color::reset << " [name]          Annotate ranges with their owner, or filter to one owner/ASN\n";
+		std::cerr << "            Looks up one sample address per range (Team Cymru ASN DNS lookup).\n";
+		std::cerr << "                                      For eg: shiv --country nepal --owner\n";
+		std::cerr << "                                      For eg: shiv --country nepal --owner worldlink\n";
+		std::cerr << color::yellow << "   --ipv4" << color::reset << " / " << color::yellow << "--ipv6" << color::reset << "         Restrict output to one family (default: both)\n\n";
+
+		std::cerr << "  category 3 - IP/ASN to domains:\n";
+		std::cerr << color::yellow << "   --ip" << color::reset << " <ip>               Reverse-lookup domains hosted on an IPv4 address\n";
+		std::cerr << color::yellow << "   --range" << color::reset << " <cidr/24>       Reverse-lookup domains in an IPv4 /24 (host bits are cleared automatically)\n";
+		std::cerr << "                                      For eg: shiv --ip 103.48.88.33\n";
+		std::cerr << "                                      For eg: shiv --range 103.48.88.0/24\n";
+		std::cerr << color::yellow << "   --asn" << color::reset << " <ASN>             Print the IPv4/IPv6 routes announced by an ASN (no domain lookups)\n";
+		std::cerr << color::yellow << "   --ipv4" << color::reset << " / " << color::yellow << "--ipv6" << color::reset << "         With --asn, restrict routes to one family (default: both)\n";
+		std::cerr << "                                      For eg: shiv --asn AS45353 --ipv6\n\n";
 		
-		std::cerr << color::cyan << "Filtered State Tackle Controller / Performance Options \n" << color::reset;
+		std::cerr << color::green << "Filtered State Tackle Controller / Performance Options \n" << color::reset;
 		std::cerr << color::yellow << "  --retry-delay-min" << color::reset << " <dur>       Floor for congestion-scaled retry delay (default: 3ms)\n";
 		std::cerr << color::yellow << "  --retry-delay-max" << color::reset << " <dur>       Ceiling for congestion-scaled retry delay (default: 700ms)\n";
 		std::cerr << color::yellow << "  --retry-delay-floor-div" << color::reset << " <n>   Divisor applied to learned RTT timeout for the delay floor (default: 4)\n";
