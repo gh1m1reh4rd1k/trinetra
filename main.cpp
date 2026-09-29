@@ -298,9 +298,14 @@ int main(int argc, char *argv[]) {
        bool netradar_enabled = false;
        int  netradar_duration_ms = 0;     
        bool netradar_time_specified = false;
-       bool discover_enabled = false;
-       std::string discover_country;  
-       bool discover_owner = false;   
+       std::string discover_country;
+       std::string discover_cn;
+       std::string discover_org;
+       bool        discover_owner = false;
+       std::string discover_owner_name;
+       std::string discover_ip;
+       std::string discover_range;
+       std::string discover_asn;   
    } config;
    
     std::vector<std::string> ips;
@@ -415,6 +420,14 @@ int main(int argc, char *argv[]) {
         return std::find(allowed_depths.begin(), allowed_depths.end(), depth) != allowed_depths.end();
     };
     bool saw_dash4 = false, saw_dash6 = false;
+    auto read_words = [&](int& idx, const char* flag) {
+        std::string v = get_next_arg(idx, flag);
+        while (idx + 1 < argc && argv[idx + 1][0] != '-') { v += ' '; v += argv[++idx]; }
+        for (unsigned char ch : v) {
+            if (ch < 0x20 || ch == 0x7F) { std::cerr << flag << ": disallowed control character\n"; exit(1); }
+        }
+        return v;
+    };
     std::unordered_map<std::string, std::function<void(int&)>> option_handlers = {
         {"-iL", [&](int& idx) {
             config.ip_file = get_next_arg(idx, "-iL");
@@ -491,22 +504,18 @@ int main(int argc, char *argv[]) {
             config.netradar_time_specified = true;
         }},
         
+        {"--country", [&](int& idx) { config.discover_country = read_words(idx, "--country"); }},
+        {"--cn", [&](int& idx) { config.discover_cn = read_words(idx, "--cn"); }},
+        {"--org", [&](int& idx) { config.discover_org = read_words(idx, "--org"); }},
         {"--owner", [&](int& idx) {
             config.discover_owner = true;
+            if (idx + 1 < argc && argv[idx + 1][0] != '-') config.discover_owner_name = read_words(idx, "--owner");
         }},
-
-        {"--discover", [&](int& idx) {
-            std::string name = get_next_arg(idx, "--discover");
-            while (idx + 1 < argc && argv[idx + 1][0] != '-') { name += ' '; name += argv[++idx]; }
-            for (unsigned char ch : name) {
-                if (ch < 0x20 || ch == 0x7F) {
-                    std::cerr << "--discover: country contains a disallowed control character\n";
-                    exit(1);
-                }
-            }
-            config.discover_country = name;
-            config.discover_enabled = true;
-        }},
+        {"--ip", [&](int& idx) { config.discover_ip = get_next_arg(idx, "--ip"); }},
+        {"--range", [&](int& idx) { config.discover_range = get_next_arg(idx, "--range"); }},
+        {"--asn", [&](int& idx) { config.discover_asn = get_next_arg(idx, "--asn"); }},
+        {"--ipv4", [&](int&) { saw_dash4 = true; }},
+        {"--ipv6", [&](int&) { saw_dash6 = true; }},
         
         {"--sport-range", [&](int& idx) {
 	    std::string range_str = get_next_arg(idx, "--sport-range");
@@ -1753,24 +1762,61 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    if (config.discover_enabled) {
+    const bool disc_country = !config.discover_country.empty();
+    const bool disc_asnlist = !config.discover_cn.empty() || !config.discover_org.empty();
+    const bool disc_reverse = !config.discover_ip.empty() || !config.discover_range.empty();
+    const bool disc_routes  = !config.discover_asn.empty();
+    const int  disc_modes   = disc_country + disc_asnlist + disc_reverse + disc_routes;
+
+    if (disc_modes > 0) {
         if (!ips.empty() || !config.ip_file.empty() || config.scan_type_specified) {
-            std::cerr << "--discover runs on its own: don't combine it with targets, -iL or scan flags.\n";
+            std::cerr << "Discovery options run on their own: don't combine them with targets, -iL or scan flags.\n";
+            return 1;
+        }
+        if (disc_modes > 1) {
+            std::cerr << "Use only one of --country, --cn/--org, --ip/--range, --asn at a time.\n";
+            return 1;
+        }
+        if (!config.discover_ip.empty() && !config.discover_range.empty()) {
+            std::cerr << "--ip and --range are mutually exclusive.\n";
+            return 1;
+        }
+        if (disc_asnlist && config.discover_owner) {
+            std::cerr << "--owner only applies to --country.\n";
+            return 1;
+        }
+        if (disc_reverse && (config.discover_owner || saw_dash4 || saw_dash6)) {
+            std::cerr << "--owner/-4/-6/--ipv4/--ipv6 don't apply to --ip/--range.\n";
             return 1;
         }
         std::cout.rdbuf(teeOut_orig);
         std::cerr.rdbuf(teeErr_orig);
         discover::Options dopts;
-        dopts.country     = config.discover_country;
-        dopts.want_v4     = !saw_dash6;      
-        dopts.want_v6     = !saw_dash4;      
+        dopts.want_v4     = !saw_dash6;
+        dopts.want_v6     = !saw_dash4;
         dopts.verbose     = config.sv_verbose;
         dopts.output_file = config.output_file;
-        dopts.owner       = config.discover_owner;
+        if (disc_country) {
+            dopts.mode       = discover::Mode::Ranges;
+            dopts.country    = config.discover_country;
+            dopts.owner      = config.discover_owner;
+            dopts.owner_name = config.discover_owner_name;
+        } else if (disc_asnlist) {
+            dopts.mode    = discover::Mode::AsnList;
+            dopts.country = config.discover_cn;
+            dopts.org     = config.discover_org;
+        } else if (disc_reverse) {
+            dopts.mode  = discover::Mode::ReverseIp;
+            dopts.ip    = config.discover_ip;
+            dopts.range = config.discover_range;
+        } else {
+            dopts.mode = discover::Mode::AsnRoutes;
+            dopts.asn  = config.discover_asn;
+        }
         return discover::run(dopts);
     }
-    if (config.discover_owner && !config.discover_enabled) {
-        std::cerr << "--owner only applies to --discover.\n";
+    if (config.discover_owner) {
+        std::cerr << "--owner only applies to --country.\n";
         return 1;
     }
 
