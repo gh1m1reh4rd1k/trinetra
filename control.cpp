@@ -1,5954 +1,3131 @@
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <vector>
-#include <set>
-#include <map>
-#include <unordered_map>
-#include <string>
-#include <cstring>
+#include "discover.hpp"
+#include <curl/curl.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <ctime>
 #include <cstdlib>
 #include <cstdio>
-#include <cassert>
-#include <stdexcept>
-#include <algorithm>
-#include <chrono>
-#include <iomanip>
-#include <optional>
-#include <thread>
-#include <regex>
-#include <future>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <sys/select.h>
-#include <poll.h>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <iterator>
+#include <memory>
 #include <mutex>
-#include <atomic>
-#include "async_io.hpp"
-#include "utils.hpp"
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-#include <openssl/pem.h>
-#include <openssl/bio.h>
-
-
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-#  define COMPAT_SSL_library_init()         SSL_library_init()
-#  define COMPAT_SSL_load_error_strings()   SSL_load_error_strings()
-#  define COMPAT_OpenSSL_add_all_algorithms() OpenSSL_add_all_algorithms()
-#else
-#  define COMPAT_SSL_library_init()           ((void)0)
-#  define COMPAT_SSL_load_error_strings()     ((void)0)
-#  define COMPAT_OpenSSL_add_all_algorithms() ((void)0)
-#endif
-
-
-#include <zlib.h>         
-
-#ifdef HAVE_BROTLI
-#  include <brotli/decode.h>
-#endif
-
-#ifdef HAVE_ZSTD
-#  include <zstd.h>
-#endif
-
-#include "probe.hpp"
-
-static constexpr int MAX_RESPONSE = 65536;
-static constexpr int CHUNK        = 4096;
+#include <random>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 extern std::atomic<bool> terminate_flag;
-bool normalize_ip_string(const std::string& in, std::string& out);         
-bool resolve_domain_to_ip(const std::string& domain, std::string& out_ip); 
-bool custom_dns_configured();                                                       
-bool resolve_ptr_via_configured_dns(const std::string& ip, std::string& out_domain);
+extern std::vector<std::string> g_dns_servers;
 
-namespace vlog {
+namespace discover {
 
-inline bool color_enabled() {
-    static const bool enabled = (isatty(fileno(stderr)) != 0);
-    return enabled;
-}
-
-inline const char* RESET()  { return color_enabled() ? "\x1b[0m"  : ""; }
-inline const char* BOLD()   { return color_enabled() ? "\x1b[1m"  : ""; }
-inline const char* CYAN()   { return color_enabled() ? "\x1b[36m" : ""; } 
-inline const char* GREEN()  { return color_enabled() ? "\x1b[32m" : ""; } 
-inline const char* RED()    { return color_enabled() ? "\x1b[31m" : ""; } 
-inline const char* YELLOW() { return color_enabled() ? "\x1b[33m" : ""; } 
-inline const char* GRAY()   { return color_enabled() ? "\x1b[90m" : ""; } 
-inline std::string pad(int level) { return std::string((size_t)level * 3, ' '); }
-inline void phase(bool verbose, const std::string& title) {
-    if (!verbose) return;
-    fprintf(stderr, "\n%s%s%s%s\n", CYAN(), BOLD(), title.c_str(), RESET());
-}
-
-inline void line(bool verbose, const std::string& msg, int level = 1) {
-    if (!verbose) return;
-    fprintf(stderr, "%s%s·%s %s\n", pad(level).c_str(), GRAY(), RESET(), msg.c_str());
-}
-
-inline void ok(bool verbose, const std::string& msg, int level = 1) {
-    if (!verbose) return;
-    fprintf(stderr, "%s%s✓%s %s\n", pad(level).c_str(), GREEN(), RESET(), msg.c_str());
-}
-
-inline void fail(bool verbose, const std::string& msg, int level = 1) {
-    if (!verbose) return;
-    fprintf(stderr, "%s%s✗%s %s\n", pad(level).c_str(), RED(), RESET(), msg.c_str());
-}
-
-inline void warn(bool verbose, const std::string& msg, int level = 1) {
-    if (!verbose) return;
-    fprintf(stderr, "%s%s!%s %s\n", pad(level).c_str(), YELLOW(), RESET(), msg.c_str());
-}
-
-inline void kv(bool verbose, const std::string& key, const std::string& val, int level = 1) {
-    if (!verbose) return;
-    fprintf(stderr, "%s%s%-11s%s: %s\n", pad(level).c_str(), GRAY(), key.c_str(), RESET(), val.c_str());
-}
-
-inline void section(bool verbose, const std::string& title) {
-    if (!verbose) return;
-    fprintf(stderr, "\n%s%s── %s ──%s\n", GRAY(), BOLD(), title.c_str(), RESET());
-}
-
-} 
-
-struct TlsCertInfo {
-    std::string subject;         
-    std::string issuer;           
-    std::string not_before;       
-    std::string not_after;        
-    std::string serial;           
-    std::string fingerprint_sha1; 
-    std::string fingerprint_sha256; 
-    std::vector<std::string> sans; 
-    std::string tls_version;     
-    std::string cipher;           
-    bool        verify_ok = false; 
-    std::string verify_error;     
-    bool        populated = false; 
-
-    void print(std::ostream &out) const {
-        if (!populated) return;
-        auto tls_emit = [&](const char *label, const std::string &val, size_t maxlen = 36) {
-            if (val.empty()) return;
-            std::string clean;
-            clean.reserve(val.size());
-            bool in_ws = false;
-            for (unsigned char c : val) {
-                if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
-                    if (!in_ws) { clean += ' '; in_ws = true; }
-                } else { clean += (char)c; in_ws = false; }
-            }
-            while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
-            while (!clean.empty() && clean.back()  == ' ') clean.pop_back();
-            if (clean.size() > maxlen) clean = clean.substr(0, maxlen - 3) + "...";
-            out << "  |  " << std::left << std::setw(13) << label << ": " << clean << "\n";
-        };
-    }
+static const Country kCountries[] = {
+    {"AF","AFG","Afghanistan",""},
+    {"AL","ALB","Albania",""},
+    {"DZ","DZA","Algeria",""},
+    {"AD","AND","Andorra",""},
+    {"AO","AGO","Angola",""},
+    {"AG","ATG","Antigua and Barbuda","antigua|barbuda"},
+    {"AR","ARG","Argentina",""},
+    {"AM","ARM","Armenia",""},
+    {"AU","AUS","Australia",""},
+    {"AT","AUT","Austria",""},
+    {"AZ","AZE","Azerbaijan",""},
+    {"BS","BHS","Bahamas","the bahamas"},
+    {"BH","BHR","Bahrain",""},
+    {"BD","BGD","Bangladesh",""},
+    {"BB","BRB","Barbados",""},
+    {"BY","BLR","Belarus","byelorussia"},
+    {"BE","BEL","Belgium",""},
+    {"BZ","BLZ","Belize",""},
+    {"BJ","BEN","Benin",""},
+    {"BT","BTN","Bhutan",""},
+    {"BO","BOL","Bolivia","plurinational state of bolivia"},
+    {"BA","BIH","Bosnia and Herzegovina","bosnia|herzegovina|bosnia herzegovina"},
+    {"BW","BWA","Botswana",""},
+    {"BR","BRA","Brazil","brasil"},
+    {"BN","BRN","Brunei","brunei darussalam"},
+    {"BG","BGR","Bulgaria",""},
+    {"BF","BFA","Burkina Faso",""},
+    {"BI","BDI","Burundi",""},
+    {"CV","CPV","Cabo Verde","cape verde"},
+    {"KH","KHM","Cambodia","kampuchea"},
+    {"CM","CMR","Cameroon",""},
+    {"CA","CAN","Canada",""},
+    {"CF","CAF","Central African Republic","car"},
+    {"TD","TCD","Chad",""},
+    {"CL","CHL","Chile",""},
+    {"CN","CHN","China","prc|peoples republic of china|mainland china"},
+    {"CO","COL","Colombia",""},
+    {"KM","COM","Comoros",""},
+    {"CG","COG","Congo","republic of the congo|congo brazzaville|congo republic"},
+    {"CD","COD","Democratic Republic of the Congo","drc|dr congo|congo kinshasa|congo democratic republic|zaire"},
+    {"CR","CRI","Costa Rica",""},
+    {"CI","CIV","Cote d'Ivoire","ivory coast|cote divoire"},
+    {"HR","HRV","Croatia",""},
+    {"CU","CUB","Cuba",""},
+    {"CY","CYP","Cyprus",""},
+    {"CZ","CZE","Czechia","czech republic"},
+    {"DK","DNK","Denmark",""},
+    {"DJ","DJI","Djibouti",""},
+    {"DM","DMA","Dominica",""},
+    {"DO","DOM","Dominican Republic","dominicana"},
+    {"EC","ECU","Ecuador",""},
+    {"EG","EGY","Egypt",""},
+    {"SV","SLV","El Salvador",""},
+    {"GQ","GNQ","Equatorial Guinea",""},
+    {"ER","ERI","Eritrea",""},
+    {"EE","EST","Estonia",""},
+    {"SZ","SWZ","Eswatini","swaziland"},
+    {"ET","ETH","Ethiopia",""},
+    {"FJ","FJI","Fiji",""},
+    {"FI","FIN","Finland",""},
+    {"FR","FRA","France",""},
+    {"GA","GAB","Gabon",""},
+    {"GM","GMB","Gambia","the gambia"},
+    {"GE","GEO","Georgia","sakartvelo"},
+    {"DE","DEU","Germany","deutschland"},
+    {"GH","GHA","Ghana",""},
+    {"GR","GRC","Greece","hellas"},
+    {"GD","GRD","Grenada",""},
+    {"GT","GTM","Guatemala",""},
+    {"GN","GIN","Guinea",""},
+    {"GW","GNB","Guinea-Bissau","guinea bissau"},
+    {"GY","GUY","Guyana",""},
+    {"HT","HTI","Haiti",""},
+    {"HN","HND","Honduras",""},
+    {"HU","HUN","Hungary",""},
+    {"IS","ISL","Iceland",""},
+    {"IN","IND","India","bharat"},
+    {"ID","IDN","Indonesia",""},
+    {"IR","IRN","Iran","islamic republic of iran|persia"},
+    {"IQ","IRQ","Iraq",""},
+    {"IE","IRL","Ireland","eire|republic of ireland"},
+    {"IL","ISR","Israel",""},
+    {"IT","ITA","Italy","italia"},
+    {"JM","JAM","Jamaica",""},
+    {"JP","JPN","Japan","nippon"},
+    {"JO","JOR","Jordan",""},
+    {"KZ","KAZ","Kazakhstan",""},
+    {"KE","KEN","Kenya",""},
+    {"KI","KIR","Kiribati",""},
+    {"KW","KWT","Kuwait",""},
+    {"KG","KGZ","Kyrgyzstan","kirghizia|kyrgyz republic"},
+    {"LA","LAO","Laos","lao|lao pdr|lao peoples democratic republic"},
+    {"LV","LVA","Latvia",""},
+    {"LB","LBN","Lebanon",""},
+    {"LS","LSO","Lesotho",""},
+    {"LR","LBR","Liberia",""},
+    {"LY","LBY","Libya",""},
+    {"LI","LIE","Liechtenstein",""},
+    {"LT","LTU","Lithuania",""},
+    {"LU","LUX","Luxembourg",""},
+    {"MG","MDG","Madagascar",""},
+    {"MW","MWI","Malawi",""},
+    {"MY","MYS","Malaysia",""},
+    {"MV","MDV","Maldives",""},
+    {"ML","MLI","Mali",""},
+    {"MT","MLT","Malta",""},
+    {"MH","MHL","Marshall Islands",""},
+    {"MR","MRT","Mauritania",""},
+    {"MU","MUS","Mauritius",""},
+    {"MX","MEX","Mexico",""},
+    {"FM","FSM","Micronesia","federated states of micronesia"},
+    {"MD","MDA","Moldova","republic of moldova"},
+    {"MC","MCO","Monaco",""},
+    {"MN","MNG","Mongolia",""},
+    {"ME","MNE","Montenegro",""},
+    {"MA","MAR","Morocco",""},
+    {"MZ","MOZ","Mozambique",""},
+    {"MM","MMR","Myanmar","burma"},
+    {"NA","NAM","Namibia",""},
+    {"NR","NRU","Nauru",""},
+    {"NP","NPL","Nepal",""},
+    {"NL","NLD","Netherlands","holland|the netherlands"},
+    {"NZ","NZL","New Zealand","aotearoa"},
+    {"NI","NIC","Nicaragua",""},
+    {"NE","NER","Niger",""},
+    {"NG","NGA","Nigeria",""},
+    {"KP","PRK","North Korea","dprk|democratic peoples republic of korea|korea north|n korea"},
+    {"MK","MKD","North Macedonia","macedonia"},
+    {"NO","NOR","Norway",""},
+    {"OM","OMN","Oman",""},
+    {"PK","PAK","Pakistan",""},
+    {"PW","PLW","Palau",""},
+    {"PA","PAN","Panama",""},
+    {"PG","PNG","Papua New Guinea",""},
+    {"PY","PRY","Paraguay",""},
+    {"PE","PER","Peru",""},
+    {"PH","PHL","Philippines","the philippines"},
+    {"PL","POL","Poland",""},
+    {"PT","PRT","Portugal",""},
+    {"QA","QAT","Qatar",""},
+    {"RO","ROU","Romania",""},
+    {"RU","RUS","Russia","russian federation"},
+    {"RW","RWA","Rwanda",""},
+    {"KN","KNA","Saint Kitts and Nevis","st kitts and nevis|saint kitts|st kitts|st christopher|kitts and nevis"},
+    {"LC","LCA","Saint Lucia","st lucia"},
+    {"VC","VCT","Saint Vincent and the Grenadines","st vincent and the grenadines|saint vincent|st vincent|grenadines"},
+    {"WS","WSM","Samoa",""},
+    {"SM","SMR","San Marino",""},
+    {"ST","STP","Sao Tome and Principe","sao tome|sao tome e principe"},
+    {"SA","SAU","Saudi Arabia","ksa"},
+    {"SN","SEN","Senegal",""},
+    {"RS","SRB","Serbia",""},
+    {"SC","SYC","Seychelles",""},
+    {"SL","SLE","Sierra Leone",""},
+    {"SG","SGP","Singapore",""},
+    {"SK","SVK","Slovakia","slovak republic"},
+    {"SI","SVN","Slovenia",""},
+    {"SB","SLB","Solomon Islands",""},
+    {"SO","SOM","Somalia",""},
+    {"ZA","ZAF","South Africa","rsa"},
+    {"KR","KOR","South Korea","republic of korea|korea south|s korea|rok"},
+    {"SS","SSD","South Sudan",""},
+    {"ES","ESP","Spain","espana"},
+    {"LK","LKA","Sri Lanka","ceylon"},
+    {"SD","SDN","Sudan",""},
+    {"SR","SUR","Suriname",""},
+    {"SE","SWE","Sweden",""},
+    {"CH","CHE","Switzerland","swiss"},
+    {"SY","SYR","Syria","syrian arab republic"},
+    {"TJ","TJK","Tajikistan",""},
+    {"TZ","TZA","Tanzania","united republic of tanzania"},
+    {"TH","THA","Thailand","siam"},
+    {"TL","TLS","Timor-Leste","east timor|timor leste"},
+    {"TG","TGO","Togo",""},
+    {"TO","TON","Tonga",""},
+    {"TT","TTO","Trinidad and Tobago","trinidad|tobago"},
+    {"TN","TUN","Tunisia",""},
+    {"TR","TUR","Turkiye","turkey"},
+    {"TM","TKM","Turkmenistan",""},
+    {"TV","TUV","Tuvalu",""},
+    {"UG","UGA","Uganda",""},
+    {"UA","UKR","Ukraine",""},
+    {"AE","ARE","United Arab Emirates","uae|emirates"},
+    {"GB","GBR","United Kingdom","uk|britain|great britain|united kingdom of great britain and northern ireland"},
+    {"US","USA","United States","usa|america|united states of america|the united states|us of a"},
+    {"UY","URY","Uruguay",""},
+    {"UZ","UZB","Uzbekistan",""},
+    {"VU","VUT","Vanuatu",""},
+    {"VE","VEN","Venezuela","bolivarian republic of venezuela"},
+    {"VN","VNM","Vietnam","viet nam"},
+    {"YE","YEM","Yemen",""},
+    {"ZM","ZMB","Zambia",""},
+    {"ZW","ZWE","Zimbabwe",""},
+    {"VA","VAT","Vatican City","holy see|vatican"},
+    {"PS","PSE","Palestine","state of palestine|palestinian territories|palestinian territory"},
+    {"TW","TWN","Taiwan","republic of china|chinese taipei|formosa"},
+    {"HK","HKG","Hong Kong","hong kong sar"},
+    {"MO","MAC","Macao","macau|macao sar"},
+    {"XK","XKX","Kosovo",""},
 };
+static constexpr size_t kCountryCount = sizeof(kCountries) / sizeof(kCountries[0]);
+static_assert(kCountryCount == 199, "country table must hold 195 UN members/observers + 4 extras");
+size_t country_count() { return kCountryCount; }
 
-static std::string asn1_time_to_str(const ASN1_TIME *t)
-{
-    if (!t) return "";
-    BIO *bio = BIO_new(BIO_s_mem());
-    ASN1_TIME_print(bio, t);
-    char buf[128] = {};
-    BIO_read(bio, buf, sizeof(buf) - 1);
-    BIO_free(bio);
-    return buf;
+namespace {
+
+inline bool is_alnum_ascii(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+inline char lower_ascii(char c) { return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c; }
+
+constexpr char kLatin1[65] =
+    "AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTs"
+    "aaaaaaaceeeeiiiidnooooo/ouuuuyty";
+
+char latin1_base(unsigned char second) {
+    if (second < 0x80 || second > 0xBF) return 0;
+    const char m = kLatin1[second - 0x80];
+    return is_alnum_ascii(static_cast<unsigned char>(m)) ? lower_ascii(m) : 0;
 }
 
-static std::string x509_name_to_str(X509_NAME *name)
-{
-    if (!name) return "";
-    BIO *bio = BIO_new(BIO_s_mem());
-    X509_NAME_print_ex(bio, name, 0, XN_FLAG_RFC2253);
-    char buf[512] = {};
-    BIO_read(bio, buf, sizeof(buf) - 1);
-    BIO_free(bio);
-    return buf;
-}
-
-static std::string hex_encode(const unsigned char *data, unsigned int len)
-{
-    static const char hex[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(len * 3);
-    for (unsigned int i = 0; i < len; ++i) {
-        if (i) out += ':';
-        out += hex[(data[i] >> 4) & 0xf];
-        out += hex[ data[i]       & 0xf];
-    }
-    return out;
-}
-
-static std::vector<std::string> extract_sans(X509 *cert)
-{
-    std::vector<std::string> out;
-    GENERAL_NAMES *gnames = (GENERAL_NAMES *)X509_get_ext_d2i(
-                                cert, NID_subject_alt_name, nullptr, nullptr);
-    if (!gnames) return out;
-    int n = sk_GENERAL_NAME_num(gnames);
-    for (int i = 0; i < n; ++i) {
-        GENERAL_NAME *gn = sk_GENERAL_NAME_value(gnames, i);
-        if (gn->type == GEN_DNS) {
-            const char *s = (const char *)ASN1_STRING_get0_data(gn->d.dNSName);
-            if (s) out.push_back(std::string("DNS:") + s);
-        } else if (gn->type == GEN_IPADD) {
-            const unsigned char *ip_bytes = ASN1_STRING_get0_data(gn->d.iPAddress);
-            int ip_len = ASN1_STRING_length(gn->d.iPAddress);
-            if (ip_len == 4) {
-                char buf[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, ip_bytes, buf, sizeof(buf));
-                out.push_back(std::string("IP:") + buf);
-            } else if (ip_len == 16) {
-                char buf[INET6_ADDRSTRLEN];
-                inet_ntop(AF_INET6, ip_bytes, buf, sizeof(buf));
-                out.push_back(std::string("IP:") + buf);
-            }
-        }
-    }
-    GENERAL_NAMES_free(gnames);
-    return out;
-}
-
-static TlsCertInfo extract_tls_cert_info(SSL *ssl)
-{
-    TlsCertInfo info;
-    info.populated = true;
-
-    // TLS version & cipher
-    info.tls_version = SSL_get_version(ssl) ? SSL_get_version(ssl) : "unknown";
-    const SSL_CIPHER *cipher = SSL_get_current_cipher(ssl);
-    info.cipher = cipher ? SSL_CIPHER_get_name(cipher) : "unknown";
-
-    // Verify result
-    long vresult = SSL_get_verify_result(ssl);
-    info.verify_ok = (vresult == X509_V_OK);
-    if (!info.verify_ok)
-        info.verify_error = X509_verify_cert_error_string(vresult);
-
-    // Peer certificate
-    X509 *cert = SSL_get_peer_certificate(ssl);
-    if (!cert) return info;
-
-    info.subject = x509_name_to_str(X509_get_subject_name(cert));
-    info.issuer  = x509_name_to_str(X509_get_issuer_name(cert));
-    info.not_before = asn1_time_to_str(X509_get_notBefore(cert));
-    info.not_after  = asn1_time_to_str(X509_get_notAfter(cert));
-
-    // Serial number
-    {
-        BIGNUM *bn = ASN1_INTEGER_to_BN(X509_get_serialNumber(cert), nullptr);
-        if (bn) {
-            char *hex = BN_bn2hex(bn);
-            if (hex) { info.serial = hex; OPENSSL_free(hex); }
-            BN_free(bn);
-        }
-    }
-
-    // Fingerprints
-    {
-        unsigned char sha1[EVP_MAX_MD_SIZE], sha256[EVP_MAX_MD_SIZE];
-        unsigned int sha1_len = 0, sha256_len = 0;
-        X509_digest(cert, EVP_sha1(),   sha1,   &sha1_len);
-        X509_digest(cert, EVP_sha256(), sha256, &sha256_len);
-        info.fingerprint_sha1   = hex_encode(sha1,   sha1_len);
-        info.fingerprint_sha256 = hex_encode(sha256, sha256_len);
-    }
-
-    // SANs
-    info.sans = extract_sans(cert);
-
-    X509_free(cert);
-    return info;
-}
-
-static std::string extract_header(const std::vector<u8> &resp,
-                                  const std::string     &field_name)
-{
-
-    const size_t hard_cap = std::min(resp.size(), (size_t)8192);
-    size_t header_end = hard_cap;
-
-    // Search for \r\n\r\n
-    for (size_t i = 0; i + 3 < hard_cap; ++i) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            header_end = i + 4;
-            break;
-        }
-    }
-    if (header_end == hard_cap) {
-        for (size_t i = 0; i + 1 < hard_cap; ++i) {
-            if (resp[i]=='\n' && resp[i+1]=='\n') {
-                header_end = i + 2;
-                break;
-            }
-        }
-    }
-    const std::string needle_lc = [&]() {
-        std::string n = field_name;
-        for (char &c : n) c = (char)tolower((unsigned char)c);
-        return n;
-    }();
-
-    size_t pos = 0;
-    while (pos < header_end && resp[pos] != '\r' && resp[pos] != '\n') ++pos;
-    if (pos < header_end && resp[pos] == '\r') ++pos;
-    if (pos < header_end && resp[pos] == '\n') ++pos;
-
-    while (pos < header_end) {
-        size_t line_start = pos;
-        while (pos < header_end && resp[pos] != '\r' && resp[pos] != '\n') ++pos;
-        size_t line_end = pos;
-        if (pos < header_end && resp[pos] == '\r') ++pos;
-        if (pos < header_end && resp[pos] == '\n') ++pos;
-
-        if (line_end == line_start) break; 
-        size_t colon = line_start;
-        while (colon < line_end && resp[colon] != ':') ++colon;
-        if (colon >= line_end) continue;
-        size_t field_len = colon - line_start;
-        if (field_len != needle_lc.size()) continue;
-        bool match = true;
-        for (size_t k = 0; k < field_len; ++k) {
-            if ((char)tolower((unsigned char)resp[line_start + k]) != needle_lc[k]) {
-                match = false; break;
-            }
-        }
-        if (!match) continue;
-        size_t val_start = colon + 1;
-        while (val_start < line_end &&
-               (resp[val_start] == ' ' || resp[val_start] == '\t')) ++val_start;
-
-        size_t val_end = line_end;
-        while (val_end > val_start &&
-               (resp[val_end - 1] == ' ' || resp[val_end - 1] == '\t')) --val_end;
-
-        return std::string(resp.begin() + (std::ptrdiff_t)val_start,
-                           resp.begin() + (std::ptrdiff_t)val_end);
-    }
-    return "";
-}
-
-// Generic header collector: parses every "Name: value" line in the response
-// header block into a map keyed by lowercased header name. Unlike
-// extract_header() (which only knows about one hardcoded field name at a
-// time), this lets signatures.conf reference ANY response header directly
-// by name -- new header-based signatures need zero C++ changes.
-// First occurrence of a repeated header wins, matching extract_header()'s
-// behavior. Values are right/left trimmed of spaces/tabs the same way.
-//
-// dup_out (optional): if non-null, records "Name: first-value | second-value"
-// for every header name seen more than once WITH DIFFERING values. A
-// duplicated Server/X-Powered-By/Content-Length/etc. header with conflicting
-// values is a classic sign of response splitting, a chunked-proxy rewrite,
-// or a deliberately spoofed banner sitting in front of the real one -- and
-// under the old first-wins-silently behavior that second value was thrown
-// away with no trace at all, so this kind of tampering was invisible to the
-// scanner. Exact-duplicate repeats (same name, same value) are NOT flagged;
-// that's normal for some servers/proxies and not a useful signal.
-static std::map<std::string, std::string> collect_all_headers(
-    const std::vector<u8> &resp,
-    std::vector<std::string> *dup_out = nullptr)
-{
-    std::map<std::string, std::string> headers;
-
-    const size_t hard_cap = std::min(resp.size(), (size_t)8192);
-    size_t header_end = hard_cap;
-
-    for (size_t i = 0; i + 3 < hard_cap; ++i) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            header_end = i + 4;
-            break;
-        }
-    }
-    if (header_end == hard_cap) {
-        for (size_t i = 0; i + 1 < hard_cap; ++i) {
-            if (resp[i]=='\n' && resp[i+1]=='\n') {
-                header_end = i + 2;
-                break;
-            }
-        }
-    }
-
-    size_t pos = 0;
-    // Skip the status line.
-    while (pos < header_end && resp[pos] != '\r' && resp[pos] != '\n') ++pos;
-    if (pos < header_end && resp[pos] == '\r') ++pos;
-    if (pos < header_end && resp[pos] == '\n') ++pos;
-
-    while (pos < header_end) {
-        size_t line_start = pos;
-        while (pos < header_end && resp[pos] != '\r' && resp[pos] != '\n') ++pos;
-        size_t line_end = pos;
-        if (pos < header_end && resp[pos] == '\r') ++pos;
-        if (pos < header_end && resp[pos] == '\n') ++pos;
-
-        if (line_end == line_start) break; // blank line -> end of headers
-
-        size_t colon = line_start;
-        while (colon < line_end && resp[colon] != ':') ++colon;
-        if (colon >= line_end) continue; // malformed line, no colon
-
-        std::string name(resp.begin() + (std::ptrdiff_t)line_start,
-                         resp.begin() + (std::ptrdiff_t)colon);
-        for (char &c : name) c = (char)tolower((unsigned char)c);
-
-        size_t val_start = colon + 1;
-        while (val_start < line_end &&
-               (resp[val_start] == ' ' || resp[val_start] == '\t')) ++val_start;
-        size_t val_end = line_end;
-        while (val_end > val_start &&
-               (resp[val_end - 1] == ' ' || resp[val_end - 1] == '\t')) --val_end;
-
-        std::string value(resp.begin() + (std::ptrdiff_t)val_start,
-                          resp.begin() + (std::ptrdiff_t)val_end);
-
-        static const std::set<std::string> kMultiValueHeaders = { "set-cookie" };
-
-        auto existing = headers.find(name);
-        if (existing != headers.end()) {
-            if (dup_out && existing->second != value &&
-                !kMultiValueHeaders.count(name)) {
-                std::string entry = name + ": \"" + existing->second + "\" | \"" + value + "\"";
-                bool already_recorded = false;
-                for (const auto &d : *dup_out) {
-                    if (d == entry) { already_recorded = true; break; }
-                }
-                if (!already_recorded) dup_out->push_back(entry);
-            }
-            continue;
-        }
-        headers.emplace(std::move(name), std::move(value));
-    }
-
-    return headers;
-}
-
-static std::string extract_status_line(const std::vector<u8> &resp)
-{
-    const size_t limit = std::min(resp.size(), (size_t)256);
-    std::string  s(resp.begin(), resp.begin() + (std::ptrdiff_t)limit);
-    auto pos = s.find("\r\n");
-    if (pos == std::string::npos) pos = s.find('\n');
-    return pos != std::string::npos ? s.substr(0, pos) : s;
-}
-
-static int extract_status_code(const std::vector<u8> &resp)
-{
-    if (resp.size() < 12) return 0;
-    // Bytes 9–11 are the 3-digit status code in "HTTP/x.y NNN"
-    if (resp[0]!='H'||resp[1]!='T'||resp[2]!='T'||resp[3]!='P'||resp[4]!='/') return 0;
-    if (!isdigit(resp[9]) || !isdigit(resp[10]) || !isdigit(resp[11])) return 0;
-    return (resp[9]-'0')*100 + (resp[10]-'0')*10 + (resp[11]-'0');
-}
-
-/* Extract HTML <title> tag content - simple and robust */
-static std::string extract_title(const std::vector<u8> &resp)
-{
-    size_t limit = std::min(resp.size(), (size_t)65536);
-    std::string html(resp.begin(), resp.begin() + (std::ptrdiff_t)limit);
-    
-    // Convert to lowercase for case-insensitive search
-    std::string lower_html = html;
-    for (char &c : lower_html) {
-        c = tolower((unsigned char)c);
-    }
-    
-    // Find <title tag
-    size_t start = lower_html.find("<title");
-    if (start == std::string::npos) {
-        return "";
-    }
-    
-    // Find the > that closes the opening tag
-    size_t gt = html.find('>', start);
-    if (gt == std::string::npos) {
-        return "";
-    }
-    
-    // Find </title>
-    size_t end = lower_html.find("</title>", gt);
-    if (end == std::string::npos) {
-        // Try to find next < or end of head as fallback
-        end = lower_html.find("</head", gt);
-        if (end == std::string::npos) {
-            end = lower_html.length();
-        }
-    }
-    
-    // Extract title
-    std::string title = html.substr(gt + 1, end - gt - 1);
-    
-    // Clean up whitespace
-    while (!title.empty() && isspace((unsigned char)title.front())) title.erase(title.begin());
-    while (!title.empty() && isspace((unsigned char)title.back())) title.pop_back();
-    
-    // Decode common HTML entities
-    size_t pos;
-    while ((pos = title.find("&amp;")) != std::string::npos) title.replace(pos, 5, "&");
-    while ((pos = title.find("&lt;")) != std::string::npos)  title.replace(pos, 4, "<");
-    while ((pos = title.find("&gt;")) != std::string::npos)  title.replace(pos, 4, ">");
-    while ((pos = title.find("&quot;")) != std::string::npos) title.replace(pos, 6, "\"");
-    while ((pos = title.find("&#39;")) != std::string::npos) title.replace(pos, 5, "'");
-    while ((pos = title.find("&nbsp;")) != std::string::npos) title.replace(pos, 6, " ");
-    
-    // Normalize multiple spaces
-    std::string result;
-    bool last_was_space = false;
-    for (char c : title) {
-        if (isspace((unsigned char)c)) {
-            if (!last_was_space) {
-                result += ' ';
-                last_was_space = true;
-            }
+template <class F>
+void scan_alnum(std::string_view in, F&& emit) {
+    for (size_t i = 0; i < in.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c < 0x80) {
+            emit(is_alnum_ascii(c) ? lower_ascii(static_cast<char>(c)) : '\0');
+        } else if (c == 0xC3 && i + 1 < in.size() && static_cast<unsigned char>(in[i + 1]) >= 0x80 &&
+                   static_cast<unsigned char>(in[i + 1]) <= 0xBF) {
+            emit(latin1_base(static_cast<unsigned char>(in[i + 1])));
+            ++i;
         } else {
-            result += c;
-            last_was_space = false;
+            emit('\0');
         }
     }
-    
-    // Trim again after normalization
-    while (!result.empty() && result.front() == ' ') result.erase(result.begin());
-    while (!result.empty() && result.back() == ' ') result.pop_back();
-    
-    // Limit length
-    if (result.size() > 200) result = result.substr(0, 200) + "...";
-    
-    return result;
 }
 
-static bool basename_looks_interesting(const std::string &val)
-{
-    static const char *kPrefixes[] = {
-        "manifest", "asset-manifest", "package", "version", "site"
-    };
-    std::string path = val;
-    size_t qpos = path.find('?');
-    if (qpos != std::string::npos) path = path.substr(0, qpos);
-    size_t slash = path.find_last_of('/');
-    std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
-    std::string lower = base;
-    for (char &c : lower) c = (char)tolower((unsigned char)c);
-
-    if (lower.size() < 5 || lower.compare(lower.size() - 5, 5, ".json") != 0)
-        return false;
-    for (auto *pfx : kPrefixes) {
-        size_t plen = std::strlen(pfx);
-        if (lower.compare(0, plen, pfx) != 0) continue;
-        if (lower.size() == plen + 5) return true;             
-        char sep = lower[plen];
-        if (sep == '-' || sep == '.' || sep == '_') return true;
-    }
-    return false;
-}
-
-static bool path_looks_interesting(const std::string &lower_val)
-{
-    static const char *kSubstrs[] = {
-        "/version", "/api/version", "/status", "/health"
-    };
-    for (auto *kw : kSubstrs)
-        if (lower_val.find(kw) != std::string::npos) return true;
-    return false;
-}
-
-
-static void scan_link_rel_manifest(const std::string &html, std::vector<std::string> &out,
-                                   size_t cap)
-{
-    size_t pos = 0;
-    while (out.size() < cap) {
-        size_t lt = html.find("<link", pos);
-        if (lt == std::string::npos) break;
-        size_t gt = html.find('>', lt);
-        if (gt == std::string::npos) break;
-        gt = std::min(gt, lt + 500);
-        std::string tag = html.substr(lt, gt - lt);
-        pos = lt + 5;
-
-        std::string tag_lc = tag;
-        for (char &c : tag_lc) c = (char)tolower((unsigned char)c);
-        if (tag_lc.find("rel=\"manifest\"") == std::string::npos &&
-            tag_lc.find("rel='manifest'") == std::string::npos)
-            continue;
-
-        size_t hpos = tag_lc.find("href=");
-        if (hpos == std::string::npos) continue;
-        size_t qpos = hpos + 5;
-        if (qpos >= tag.size() || (tag[qpos] != '"' && tag[qpos] != '\'')) continue;
-        char quote = tag[qpos];
-        size_t end = tag.find(quote, qpos + 1);
-        if (end == std::string::npos) continue;
-        std::string val = tag.substr(qpos + 1, end - qpos - 1);
-
-        if (val.empty() || val[0] == '#') continue;
-        if (val.rfind("http://", 0) == 0 || val.rfind("https://", 0) == 0 ||
-            val.rfind("//", 0) == 0) continue;   // cross-origin -- don't follow
-
-        if (std::find(out.begin(), out.end(), val) == out.end())
-            out.push_back(val);
-    }
-}
-
-static std::vector<std::string> extract_asset_paths(const std::vector<u8> &resp)
-{
-    std::vector<std::string> out;
-    const size_t limit = std::min(resp.size(), (size_t)65536);
-    std::string html(resp.begin(), resp.begin() + (std::ptrdiff_t)limit);
-    const size_t kCap = 12;
-    scan_link_rel_manifest(html, out, kCap);
-    auto scan_attr = [&](const char *attr) {
-        size_t pos = 0;
-        const size_t attr_len = std::strlen(attr);
-        while (out.size() < kCap) {
-            size_t apos = html.find(attr, pos);
-            if (apos == std::string::npos) break;
-            size_t qpos = apos + attr_len;
-            if (qpos >= html.size() || html[qpos] != '"') { pos = apos + attr_len; continue; }
-            size_t end = html.find('"', qpos + 1);
-            if (end == std::string::npos) break;
-            std::string val = html.substr(qpos + 1, end - qpos - 1);
-            pos = end + 1;
-
-            if (val.empty() || val[0] == '#') continue;
-            if (val.rfind("http://", 0) == 0 || val.rfind("https://", 0) == 0 ||
-                val.rfind("//", 0) == 0) continue;   // cross-origin -- don't follow
-            if (std::find(out.begin(), out.end(), val) != out.end()) continue; // dedup
-
-            std::string lower = val;
-            for (char &c : lower) c = (char)tolower((unsigned char)c);
-
-            if (basename_looks_interesting(val) || path_looks_interesting(lower))
-                out.push_back(val);
-        }
-    };
-
-    scan_attr("href=");
-    scan_attr("src=");
+std::string normalize(std::string_view in) {
+    std::string out;
+    out.reserve(in.size());
+    scan_alnum(in, [&](char c) { if (c) out.push_back(c); });
     return out;
 }
 
-static std::string extract_report_to_group(const std::vector<u8> &resp)
-{
-    std::string raw = extract_header(resp, "Report-To");
-    if (raw.empty()) return "";
-    size_t pos = raw.find("\"group\"");
-    if (pos == std::string::npos) return "";
-    pos = raw.find(':', pos);
-    if (pos == std::string::npos) return "";
-    pos = raw.find('"', pos);
-    if (pos == std::string::npos) return "";
-    size_t end = raw.find('"', pos + 1);
-    if (end == std::string::npos) return "";
-    return raw.substr(pos + 1, end - pos - 1);
+void tokenize(std::string_view in, std::vector<std::string>& out) {
+    std::string cur;
+    scan_alnum(in, [&](char c) {
+        if (c) {
+            cur.push_back(c);
+        } else if (!cur.empty()) {
+            out.push_back(std::move(cur));
+            cur.clear();
+        }
+    });
+    if (!cur.empty()) out.push_back(std::move(cur));
 }
 
-static std::string extract_coop_report_to(const std::vector<u8> &resp)
-{
-    std::string raw = extract_header(resp, "Cross-Origin-Opener-Policy-Report-Only");
-    if (raw.empty()) return "";
-    size_t pos = raw.find("report-to=");
-    if (pos == std::string::npos) return "";
-    pos += strlen("report-to=");
-    if (pos >= raw.size()) return "";
-    if (raw[pos] == '"') {
-        size_t end = raw.find('"', pos + 1);
-        if (end == std::string::npos) return "";
-        return raw.substr(pos + 1, end - pos - 1);
+void sanitize_inplace(std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x20 || c == 0x7F) { ++i; continue; }
+        if (c == 0xC2 && i + 1 < s.size()) {
+            const unsigned char d = static_cast<unsigned char>(s[i + 1]);
+            if (d >= 0x80 && d <= 0x9F) { i += 2; continue; }
+        }
+        if (c == 0xE2 && i + 2 < s.size()) {
+            const unsigned char d = static_cast<unsigned char>(s[i + 1]);
+            const unsigned char e = static_cast<unsigned char>(s[i + 2]);
+            if ((d == 0x80 && e >= 0xAA && e <= 0xAE) || (d == 0x81 && e >= 0xA6 && e <= 0xA9)) { i += 3; continue; }
+        }
+        out.push_back(s[i]);
+        ++i;
     }
-    // Unquoted value fallback: read until ';', whitespace, or end.
-    size_t end = raw.find_first_of("; \t", pos);
-    return (end == std::string::npos) ? raw.substr(pos) : raw.substr(pos, end - pos);
+    s.swap(out);
 }
 
-struct HttpFingerprint {
-    std::string phase;          // "initial" | "redirect-src" | "redirect-dst"
-                                // | "4xx-plain" | "ssl-after-4xx" | "ssl-after-4xx-redirect-dst"
-    int         status_code  = 0;
-    std::string status_line;
-    std::string server;         // Server: header value
-    std::string osd_name;       // osd-name: header value (alternate identity)
-    std::string powered_by;     // X-Powered-By: (optional)
-    std::string title; 
-    std::string via;            // Via: (optional)
-    std::string x_generator;    // X-Generator: (optional)
-    std::string location;       // Location: present on 3xx
-    std::string redirect_url;   // resolved redirect URL (absolute or path)
-    bool        is_redirect  = false;
-    bool        is_4xx       = false;
-    bool        is_ssl       = false;
-    std::string raw_snippet;    // first 200 bytes of response (printable)
-    TlsCertInfo tls_cert;       // populated when is_ssl == true
+constexpr int kEditMax = 64;
 
-    // Every response header, lowercased-name -> value. Populated generically
-    // for ALL headers (not just the ones with a dedicated field below), so
-    // signatures.conf [platform.*] rules can reference any header by name
-    // via field_any_nonempty without requiring a matching C++ field.
-    std::map<std::string, std::string> raw_headers;
+int edit_distance(std::string_view a, std::string_view b, int limit) {
+    const int la = static_cast<int>(a.size()), lb = static_cast<int>(b.size());
+    if (std::abs(la - lb) > limit || la > kEditMax || lb > kEditMax) return limit + 1;
+    int r0[kEditMax + 1], r1[kEditMax + 1], r2[kEditMax + 1];
+    int* pp = r0;
+    int* p = r1;
+    int* c = r2;
+    for (int j = 0; j <= lb; ++j) p[j] = j;
+    for (int i = 1; i <= la; ++i) {
+        c[0] = i;
+        int row_min = c[0];
+        for (int j = 1; j <= lb; ++j) {
+            const int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            int v = std::min({p[j] + 1, c[j - 1] + 1, p[j - 1] + cost});
+            if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) v = std::min(v, pp[j - 2] + 1);
+            c[j] = v;
+            row_min = std::min(row_min, v);
+        }
+        if (row_min > limit) return limit + 1;
+        int* t = pp;
+        pp = p;
+        p = c;
+        c = t;
+    }
+    return p[lb];
+}
 
-    // ---- Tamper / anomaly signals -----------------------------------------
-    // Populated in fetch_and_fingerprint() from collect_all_headers()'s
-    // dup_out, and in extract_html_body_signals() when the page's own
-    // meta-generator claim contradicts what the structural (path/JS-global/
-    // comment/body) evidence actually points to. Both are heuristics, not
-    // proof -- surfaced to the operator as a flag, not auto-acted-on.
-    std::vector<std::string> duplicate_headers; // "Name: \"v1\" | \"v2\""
-    std::string               tamper_hint;       // e.g. "meta:generator claims WordPress but structural signals point to Joomla (score=5 vs 0)"
+int approx_sub(std::string_view pat, std::string_view text, int limit) {
+    const int m = static_cast<int>(pat.size());
+    if (m == 0 || m > kEditMax) return limit + 1;
+    int prev[kEditMax + 1], cur[kEditMax + 1];
+    for (int i = 0; i <= m; ++i) prev[i] = i;
+    int best = prev[m];
+    for (size_t j = 0; j < text.size() && best > 0; ++j) {
+        cur[0] = 0;
+        for (int i = 1; i <= m; ++i) {
+            const int cost = (pat[i - 1] == text[j]) ? 0 : 1;
+            cur[i] = std::min({prev[i] + 1, cur[i - 1] + 1, prev[i - 1] + cost});
+        }
+        best = std::min(best, cur[m]);
+        std::memcpy(prev, cur, sizeof(int) * static_cast<size_t>(m + 1));
+    }
+    return best;
+}
 
-    // ---- CDN / Cache / Proxy infrastructure headers ----
-    std::string x_amz_cf_pop;
-    std::string x_amz_cf_id;
-    std::string x_cache;
-    std::string cf_ray;
-    std::string cf_cache_status;
-    std::string x_served_by;
-    std::string x_cache_hits;
-    std::string x_cache_lookup;
-    std::string akamai_cache_key;
-    std::string x_amz_request_id;
-    std::string x_amz_id_2;
-    std::string x_amz_version_id;
-    std::string x_amz_sse;
-    std::string x_amz_bucket_region;
-    std::string x_amzn_request_id;
-    std::string x_amzn_error_type;
-    std::string x_via;
-    std::string x_forwarded_for;
-    std::string x_forwarded_proto;
-    std::string x_real_ip;
-    std::string x_haproxy_server_state;
-    std::string x_varnish;
-    std::string x_cacheable;
-    std::string x_cache_status;
-    std::string x_cache_expiry;
-    std::string age;
-    std::string x_drupal_cache;
-    std::string x_drupal_dynamic_cache;
-    std::string x_magento_cache_debug;
-    std::string x_wordpress_cache;
-    std::string x_prestashop_cache;
-    // ---- Security ----
-    std::string www_authenticate;
-    std::string x_content_type_options;
-    std::string strict_transport_security;
-    std::string report_to_group;          // "group" value from Report-To: {"group":"NAME",...}
-    std::string coop_report_to_group;     // report-to="NAME" from Cross-Origin-Opener-Policy-Report-Only
-    // ---- APM / Tracing ----
-    std::string x_newrelic_app_data;
-    std::string x_request_id;
-    std::string server_timing;
-    std::string x_cloud_trace_context;
-    // ---- CDN vendor specifics ----
-    std::string x_cdn;
-    std::string x_edge_location;
-    std::string x_edge_connect;
-    std::string x_edgeconnect_config;
-    std::string x_edgeconnect_method;
-    std::string x_cache_key;
-    std::string x_timer;
-    std::string x_host;
-    std::string x_backend;
-    std::string x_backend_server;
-    std::string x_orig_cache;
-    std::string x_proxy_cache;
-    // ---- AWS extended ----
-    std::string x_amz_storage_class;
-    std::string x_amz_delete_marker;
-    std::string x_amz_expiration;
-    std::string x_amz_replication_status;
-    std::string x_amz_request_charged;
-    // ---- GCP / GCS ----
-    std::string x_google_cache_control;
-    std::string x_google_cache_hit;
-    std::string x_google_load_balancer;
-    std::string x_google_backend;
-    std::string x_google_appengine_app;
-    std::string x_google_appengine_country;
-    std::string x_guploader;
-    std::string x_gcs_bucket;
-    std::string x_gcs_object_generation;
-    // ---- Azure / MS Edge ----
-    std::string x_ms_edge_ref;
-    std::string x_ms_request_id;
-    std::string x_ms_client_request_id;
-    std::string x_ms_correlation_request_id;
-    std::string x_azure_ref;
-    std::string x_azure_request_id;
-    std::string x_msedge_ref;
-    // ---- Load balancer ----
-    std::string x_lb_node;
-    std::string x_lb_tag;
-    std::string x_lb_instance;
-    std::string x_lb_server;
-    std::string x_lb_backend;
-    std::string x_proxy_id;
-    std::string x_proxy_server;
-    std::string x_proxy_backend;
-    std::string x_haproxy_node;
-    std::string x_haproxy_backend;
-    std::string x_haproxy_config;
-    // ---- Nginx / Varnish / Squid ----
-    std::string x_nginx_cache_status;
-    std::string x_nginx_proxy;
-    std::string x_cache_id;
-    std::string x_cache_ttl;
-    std::string x_cache_time;
-    std::string x_cache_request;
-    std::string x_cache_response;
-    std::string x_cache_info;
-    std::string x_squid_error;
-    std::string x_squid_request_id;
-    std::string x_varnish_cache;
-    std::string x_varnish_age;
-    std::string x_varnish_backend;
-    std::string x_varnish_session;
-    std::string x_varnish_hit;
-    std::string x_varnish_ttl;
-    // ---- Auth ----
-    std::string x_auth_token;
-    std::string x_auth_request_redirect;
-    std::string x_auth_request_url;
-    std::string x_auth_user;
-    std::string x_auth_user_groups;
-    std::string x_auth_service;
-    std::string x_csrf_token;
-    std::string x_csrf_param;
-    std::string x_csrf_header;
-    // ---- Debug / CMS ----
-    std::string x_debug;
-    std::string x_debug_token;
-    std::string x_debug_token_link;
-    std::string x_drupal_route;
-    std::string x_drupal_ajax_token;
-    std::string x_wordpress_theme;
-    std::string x_wordpress_plugin;
-    std::string x_magento_store;
-    std::string x_magento_theme;
-    std::string x_magento_layout;
-    std::string x_prestashop_store;
-    std::string x_prestashop_theme;
-    // ---- Timing / Rate limiting ----
-    std::string x_response_time;
-    std::string x_execution_time;
-    std::string x_process_time;
-    std::string x_generator_duration;
-    std::string x_powered_by_duration;
-    std::string x_ratelimit_limit;
-    std::string x_ratelimit_remaining;
-    std::string x_ratelimit_reset;
-    std::string x_ratelimit_retry_after;
-    std::string x_ratelimit_resource;
-    // ---- Misc ----
-    std::string x_mailer;
-    std::string x_php_script;
-    std::string x_php_origin;
-    std::string x_object_version;
-    std::string x_object_delete_marker;
-    std::string x_object_expiry;
-    std::string x_object_storage_class;
-    std::string x_bucket_location;
-    std::string x_bucket_versioning;
+struct Index {
+    std::unordered_map<std::string, const Country*>              exact;
+    std::vector<std::pair<std::string, const Country*>>         names;
+    const Country*                                              by_iso2[26][26] = {};
 
-    // ---- CI/CD / DevOps identity headers ----
-    std::string x_jenkins;            // X-Jenkins: (Jenkins version string)
-    std::string x_hudson;             // X-Hudson: (Hudson / older Jenkins)
-    std::string x_teamcity_node_id;   // X-TeamCity-Node-Id:
-    std::string x_gitlab_meta;        // X-Gitlab-Meta: (GitLab request metadata)
-    std::string x_harness_account;    // x-harness-account: (Harness.io)
+    void add(const std::string& key, const Country* c, bool is_name) {
+        if (key.empty()) return;
+        exact.emplace(key, c);
+        if (is_name) names.emplace_back(key, c);
+    }
 
-    // ---- HTML body signals (meta tags, comments, link tags, JS globals) ----
-    // meta name="generator/software/author/framework/cms/powered-by/built-with" etc.
-    std::string meta_generator;
-    std::string meta_software;
-    std::string meta_author;
-    std::string meta_developer;
-    std::string meta_framework;
-    std::string meta_cms;
-    std::string meta_powered_by;
-    std::string meta_built_with;
-    std::string meta_created_by;
-    std::string meta_application_name;
-    std::string meta_progid;
-    std::string meta_msapplication_config;
-    std::string meta_msapplication_tile_image;
-    std::string meta_msapplication_tile_color;
-    std::string meta_apple_title;
-    std::string meta_apple_capable;
-    std::vector<std::string> html_comments;   
-    std::vector<std::string> link_platform_paths; 
-    std::vector<std::string> js_globals;   
-    std::string body_platform_hint;        
-    // ---- Client-Side Routing / SPA location references (status-200 redirects) ----
-    std::vector<std::string> spa_locations; // URLs found via JS location / meta-refresh patterns
-
-    // Print fields only — caller controls the section header and deduplication.
-    // 'seen_keys' accumulates field labels already printed so duplicates are skipped.
-    void print(std::ostream &out,
-               std::set<std::string> *seen_keys = nullptr,
-               const std::string    &title_override = "",
-               const std::set<std::string> *shown_values = nullptr) const {
-        // Helper that skips a field if its label was already emitted.
-        auto emit = [&](const std::string &label, const std::string &val) {
-	    if (val.empty()) return;
-	    if (seen_keys && seen_keys->count(label)) return;
-	    if (shown_values) {
-		std::string lv = val;
-		for (char &c : lv) c = (char)tolower((unsigned char)c);
-		if (shown_values->count(lv)) return;
-	    }
-	    if (seen_keys) seen_keys->insert(label);
-
-	    // Normalize val: collapse embedded \r \n \t and whitespace runs to single space
-	    std::string clean;
-	    clean.reserve(val.size());
-	    bool in_ws = false;
-	    for (unsigned char c : val) {
-		if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
-		    if (!in_ws) { clean += ' '; in_ws = true; }
-		} else { clean += (char)c; in_ws = false; }
-	    }
-	    while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
-	    while (!clean.empty() && clean.back()  == ' ') clean.pop_back();
-
-	    // Truncate val to fit box (80 chars max after label column, wide enough
-	    // for merged redirect-hop values like "nginx | openresty | apache")
-	    static constexpr size_t VAL_MAX = 80;
-	    if (clean.size() > VAL_MAX) clean = clean.substr(0, VAL_MAX - 3) + "...";
-
-	    out << "|  " << std::left << std::setw(13) << label << ": " << "\033[32m" << clean << "\033[0m" << "\n";
-	};
-
-        emit("Server",       server);
-        emit("osd-name",     osd_name);
-        emit("X-Powered-By", powered_by);
-        emit("Report-To",    report_to_group);
-        emit("COOP-Report",  coop_report_to_group);
-        // Title: use override (from probe match) if provided, otherwise this FP's title
-        if (!title_override.empty())
-            emit("Title", title_override);
-        else
-            emit("Title", title);
-        // Via: strip leading HTTP-version token (e.g. "1.1 ") before display,
-        // and collapse CloudFront's long hash hostname to just "CloudFront".
-        {
-            std::string via_display = via;
-            // Strip the leading version token ("1.1 ", "2 ", etc.)
-            auto sp = via_display.find(' ');
-            if (sp != std::string::npos)
-                via_display = via_display.substr(sp + 1);
-            // Trim any leading whitespace left over
-            while (!via_display.empty() && via_display.front() == ' ')
-                via_display.erase(via_display.begin());
-            // Collapse CloudFront's "hash.cloudfront.net (CloudFront)" → "CloudFront"
-            {
-                std::string lower = via_display;
-                for (char &c : lower) c = (char)tolower((unsigned char)c);
-                if (lower.find("cloudfront") != std::string::npos)
-                    via_display = "CloudFront";
+    Index() {
+        exact.reserve(kCountryCount * 6);
+        names.reserve(kCountryCount * 3);
+        for (const Country& c : kCountries) {
+            by_iso2[c.iso2[0] - 'A'][c.iso2[1] - 'A'] = &c;
+            add(normalize(c.iso2), &c, false);
+            add(normalize(c.iso3), &c, false);
+            add(normalize(c.name), &c, true);
+            std::string_view al(c.aliases);
+            while (!al.empty()) {
+                size_t bar = al.find('|');
+                std::string_view one = al.substr(0, bar);
+                add(normalize(one), &c, true);
+                if (bar == std::string_view::npos) break;
+                al.remove_prefix(bar + 1);
             }
-            emit("Proxy", via_display);
         }
-        emit("X-Generator",  x_generator);
-        if (!redirect_url.empty() && redirect_url != location)
-            emit("Redirect->", redirect_url);
-
-        // ---- Infrastructure / CDN / security headers (emit deduplicates) ----
-        emit("X-Amz-Cf-Pop",           x_amz_cf_pop);
-        emit("X-Amz-Cf-Id",            x_amz_cf_id);
-        emit("X-Cache",                x_cache);
-        emit("CF-Ray",                 cf_ray);
-        emit("CF-Cache-Status",        cf_cache_status);
-        emit("X-Served-By",            x_served_by);
-        emit("X-Cache-Hits",           x_cache_hits);
-        emit("X-Cache-Lookup",         x_cache_lookup);
-        emit("Akamai-X-Get-Cache-Key", akamai_cache_key);
-        emit("X-Amz-Request-Id",       x_amz_request_id);
-        emit("X-Amz-Id-2",             x_amz_id_2);
-        emit("x-amz-version-id",       x_amz_version_id);
-        emit("X-Amz-SSE",              x_amz_sse);
-        emit("X-Amz-Bucket-Region",    x_amz_bucket_region);
-        emit("X-Amzn-RequestId",       x_amzn_request_id);
-        emit("X-Amzn-Error-Type",      x_amzn_error_type);
-        // Via already emitted above; emit() will skip if seen_keys tracks it
-        emit("X-Via",                  x_via);
-        emit("X-Forwarded-For",        x_forwarded_for);
-        emit("X-Forwarded-Proto",      x_forwarded_proto);
-        emit("X-Real-IP",              x_real_ip);
-        emit("X-Haproxy-Server-State", x_haproxy_server_state);
-        emit("X-Varnish",              x_varnish);
-        emit("X-Cacheable",            x_cacheable);
-        emit("X-Cache-Status",         x_cache_status);
-        emit("X-Cache-Expiry",         x_cache_expiry);
-        emit("Age",                    age);
-        emit("X-Drupal-Cache",         x_drupal_cache);
-        emit("X-Drupal-Dynamic-Cache", x_drupal_dynamic_cache);
-        emit("X-Magento-Cache-Debug",  x_magento_cache_debug);
-        emit("X-WordPress-Cache",      x_wordpress_cache);
-        emit("X-Prestashop-Cache",     x_prestashop_cache);
-        emit("WWW-Authenticate",       www_authenticate);
-        // X-Content-Type-Options and Strict-Transport-Security intentionally omitted
-        emit("X-NewRelic-App-Data",    x_newrelic_app_data);
-        emit("X-Request-Id",           x_request_id);
-        emit("Server-Timing",          server_timing);
-        emit("X-Cloud-Trace-Context",  x_cloud_trace_context);
-        emit("X-CDN",                  x_cdn);
-        emit("X-Edge-Location",        x_edge_location);
-        emit("X-Edge-Connect",         x_edge_connect);
-        emit("X-EdgeConnect-Config",   x_edgeconnect_config);
-        emit("X-EdgeConnect-Method",   x_edgeconnect_method);
-        emit("X-Cache-Key",            x_cache_key);
-        emit("X-Timer",                x_timer);
-        emit("X-Host",                 x_host);
-        emit("X-Backend",              x_backend);
-        emit("X-Backend-Server",       x_backend_server);
-        emit("X-Orig-Cache",           x_orig_cache);
-        emit("X-Proxy-Cache",          x_proxy_cache);
-        emit("X-Amz-Storage-Class",    x_amz_storage_class);
-        emit("X-Amz-Delete-Marker",    x_amz_delete_marker);
-        emit("X-Amz-Expiration",       x_amz_expiration);
-        emit("X-Amz-Replication",      x_amz_replication_status);
-        emit("X-Amz-Req-Charged",      x_amz_request_charged);
-        emit("X-Google-Cache-Control", x_google_cache_control);
-        emit("X-Google-Cache-Hit",     x_google_cache_hit);
-        emit("X-Google-LB",            x_google_load_balancer);
-        emit("X-Google-Backend",       x_google_backend);
-        emit("X-GAE-App",              x_google_appengine_app);
-        emit("X-GAE-Country",          x_google_appengine_country);
-        emit("X-GUploader",            x_guploader);
-        emit("X-GCS-Bucket",           x_gcs_bucket);
-        emit("X-GCS-Object-Gen",       x_gcs_object_generation);
-        emit("X-MS-Edge-Ref",          x_ms_edge_ref);
-        emit("X-MS-RequestId",         x_ms_request_id);
-        emit("X-MS-Client-RequestId",  x_ms_client_request_id);
-        emit("X-MS-Correlation-ReqId", x_ms_correlation_request_id);
-        emit("X-Azure-Ref",            x_azure_ref);
-        emit("X-Azure-RequestId",      x_azure_request_id);
-        emit("X-MSEdge-Ref",           x_msedge_ref);
-        emit("X-LB-Node",              x_lb_node);
-        emit("X-LB-Tag",               x_lb_tag);
-        emit("X-LB-Instance",          x_lb_instance);
-        emit("X-LB-Server",            x_lb_server);
-        emit("X-LB-Backend",           x_lb_backend);
-        emit("X-Proxy-Id",             x_proxy_id);
-        emit("X-Proxy-Server",         x_proxy_server);
-        emit("X-Proxy-Backend",        x_proxy_backend);
-        emit("X-HAProxy-Node",         x_haproxy_node);
-        emit("X-HAProxy-Backend",      x_haproxy_backend);
-        emit("X-HAProxy-Config",       x_haproxy_config);
-        emit("X-Nginx-Cache-Status",   x_nginx_cache_status);
-        emit("X-Nginx-Proxy",          x_nginx_proxy);
-        emit("X-Cache-Id",             x_cache_id);
-        emit("X-Cache-TTL",            x_cache_ttl);
-        emit("X-Cache-Time",           x_cache_time);
-        emit("X-Cache-Request",        x_cache_request);
-        emit("X-Cache-Response",       x_cache_response);
-        emit("X-Cache-Info",           x_cache_info);
-        emit("X-Squid-Error",          x_squid_error);
-        emit("X-Squid-Request-Id",     x_squid_request_id);
-        emit("X-Varnish-Cache",        x_varnish_cache);
-        emit("X-Varnish-Age",          x_varnish_age);
-        emit("X-Varnish-Backend",      x_varnish_backend);
-        emit("X-Varnish-Session",      x_varnish_session);
-        emit("X-Varnish-Hit",          x_varnish_hit);
-        emit("X-Varnish-TTL",          x_varnish_ttl);
-        emit("X-Auth-Token",           x_auth_token);
-        emit("X-Auth-Req-Redirect",    x_auth_request_redirect);
-        emit("X-Auth-Req-URL",         x_auth_request_url);
-        emit("X-Auth-User",            x_auth_user);
-        emit("X-Auth-User-Groups",     x_auth_user_groups);
-        emit("X-Auth-Service",         x_auth_service);
-        emit("X-CSRF-Token",           x_csrf_token);
-        emit("X-CSRF-Param",           x_csrf_param);
-        emit("X-CSRF-Header",          x_csrf_header);
-        emit("X-Debug",                x_debug);
-        emit("X-Debug-Token",          x_debug_token);
-        emit("X-Debug-Token-Link",     x_debug_token_link);
-        emit("X-Drupal-Route",         x_drupal_route);
-        emit("X-Drupal-Ajax-Token",    x_drupal_ajax_token);
-        emit("X-WordPress-Theme",      x_wordpress_theme);
-        emit("X-WordPress-Plugin",     x_wordpress_plugin);
-        emit("X-Magento-Store",        x_magento_store);
-        emit("X-Magento-Theme",        x_magento_theme);
-        emit("X-Magento-Layout",       x_magento_layout);
-        emit("X-Prestashop-Store",     x_prestashop_store);
-        emit("X-Prestashop-Theme",     x_prestashop_theme);
-        emit("X-Response-Time",        x_response_time);
-        emit("X-Execution-Time",       x_execution_time);
-        emit("X-Process-Time",         x_process_time);
-        emit("X-Generator-Duration",   x_generator_duration);
-        emit("X-Powered-By-Duration",  x_powered_by_duration);
-        emit("X-RateLimit-Limit",      x_ratelimit_limit);
-        emit("X-RateLimit-Remaining",  x_ratelimit_remaining);
-        emit("X-RateLimit-Reset",      x_ratelimit_reset);
-        emit("X-RateLimit-Retry-After",x_ratelimit_retry_after);
-        emit("X-RateLimit-Resource",   x_ratelimit_resource);
-        emit("X-Mailer",               x_mailer);
-        emit("X-PHP-Script",           x_php_script);
-        emit("X-PHP-Origin",           x_php_origin);
-        emit("X-Object-Version",       x_object_version);
-        emit("X-Object-Delete-Marker", x_object_delete_marker);
-        emit("X-Object-Expiry",        x_object_expiry);
-        emit("X-Object-Storage-Class", x_object_storage_class);
-        emit("X-Bucket-Location",      x_bucket_location);
-        emit("X-Bucket-Versioning",    x_bucket_versioning);
-        // ---- CI/CD / DevOps identity headers ----
-        emit("X-Jenkins",             x_jenkins);
-        emit("X-Hudson",              x_hudson);
-        emit("X-TeamCity-NodeId",     x_teamcity_node_id);
-        emit("X-Gitlab-Meta",         x_gitlab_meta);
-        emit("X-Harness-Account",     x_harness_account);
-        emit("meta:generator",      meta_generator);
-        emit("meta:software",       meta_software);
-        emit("meta:author",         meta_author);
-        emit("meta:developer",      meta_developer);
-        emit("meta:framework",      meta_framework);
-        emit("meta:cms",            meta_cms);
-        emit("meta:powered-by",     meta_powered_by);
-        emit("meta:built-with",     meta_built_with);
-        emit("meta:created-by",     meta_created_by);
-        emit("meta:app-name",       meta_application_name);
-        emit("meta:progid",         meta_progid);
-        emit("meta:ms-config",      meta_msapplication_config);
-        emit("meta:ms-tile-img",    meta_msapplication_tile_image);
-        emit("meta:ms-tile-color",  meta_msapplication_tile_color);
-        emit("meta:apple-title",    meta_apple_title);
-        emit("meta:apple-capable",  meta_apple_capable);
-        if (!body_platform_hint.empty())
-            emit("Body Platform", "[" + body_platform_hint + "]");
-        if (!tamper_hint.empty())
-            emit("TAMPER?", "[" + tamper_hint + "]");
-        for (size_t di = 0; di < duplicate_headers.size() && di < 5; ++di) {
-            emit("Dup Header", duplicate_headers[di]);
-        }
-        // ---- SPA / Client-Side Routing locations ----
-        for (size_t si = 0; si < spa_locations.size() && si < 5; ++si) {
-            emit("SPA-Location", spa_locations[si]);
-        }
-        // html_comments block (lines 777–784) — replace with:
-	if (!html_comments.empty()) {
-	    for (const auto &c : html_comments) {
-		if (seen_keys && seen_keys->count("html_comment:" + c)) continue;
-		if (seen_keys) seen_keys->insert("html_comment:" + c);
-		std::string val = c.size() > 42 ? c.substr(0, 39) + "..." : c;
-		out << std::left << std::setw(13) << "HTML-Comment" << val << "\n";
-	    }
-	}
-
-	// link_platform_paths block (lines 786–793) — replace with:
-	if (!link_platform_paths.empty()) {
-	    for (const auto &lp : link_platform_paths) {
-		if (seen_keys && seen_keys->count("link_path:" + lp)) continue;
-		if (seen_keys) seen_keys->insert("link_path:" + lp);
-		std::string val = lp.size() > 42 ? lp.substr(0, 39) + "..." : lp;
-		out << std::left << std::setw(13) << "Link-Path" << val << "\n";
-	    }
-	}
-
-	// js_globals block (lines 795–802) — replace with:
-	if (!js_globals.empty()) {
-	    for (const auto &g : js_globals) {
-		if (seen_keys && seen_keys->count("js_global:" + g)) continue;
-		if (seen_keys) seen_keys->insert("js_global:" + g);
-		std::string val = g.size() > 42 ? g.substr(0, 39) + "..." : g;
-		out << std::left << std::setw(13) << "JS-Global" << val << "\n";
-	    }
-	}
-
-        tls_cert.print(out);
     }
 };
 
-std::string g_signature_conf_path = "/usr/share/shiv/signatures.conf";
+const Index& index() {
+    static const Index idx;
+    return idx;
+}
 
+std::string_view trim_sv(std::string_view s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) s.remove_prefix(1);
+    while (!s.empty() && (s.back()  == ' ' || s.back()  == '\t' || s.back()  == '\r' || s.back()  == '\n')) s.remove_suffix(1);
+    return s;
+}
 
-struct PathSigEntry { std::string needle; std::string label; };
-struct AttrSigEntry { std::string attr;   std::string label; };
+void push_unique(std::vector<const Country*>& v, const Country* c) {
+    if (std::find(v.begin(), v.end(), c) == v.end()) v.push_back(c);
+}
 
-// An entry in signatures.conf's [identity_headers] section: a single HTTP
-// response header that should be surfaced on the -sV version line whenever
-// it's present. This is the ONLY thing you need to touch to make a new
-// header show up there -- no HttpFingerprint field, no extract_header()
-// call, no C++ recompile. Lookup happens directly against
-// HttpFingerprint::raw_headers, which already captures every response
-// header generically (see collect_all_headers()).
-//   header : the HTTP header name, case-insensitive (e.g. "X-Powered-By-Plesk")
-//   label  : what to print it as
-//   bare   : true  -> the header's value is already self-descriptive and is
-//                      printed as-is, e.g. Server: "cloudflare" -> "cloudflare"
-//            false -> the value is just a bare token/number, so it's printed
-//                      as "label: value", e.g. X-Jenkins: "2.440.3" ->
-//                      "Jenkins: 2.440.3"
-struct IdentityHeaderSpec { std::string header; std::string label; bool bare; };
+}
 
-struct PlatformRule {
-    enum class Kind {
-        PathContains,          // arg = substring to find in link_platform_paths entries
-        JsGlobalEq,            // arg = exact string to match in js_globals entries
-        CommentContains,       // arg = substring to find in html_comments entries
-        MetaGeneratorContains, // arg = substring to find in meta_generator
-        FieldAnyNonEmpty,      // arg = comma-separated HTTP header names; bump if any is present & non-empty
-        BodyContains,          // arg = substring to find anywhere in the lowercased response body
-                                //       (covers text outside href=/comments -- e.g. src="...", plain
-                                //       visible text, inline JSON blobs)
-        HeaderValueContains    // header = specific HTTP response header name (lowercased);
-                                // arg    = substring to find inside THAT header's value (lowercased).
-                                //          Unlike FieldAnyNonEmpty (presence-only), this lets a rule
-                                //          key off *what a header says*, e.g. Server containing
-                                //          "openresty" or "nginx", or X-Powered-By containing "PHP".
-                                //          signatures.conf syntax: header_contains|Header=needle|weight
-    };
-    Kind        kind;
-    std::string arg;
-    std::string header;   // only used by HeaderValueContains
-    int         weight = 1;
-};
+CountryMatch resolve_country(const std::string& input) {
+    CountryMatch r;
+    const Index& idx = index();
+    std::string_view raw = trim_sv(input);
+    if (raw.size() == 2 && is_alnum_ascii(raw[0]) && is_alnum_ascii(raw[1]) &&
+        !(raw[0] >= '0' && raw[0] <= '9') && !(raw[1] >= '0' && raw[1] <= '9')) {
+        int a = std::toupper(static_cast<unsigned char>(raw[0])) - 'A';
+        int b = std::toupper(static_cast<unsigned char>(raw[1])) - 'A';
+        if (const Country* c = idx.by_iso2[a][b]) { r.country = c; r.how = CountryMatch::How::Exact; return r; }
+    }
 
-struct SuppressRule {
-    std::string trigger_platform;
-    int         trigger_min_score = 0;
-    std::string suppressed_platform;
-};
+    const std::string n = normalize(raw);
+    if (n.empty()) return r;
+    if (auto it = idx.exact.find(n); it != idx.exact.end()) {
+        r.country = it->second; r.how = CountryMatch::How::Exact; return r;
+    }
+    std::vector<const Country*> prefix_hits;
+    if (n.size() >= 3) {
+        for (const auto& [key, c] : idx.names)
+            if (key.size() >= n.size() && key.compare(0, n.size(), n) == 0) push_unique(prefix_hits, c);
+        if (prefix_hits.size() == 1) { r.country = prefix_hits[0]; r.how = CountryMatch::How::Prefix; return r; }
+    }
+    if (n.size() >= 4) {
+        const int max_d = (n.size() >= 8) ? 2 : 1;
+        int best = max_d + 1;
+        std::vector<const Country*> best_c;
+        for (const auto& [key, c] : idx.names) {
+            int d = edit_distance(n, key, max_d);
+            if (d > max_d) continue;
+            if (d < best) { best = d; best_c.clear(); best_c.push_back(c); }
+            else if (d == best) push_unique(best_c, c);
+        }
+        if (best_c.size() == 1) { r.country = best_c[0]; r.how = CountryMatch::How::Fuzzy; return r; }
+    }
+    for (const Country* c : prefix_hits) { if (r.suggestions.size() < 8) push_unique(r.suggestions, c); }
+    if (n.size() >= 3) {
+        for (const auto& [key, c] : idx.names) {
+            if (r.suggestions.size() >= 8) break;
+            if (key.find(n) != std::string::npos) push_unique(r.suggestions, c);
+        }
+    }
+    if (r.suggestions.size() < 5) {
+        std::vector<std::pair<int, const Country*>> scored;
+        for (const auto& [key, c] : idx.names) {
+            int d = edit_distance(n, key, 3);
+            if (d <= 3) scored.emplace_back(d, c);
+        }
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto& x, const auto& y) { return x.first < y.first; });
+        for (const auto& [d, c] : scored) {
+            (void)d;
+            if (r.suggestions.size() >= 5) break;
+            push_unique(r.suggestions, c);
+        }
+    }
+    return r;
+}
 
-// NOTE: field_any_nonempty used to require each header to be registered here
-// by hand as a named HttpFingerprint field. That's gone -- it now looks
-// straight into HttpFingerprint::raw_headers (see the FieldAnyNonEmpty case
-// in the scorer below), so any header can be referenced purely from
-// signatures.conf. Underscores in the signatures.conf arg are treated as
-// equivalent to hyphens (e.g. "x_iinfo" matches the "X-Iinfo" header), so
-// existing entries using the old underscore convention keep working as-is.
+namespace {
 
-class PlatformSignatureSet {
-public:
-    std::vector<std::string>                         js_globals;
-    std::vector<PathSigEntry>                         path_sigs;
-    std::vector<AttrSigEntry>                         attr_sigs;
-    std::map<std::string, std::vector<PlatformRule>>  platform_rules; // platform name -> rules
-    std::vector<std::string>                          meta_hint_platforms;
-    std::vector<SuppressRule>                          suppress_rules;
-    std::vector<IdentityHeaderSpec>                    identity_headers; // [identity_headers]
+__extension__ typedef unsigned __int128 u128;
 
-    static PlatformSignatureSet loadFromFile(const std::string &path);
-};
+using V4 = std::pair<uint32_t, uint32_t>;
+struct V6 { u128 lo, hi; };
 
-namespace platform_sig_detail {
+bool parse_u64(std::string_view s, uint64_t& out) {
+    if (s.empty()) return false;
+    auto r = std::from_chars(s.data(), s.data() + s.size(), out);
+    return r.ec == std::errc() && r.ptr == s.data() + s.size();
+}
 
-static inline std::string trim(const std::string &s)
-{
+bool parse_v4_addr(std::string_view s, uint32_t& host) {
+    if (s.empty() || s.size() > 15) return false;
+    char buf[16];
+    std::memcpy(buf, s.data(), s.size());
+    buf[s.size()] = '\0';
+    in_addr a{};
+    if (inet_pton(AF_INET, buf, &a) != 1) return false;
+    host = ntohl(a.s_addr);
+    return true;
+}
+
+bool parse_v6_addr(std::string_view s, u128& host) {
+    if (s.empty() || s.size() > 45) return false;
+    char buf[48];
+    std::memcpy(buf, s.data(), s.size());
+    buf[s.size()] = '\0';
+    in6_addr a{};
+    if (inet_pton(AF_INET6, buf, &a) != 1) return false;
+    u128 v = 0;
+    for (int i = 0; i < 16; ++i) v = (v << 8) | a.s6_addr[i];
+    host = v;
+    return true;
+}
+
+V4 v4_from_prefix(uint32_t base, unsigned len) {
+    uint32_t mask = 0xFFFFFFFFu << (32 - len);
+    uint32_t lo = base & mask;
+    return {lo, lo | ~mask};
+}
+
+V6 v6_from_prefix(u128 base, unsigned len) {
+    u128 host_mask = (static_cast<u128>(1) << (128 - len)) - 1;
+    u128 lo = base & ~host_mask;
+    return {lo, lo | host_mask};
+}
+
+bool parse_v4_cidr(std::string_view s, V4& out) {
+    size_t slash = s.find('/');
+    if (slash == std::string_view::npos) return false;
+    uint32_t base;
+    uint64_t len;
+    if (!parse_v4_addr(s.substr(0, slash), base)) return false;
+    if (!parse_u64(s.substr(slash + 1), len) || len < 1 || len > 32) return false;
+    out = v4_from_prefix(base, static_cast<unsigned>(len));
+    return true;
+}
+
+bool parse_v6_cidr(std::string_view s, V6& out) {
+    size_t slash = s.find('/');
+    if (slash == std::string_view::npos) return false;
+    u128 base;
+    uint64_t len;
+    if (!parse_v6_addr(s.substr(0, slash), base)) return false;
+    if (!parse_u64(s.substr(slash + 1), len) || len < 1 || len > 128) return false;
+    out = v6_from_prefix(base, static_cast<unsigned>(len));
+    return true;
+}
+
+int ctz128(u128 x) {
+    uint64_t lo = static_cast<uint64_t>(x);
+    return lo ? __builtin_ctzll(lo) : 64 + __builtin_ctzll(static_cast<uint64_t>(x >> 64));
+}
+int floor_log2_128(u128 x) {
+    uint64_t hi = static_cast<uint64_t>(x >> 64);
+    return hi ? 127 - __builtin_clzll(hi) : 63 - __builtin_clzll(static_cast<uint64_t>(x));
+}
+
+std::vector<V4> merge_v4(std::vector<V4> v) {
+    std::sort(v.begin(), v.end());
+    std::vector<V4> out;
+    out.reserve(v.size());
+    for (const V4& iv : v) {
+        if (!out.empty() && static_cast<uint64_t>(iv.first) <= static_cast<uint64_t>(out.back().second) + 1)
+            out.back().second = std::max(out.back().second, iv.second);
+        else
+            out.push_back(iv);
+    }
+    return out;
+}
+
+std::vector<V6> merge_v6(std::vector<V6> v) {
+    std::sort(v.begin(), v.end(), [](const V6& a, const V6& b) { return a.lo < b.lo; });
+    std::vector<V6> out;
+    out.reserve(v.size());
+    const u128 kMax = ~static_cast<u128>(0);
+    for (const V6& iv : v) {
+        if (!out.empty() && (out.back().hi == kMax || iv.lo <= out.back().hi + 1))
+            out.back().hi = std::max(out.back().hi, iv.hi);
+        else
+            out.push_back(iv);
+    }
+    return out;
+}
+
+size_t emit_v4(V4 iv, std::string* out, std::vector<std::pair<std::string, uint32_t>>* samples = nullptr) {
+    size_t lines = 0;
+    uint64_t cur = iv.first, end = iv.second;
+    char ip[INET_ADDRSTRLEN];
+    while (cur <= end) {
+        const uint64_t remaining = end - cur + 1;
+        const uint64_t align = cur ? (cur & (~cur + 1)) : (1ULL << 32);
+        const uint64_t fit   = 1ULL << (63 - __builtin_clzll(remaining));
+        const uint64_t size  = std::min(align, fit);
+        const unsigned prefix = 32 - static_cast<unsigned>(__builtin_ctzll(size));
+        in_addr a{};
+        a.s_addr = htonl(static_cast<uint32_t>(cur));
+        inet_ntop(AF_INET, &a, ip, sizeof(ip));
+        if (out) {
+            *out += ip;
+            *out += '/';
+            *out += std::to_string(prefix);
+            *out += '\n';
+        }
+        if (samples) {
+            const uint32_t sample = static_cast<uint32_t>(cur + (size > 1 ? 1 : 0));
+            samples->emplace_back(std::string(ip) + "/" + std::to_string(prefix), sample);
+        }
+        ++lines;
+        cur += size;
+    }
+    return lines;
+}
+
+size_t emit_v6(V6 iv, std::string* out, std::vector<std::pair<std::string, u128>>* samples = nullptr) {
+    size_t lines = 0;
+    char ip[INET6_ADDRSTRLEN];
+    const u128 kMax = ~static_cast<u128>(0);
+    u128 cur = iv.lo;
+    const u128 end = iv.hi;
+    for (;;) {
+        int take;
+        if (cur == 0 && end == kMax) {
+            take = 128;
+        } else {
+            const u128 remaining = end - cur + 1;
+            const int align = (cur == 0) ? 128 : ctz128(cur);
+            const int fit   = floor_log2_128(remaining);
+            take = std::min(align, fit);
+        }
+        in6_addr a{};
+        for (int i = 0; i < 16; ++i) a.s6_addr[i] = static_cast<uint8_t>(cur >> (8 * (15 - i)));
+        inet_ntop(AF_INET6, &a, ip, sizeof(ip));
+        if (out) {
+            *out += ip;
+            *out += '/';
+            *out += std::to_string(128 - take);
+            *out += '\n';
+        }
+        if (samples) {
+            const u128 sample = cur + (take > 0 ? static_cast<u128>(1) : static_cast<u128>(0));
+            samples->emplace_back(std::string(ip) + "/" + std::to_string(128 - take), sample);
+        }
+        ++lines;
+        if (take >= 128) break;
+        const u128 step = static_cast<u128>(1) << take;
+        if (end - cur < step) break;
+        cur += step;
+        if (cur > end || cur == 0) break;
+    }
+    return lines;
+}
+
+}
+
+namespace {
+
+constexpr size_t kMaxOwnerLookups = 20000;
+constexpr size_t kBulkChunkSize   = 500;
+constexpr int    kCymruWhoisPort  = 43;
+
+std::vector<std::string> owner_system_resolvers() {
+    std::vector<std::string> out;
+    std::ifstream f("/etc/resolv.conf");
+    std::string line;
+    while (f && std::getline(f, line)) {
+        if (line.rfind("nameserver", 0) == 0) {
+            std::istringstream ss(line);
+            std::string tok, ip;
+            ss >> tok >> ip;
+            if (!ip.empty()) out.push_back(ip);
+        }
+    }
+    if (out.empty()) { out.push_back("1.1.1.1"); out.push_back("8.8.8.8"); }
+    return out;
+}
+
+std::string trim_field(std::string s) {
     size_t a = s.find_first_not_of(" \t\r\n");
     if (a == std::string::npos) return "";
     size_t b = s.find_last_not_of(" \t\r\n");
     return s.substr(a, b - a + 1);
 }
 
-static inline std::vector<std::string> split_pipe(const std::string &line)
-{
-    std::vector<std::string> parts;
+std::vector<std::string> split_pipe(const std::string& line) {
+    std::vector<std::string> out;
     size_t start = 0;
-    while (true) {
+    for (;;) {
         size_t p = line.find('|', start);
-        if (p == std::string::npos) { parts.push_back(line.substr(start)); break; }
-        parts.push_back(line.substr(start, p - start));
+        out.push_back(trim_field(line.substr(start, p == std::string::npos ? std::string::npos : p - start)));
+        if (p == std::string::npos) break;
         start = p + 1;
     }
-    return parts;
+    return out;
 }
 
-static inline std::vector<std::string> split_comma(const std::string &s)
-{
-    std::vector<std::string> parts;
-    size_t start = 0;
-    while (true) {
-        size_t p = s.find(',', start);
-        if (p == std::string::npos) { parts.push_back(trim(s.substr(start))); break; }
-        parts.push_back(trim(s.substr(start, p - start)));
-        start = p + 1;
-    }
-    return parts;
-}
-
-} // namespace platform_sig_detail
-
-PlatformSignatureSet PlatformSignatureSet::loadFromFile(const std::string &path)
-{
-    using namespace platform_sig_detail;
-
-    std::ifstream in(path);
-    if (!in.is_open())
-        throw std::runtime_error("cannot open '" + path + "'");
-
-    PlatformSignatureSet sigs;
-    std::string section;          // e.g. "jsglobals", "paths", "attrs", "meta_hint_platforms", "suppress"
-    std::string current_platform; // set when section starts with "platform."
-
-    std::string raw_line;
-    size_t lineno = 0;
-    while (std::getline(in, raw_line)) {
-        ++lineno;
-        // Strip trailing \r for files edited on Windows.
-        if (!raw_line.empty() && raw_line.back() == '\r') raw_line.pop_back();
-        // Right-trim only: data lines (e.g. [attrs] needles like " id=") may rely
-        // on significant leading whitespace, so it must survive into 'line'.
-        std::string line = raw_line;
-        while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
-        std::string check = trim(line); // used only to classify the line
-        if (check.empty() || check[0] == '#') continue;
-
-        if (check.front() == '[' && check.back() == ']') {
-            section = check.substr(1, check.size() - 2);
-            current_platform.clear();
-            static const std::string kPlatformPrefix = "platform.";
-            if (section.rfind(kPlatformPrefix, 0) == 0) {
-                current_platform = section.substr(kPlatformPrefix.size());
-                sigs.platform_rules.emplace(current_platform, std::vector<PlatformRule>{});
-            }
+size_t decode_dns_name(const uint8_t* buf, size_t len, size_t pos, std::string& out) {
+    out.clear();
+    size_t cur = pos;
+    size_t after_first_jump = std::string::npos;
+    int jumps = 0;
+    while (cur < len) {
+        uint8_t c = buf[cur];
+        if (c == 0) { cur += 1; break; }
+        if ((c & 0xC0) == 0xC0) {
+            if (cur + 1 >= len || ++jumps > 20) return len;
+            size_t ptr = (static_cast<size_t>(c & 0x3F) << 8) | buf[cur + 1];
+            if (after_first_jump == std::string::npos) after_first_jump = cur + 2;
+            cur = ptr;
             continue;
         }
-
-        if (section == "jsglobals") {
-            sigs.js_globals.push_back(check);
-        }
-        else if (section == "paths") {
-            auto f = split_pipe(line);
-            if (f.size() != 2) {
-                throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                          ": [paths] entry needs 'needle|label'");
-            }
-            sigs.path_sigs.push_back({ trim(f[0]), trim(f[1]) });
-        }
-        else if (section == "attrs") {
-            auto f = split_pipe(line);
-            if (f.size() != 2) {
-                throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                          ": [attrs] entry needs 'attr|label'");
-            }
-            sigs.attr_sigs.push_back({ f[0], trim(f[1]) }); // keep attr as-is (may have leading space)
-        }
-        else if (section == "meta_hint_platforms") {
-            sigs.meta_hint_platforms.push_back(check);
-        }
-        else if (section == "identity_headers") {
-            // header|label|bare
-            auto f = split_pipe(line);
-            if (f.size() != 3) {
-                throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                          ": [identity_headers] entry needs 'header|label|bare'");
-            }
-            IdentityHeaderSpec spec;
-            spec.header = trim(f[0]);
-            spec.label  = trim(f[1]);
-            std::string bare_str = trim(f[2]);
-            for (char &c : bare_str) c = (char)tolower((unsigned char)c);
-            if (bare_str == "true" || bare_str == "1")       spec.bare = true;
-            else if (bare_str == "false" || bare_str == "0") spec.bare = false;
-            else {
-                throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                          ": [identity_headers] bare flag must be true/false");
-            }
-            sigs.identity_headers.push_back(std::move(spec));
-        }
-        else if (section == "suppress") {
-            // trigger_platform>=min_score|suppressed_platform
-            auto f = split_pipe(line);
-            if (f.size() != 2) {
-                throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                          ": [suppress] entry needs 'Platform>=N|SuppressedPlatform'");
-            }
-            size_t ge = f[0].find(">=");
-            if (ge == std::string::npos) {
-                throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                          ": [suppress] trigger must look like 'Platform>=N'");
-            }
-            SuppressRule r;
-            r.trigger_platform    = trim(f[0].substr(0, ge));
-            {
-	        const std::string num = trim(f[0].substr(ge + 2));
-	        char *endp = nullptr;
-	        long v = std::strtol(num.c_str(), &endp, 10);
-	        if (endp == num.c_str() || *endp != '\0') {
-		    throw std::runtime_error(path + ":" + std::to_string(lineno) +
-		                              ": [suppress] score must be a valid integer");
-	        }
-	        r.trigger_min_score = static_cast<int>(v);
-	    }
-            r.suppressed_platform = trim(f[1]);
-            sigs.suppress_rules.push_back(std::move(r));
-        }
-        else if (!current_platform.empty()) {
-            // Rule line inside [platform.NAME]: kind|arg|weight
-            auto f = split_pipe(line);
-            if (f.size() != 3) {
-                throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                          ": platform rule needs 'kind|arg|weight'");
-            }
-            std::string kind_str = trim(f[0]);
-            PlatformRule rule;
-            rule.arg    = f[1]; // preserve as-is; some args (attrs) are meaningfully space-sensitive
-            {
-	        const std::string num = trim(f[2]);
-	        char *endp = nullptr;
-	        long v = std::strtol(num.c_str(), &endp, 10);
-	        if (endp == num.c_str() || *endp != '\0') {
-		    throw std::runtime_error(path + ":" + std::to_string(lineno) +
-		                              ": platform rule weight must be a valid integer");
-	        }
-	        rule.weight = static_cast<int>(v);
-	    }
-
-            if      (kind_str == "path_contains")           rule.kind = PlatformRule::Kind::PathContains;
-            else if (kind_str == "jsglobal_eq")              rule.kind = PlatformRule::Kind::JsGlobalEq;
-            else if (kind_str == "comment_contains")         rule.kind = PlatformRule::Kind::CommentContains;
-            else if (kind_str == "meta_generator_contains")  rule.kind = PlatformRule::Kind::MetaGeneratorContains;
-            else if (kind_str == "field_any_nonempty")       rule.kind = PlatformRule::Kind::FieldAnyNonEmpty;
-            else if (kind_str == "body_contains") {
-                rule.kind = PlatformRule::Kind::BodyContains;
-                // Stored lowercased up front since it's always matched against lbody.
-                for (char &c : rule.arg) c = (char)tolower((unsigned char)c);
-            }
-            else if (kind_str == "header_contains") {
-                // arg is "Header=needle"; split on the FIRST '=' so a needle
-                // containing '=' (unlikely but not impossible) still works.
-                rule.kind = PlatformRule::Kind::HeaderValueContains;
-                size_t eq = rule.arg.find('=');
-                if (eq == std::string::npos) {
-                    throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                              ": header_contains arg must be 'Header=needle'");
-                }
-                rule.header = trim(rule.arg.substr(0, eq));
-                rule.arg    = trim(rule.arg.substr(eq + 1));
-                for (char &c : rule.header) { c = (char)tolower((unsigned char)c); if (c == '_') c = '-'; }
-                for (char &c : rule.arg)    c = (char)tolower((unsigned char)c);
-                if (rule.header.empty() || rule.arg.empty()) {
-                    throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                              ": header_contains needs both a header name and a needle");
-                }
-            }
-            else {
-                throw std::runtime_error(path + ":" + std::to_string(lineno) +
-                                          ": unknown rule kind '" + kind_str + "'");
-            }
-            sigs.platform_rules[current_platform].push_back(std::move(rule));
-        }
-        // Lines outside any recognized section are ignored (forward-compatible).
+        size_t label_len = c;
+        cur += 1;
+        if (cur + label_len > len) return len;
+        if (!out.empty()) out += '.';
+        out.append(reinterpret_cast<const char*>(buf + cur), label_len);
+        cur += label_len;
     }
-
-    return sigs;
+    return (after_first_jump != std::string::npos) ? after_first_jump : cur;
 }
 
-static const PlatformSignatureSet &platform_signatures()
-{
-    static const PlatformSignatureSet sigs = [] {
-        try {
-            return PlatformSignatureSet::loadFromFile(g_signature_conf_path);
-        } catch (const std::exception &e) {
-            std::cerr << "[web-fp] failed to load signatures.conf: " << e.what()
-                      << " -- platform/CMS detection disabled for this run\n";
-            return PlatformSignatureSet{};
-        }
-    }();
-    return sigs;
+std::vector<uint8_t> build_dns_query(uint16_t id, const std::string& qname, uint16_t qtype) {
+    std::vector<uint8_t> pkt;
+    pkt.reserve(qname.size() + 18);
+    auto put16 = [&](uint16_t v) { uint16_t n = htons(v); pkt.push_back(static_cast<uint8_t>(n & 0xFF)); pkt.push_back(static_cast<uint8_t>(n >> 8)); };
+    pkt.push_back(static_cast<uint8_t>(id >> 8)); pkt.push_back(static_cast<uint8_t>(id & 0xFF));
+    put16(0x0100);
+    put16(1); put16(0); put16(0); put16(0);
+    size_t start = 0;
+    while (start <= qname.size()) {
+        size_t dot = qname.find('.', start);
+        size_t end = (dot == std::string::npos) ? qname.size() : dot;
+        size_t label_len = end - start;
+        if (label_len > 63) return {};
+        pkt.push_back(static_cast<uint8_t>(label_len));
+        pkt.insert(pkt.end(), qname.begin() + start, qname.begin() + end);
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    pkt.push_back(0);
+    put16(qtype);
+    put16(1);
+    return pkt;
 }
 
-static std::vector<std::string> extract_spa_locations(const std::string &body);
-
-static void extract_html_body_signals(const std::vector<u8> &resp,
-                                      HttpFingerprint        &fp)
-{
-    // ---- locate body start -----------------------------------------------
-    // We want everything after the blank line separating headers from body.
-    size_t body_start = 0;
-    const size_t limit = std::min(resp.size(), (size_t)MAX_RESPONSE);
-
-    for (size_t i = 0; i + 3 < limit; ++i) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            body_start = i + 4;
-            break;
-        }
-    }
-    if (body_start == 0) {
-        // Fallback: \n\n
-        for (size_t i = 0; i + 1 < limit; ++i) {
-            if (resp[i]=='\n' && resp[i+1]=='\n') {
-                body_start = i + 2;
-                break;
-            }
-        }
-    }
-
-    // If no separator found, scan whole buffer (e.g. raw HTML without HTTP headers)
-    std::string body(resp.begin() + (std::ptrdiff_t)body_start,
-                     resp.begin() + (std::ptrdiff_t)limit);
-
-    // Lower-case copy for case-insensitive searches
-    std::string lbody = body;
-    for (char &c : lbody) c = (char)tolower((unsigned char)c);
-
-
-    {
-        // Collect all <meta ...> tags via manual find — avoids regex DFS stack overflow.
-        // Helper: extract a quoted or unquoted attribute value from a tag string.
-        auto get_attr = [](const std::string &tag, const std::string &attr_lc) -> std::string {
-            // Work on a lowercased copy for matching, but extract value from original
-            std::string ltag = tag;
-            for (char &c : ltag) c = (char)tolower((unsigned char)c);
-
-            size_t pos = 0;
-            while (pos < ltag.size()) {
-                size_t ap = ltag.find(attr_lc, pos);
-                if (ap == std::string::npos) break;
-                // Must be preceded by whitespace or start-of-string
-                if (ap > 0 && !isspace((unsigned char)ltag[ap - 1])) { pos = ap + 1; continue; }
-                size_t after = ap + attr_lc.size();
-                // Skip spaces then '='
-                while (after < ltag.size() && ltag[after] == ' ') ++after;
-                if (after >= ltag.size() || ltag[after] != '=') { pos = ap + 1; continue; }
-                ++after; // skip '='
-                while (after < ltag.size() && ltag[after] == ' ') ++after;
-                if (after >= ltag.size()) break;
-                char q = ltag[after];
-                if (q == '"' || q == '\'') {
-                    ++after;
-                    size_t vend = tag.find(q, after);
-                    if (vend == std::string::npos) vend = tag.size();
-                    std::string v = tag.substr(after, vend - after);
-                    while (!v.empty() && isspace((unsigned char)v.front())) v.erase(v.begin());
-                    while (!v.empty() && isspace((unsigned char)v.back()))  v.pop_back();
-                    return v;
-                } else {
-                    // unquoted value
-                    size_t vend = after;
-                    while (vend < tag.size() && !isspace((unsigned char)tag[vend]) &&
-                           tag[vend] != '>' && tag[vend] != '"' && tag[vend] != '\'') ++vend;
-                    std::string v = tag.substr(after, vend - after);
-                    while (!v.empty() && isspace((unsigned char)v.front())) v.erase(v.begin());
-                    while (!v.empty() && isspace((unsigned char)v.back()))  v.pop_back();
-                    return v;
+bool parse_dns_answer(const uint8_t* buf, size_t len, uint16_t want_type,
+                       size_t answers_start, uint16_t ancount, std::string& out) {
+    size_t pos = answers_start;
+    for (uint16_t i = 0; i < ancount; ++i) {
+        std::string name;
+        pos = decode_dns_name(buf, len, pos, name);
+        if (pos + 10 > len) return false;
+        uint16_t rtype, rdlen;
+        memcpy(&rtype, buf + pos, 2); rtype = ntohs(rtype); pos += 2;
+        pos += 2;
+        pos += 4;
+        memcpy(&rdlen, buf + pos, 2); rdlen = ntohs(rdlen); pos += 2;
+        if (pos + rdlen > len) return false;
+        if (rtype == want_type) {
+            if (want_type == 16) {
+                std::string txt;
+                size_t p = pos, end = pos + rdlen;
+                while (p < end) {
+                    uint8_t slen = buf[p++];
+                    if (p + slen > end) break;
+                    txt.append(reinterpret_cast<const char*>(buf + p), slen);
+                    p += slen;
                 }
+                out = txt;
+                return true;
             }
-            return "";
-        };
-
-        // Scan body for <meta ...> tags manually (bounded: skip tags > 500 chars)
-        size_t scan_pos = 0;
-        while (scan_pos < body.size()) {
-            // case-insensitive find of "<meta"
-            size_t mp = std::string::npos;
-            for (size_t k = scan_pos; k + 5 <= body.size(); ++k) {
-                if (tolower((unsigned char)body[k])   == '<' &&
-                    tolower((unsigned char)body[k+1]) == 'm' &&
-                    tolower((unsigned char)body[k+2]) == 'e' &&
-                    tolower((unsigned char)body[k+3]) == 't' &&
-                    tolower((unsigned char)body[k+4]) == 'a' &&
-                    (isspace((unsigned char)body[k+5]) || body[k+5] == '>')) {
-                    mp = k; break;
-                }
-            }
-            if (mp == std::string::npos) break;
-
-            // Find closing '>' — cap search at 500 chars to stay safe
-            size_t ge = body.find('>', mp);
-            if (ge == std::string::npos || ge - mp > 500) { scan_pos = mp + 5; continue; }
-            scan_pos = ge + 1;
-
-            std::string tag = body.substr(mp, ge - mp + 1);
-            std::string name_val    = get_attr(tag, "name");
-            std::string content_val = get_attr(tag, "content");
-
-            if (name_val.empty() || content_val.empty()) continue;
-
-            // lower-case the name for comparison
-            std::string lname = name_val;
-            for (char &c : lname) c = (char)tolower((unsigned char)c);
-
-            if (lname == "generator")                  fp.meta_generator            = content_val;
-            else if (lname == "software")              fp.meta_software             = content_val;
-            else if (lname == "author")                fp.meta_author               = content_val;
-            else if (lname == "developer")             fp.meta_developer            = content_val;
-            else if (lname == "framework")             fp.meta_framework            = content_val;
-            else if (lname == "cms")                   fp.meta_cms                  = content_val;
-            else if (lname == "powered-by")            fp.meta_powered_by           = content_val;
-            else if (lname == "built-with")            fp.meta_built_with           = content_val;
-            else if (lname == "created-by")            fp.meta_created_by           = content_val;
-            else if (lname == "application-name")      fp.meta_application_name     = content_val;
-            else if (lname == "progid")                fp.meta_progid               = content_val;
-            else if (lname == "msapplication-config")  fp.meta_msapplication_config = content_val;
-            else if (lname == "msapplication-tileimage")
-                                                       fp.meta_msapplication_tile_image  = content_val;
-            else if (lname == "msapplication-tilecolor")
-                                                       fp.meta_msapplication_tile_color  = content_val;
-            else if (lname == "apple-mobile-web-app-title")
-                                                       fp.meta_apple_title          = content_val;
-            else if (lname == "apple-mobile-web-app-capable")
-                                                       fp.meta_apple_capable        = content_val;
-        }
-    }
-
-    {
-        // Extract HTML comments manually — avoids [\s\S]{0,300}? regex DFS overflow.
-        // Keywords that suggest a tech-reveal comment
-        static const std::vector<std::string> kw = {
-            "generated by", "built with", "powered by", "created with",
-            "wordpress", "drupal", "magento", "joomla", "prestashop",
-            "static generated", "generator:", "this site is", "wix.com",
-            "shopify", "squarespace", "ghost", "typo3", "opencart"
-        };
-
-        size_t cpos = 0;
-        while (cpos < body.size()) {
-            size_t cs = body.find("<!--", cpos);
-            if (cs == std::string::npos) break;
-            size_t ce = body.find("-->", cs + 4);
-            if (ce == std::string::npos) break;
-            // Limit inner content to 300 chars
-            size_t inner_len = ce - (cs + 4);
-            if (inner_len <= 300) {
-                std::string inner = body.substr(cs + 4, inner_len);
-                // trim
-                while (!inner.empty() && isspace((unsigned char)inner.front())) inner.erase(inner.begin());
-                while (!inner.empty() && isspace((unsigned char)inner.back()))  inner.pop_back();
-                if (!inner.empty()) {
-                    std::string lower_inner = inner;
-                    for (char &c : lower_inner) c = (char)tolower((unsigned char)c);
-                    for (const auto &k : kw) {
-                        if (lower_inner.find(k) != std::string::npos) {
-                            // Collapse internal whitespace for cleaner output
-                            std::string cleaned;
-                            bool ws = false;
-                            for (char c : inner) {
-                                if (isspace((unsigned char)c)) { if (!ws) { cleaned += ' '; ws = true; } }
-                                else                           { cleaned += c; ws = false; }
-                            }
-                            fp.html_comments.push_back(cleaned);
-                            break;
-                        }
-                    }
-                }
-            }
-            cpos = ce + 3;
-        }
-        // Deduplicate
-        std::sort(fp.html_comments.begin(), fp.html_comments.end());
-        fp.html_comments.erase(std::unique(fp.html_comments.begin(), fp.html_comments.end()),
-                               fp.html_comments.end());
-    }
-
-    {
-       
-        size_t scan_p = 0;
-        while (scan_p < body.size()) {
-            // Case-insensitive find of '<p'
-            size_t ptag = std::string::npos;
-            for (size_t k = scan_p; k + 2 <= body.size(); ++k) {
-                if ((body[k] == '<' || body[k] == '<') &&
-                    tolower((unsigned char)body[k]) == '<' &&
-                    tolower((unsigned char)body[k+1]) == 'p' &&
-                    (isspace((unsigned char)body[k+2]) || body[k+2] == '>')) {
-                    ptag = k; break;
-                }
-            }
-            if (ptag == std::string::npos) break;
-            // Find the '>' that closes the opening <p ...>
-            size_t pgt = body.find('>', ptag);
-            if (pgt == std::string::npos || pgt - ptag > 300) { scan_p = ptag + 2; continue; }
-            std::string open_tag = body.substr(ptag, pgt - ptag + 1);
-            // Check if class contains "command" (case-insensitive)
-            std::string open_lc = open_tag;
-            for (char &c : open_lc) c = (char)tolower((unsigned char)c);
-            if (open_lc.find("class=") != std::string::npos &&
-                open_lc.find("command") != std::string::npos)
-            {
-                // Extract text content up to </p>
-                size_t content_start = pgt + 1;
-                // Find </p> case-insensitively
-                size_t close_pos = std::string::npos;
-                for (size_t k = content_start; k + 3 <= body.size(); ++k) {
-                    if (body[k] == '<' &&
-                        tolower((unsigned char)body[k+1]) == '/' &&
-                        tolower((unsigned char)body[k+2]) == 'p' &&
-                        (body[k+3] == '>' || isspace((unsigned char)body[k+3]))) {
-                        close_pos = k; break;
-                    }
-                }
-                size_t text_end = (close_pos != std::string::npos)
-                                ? close_pos : std::min(content_start + 200, body.size());
-                std::string text = body.substr(content_start, text_end - content_start);
-                // Strip any inner HTML tags
-                std::string plain;
-                bool in_tag = false;
-                for (char c : text) {
-                    if      (c == '<') in_tag = true;
-                    else if (c == '>') in_tag = false;
-                    else if (!in_tag) plain += c;
-                }
-                // Collapse whitespace
-                std::string clean_text;
-                bool ws2 = false;
-                for (char c : plain) {
-                    if (isspace((unsigned char)c)) { if (!ws2) { clean_text += ' '; ws2 = true; } }
-                    else                           { clean_text += c; ws2 = false; }
-                }
-                while (!clean_text.empty() && clean_text.front() == ' ') clean_text.erase(clean_text.begin());
-                while (!clean_text.empty() && clean_text.back()  == ' ') clean_text.pop_back();
-                if (!clean_text.empty() && clean_text.size() <= 200) {
-                    std::string entry = "[p.command] " + clean_text;
-                    bool dup = false;
-                    for (const auto &e : fp.html_comments) if (e == entry) { dup = true; break; }
-                    if (!dup) fp.html_comments.push_back(entry);
-                }
-                scan_p = (close_pos != std::string::npos) ? close_pos + 4 : pgt + 1;
-            } else {
-                scan_p = pgt + 1;
+            if (want_type == 12) {
+                std::string name2;
+                decode_dns_name(buf, len, pos, name2);
+                out = name2;
+                return true;
             }
         }
+        pos += rdlen;
     }
-
-
-    {
-        // Detect platform-specific URL paths in href attributes.
-        // Manual scan of href="..." values — avoids regex DFS on large HTML bodies.
-        // Signature data (needle -> label) comes from signatures.conf [paths].
-        const auto &sigs = platform_signatures();
-
-        size_t hpos = 0;
-        while (hpos < lbody.size()) {
-            // Find next href=
-            size_t hp = lbody.find("href=", hpos);
-            if (hp == std::string::npos) break;
-            hpos = hp + 5;
-            if (hpos >= lbody.size()) break;
-            char q = lbody[hpos];
-            if (q != '"' && q != '\'') continue;
-            ++hpos;
-            size_t val_end = lbody.find(q, hpos);
-            if (val_end == std::string::npos || val_end - hpos > 300) continue;
-            // lbody slice for this href value (already lowercase)
-            std::string href_val = lbody.substr(hpos, val_end - hpos);
-            // original-case value for display
-            std::string href_orig = body.substr(hpos, val_end - hpos);
-            hpos = val_end + 1;
-
-            for (const auto &sig : sigs.path_sigs) {
-                if (href_val.find(sig.needle) != std::string::npos) {
-                    std::string entry = "[" + sig.label + "] " + href_orig;
-                    bool dup = false;
-                    for (const auto &existing : fp.link_platform_paths)
-                        if (existing == entry) { dup = true; break; }
-                    if (!dup) fp.link_platform_paths.push_back(entry);
-                }
-            }
-        }
-    }
-
-
-    {
-        // Collect all <script ...> blocks manually — avoids [\s\S]{0,8000}? DFS overflow.
-        // Global names to search for come from signatures.conf [jsglobals].
-        const auto &sigs = platform_signatures();
-
-        std::vector<std::string> script_blocks;
-        {
-            size_t spos = 0;
-            // lowercase body for case-insensitive tag search
-            while (spos < body.size()) {
-                // Find opening <script tag
-                size_t tag_start = std::string::npos;
-                for (size_t k = spos; k + 7 <= body.size(); ++k) {
-                    if (tolower((unsigned char)body[k])   == '<' &&
-                        tolower((unsigned char)body[k+1]) == 's' &&
-                        tolower((unsigned char)body[k+2]) == 'c' &&
-                        tolower((unsigned char)body[k+3]) == 'r' &&
-                        tolower((unsigned char)body[k+4]) == 'i' &&
-                        tolower((unsigned char)body[k+5]) == 'p' &&
-                        tolower((unsigned char)body[k+6]) == 't' &&
-                        (isspace((unsigned char)body[k+7]) || body[k+7] == '>')) {
-                        tag_start = k; break;
-                    }
-                }
-                if (tag_start == std::string::npos) break;
-                // Find the '>' closing the opening tag
-                size_t tag_gt = body.find('>', tag_start);
-                if (tag_gt == std::string::npos) break;
-                size_t content_start = tag_gt + 1;
-
-                // Find </script>
-                size_t close_pos = std::string::npos;
-                for (size_t k = content_start; k + 9 <= body.size(); ++k) {
-                    if (body[k] == '<' &&
-                        tolower((unsigned char)body[k+1]) == '/' &&
-                        tolower((unsigned char)body[k+2]) == 's' &&
-                        tolower((unsigned char)body[k+3]) == 'c' &&
-                        tolower((unsigned char)body[k+4]) == 'r' &&
-                        tolower((unsigned char)body[k+5]) == 'i' &&
-                        tolower((unsigned char)body[k+6]) == 'p' &&
-                        tolower((unsigned char)body[k+7]) == 't' &&
-                        (body[k+8] == '>' || isspace((unsigned char)body[k+8]))) {
-                        close_pos = k; break;
-                    }
-                }
-                if (close_pos == std::string::npos) break;
-
-                size_t block_len = close_pos - content_start;
-                if (block_len > 0 && block_len <= 8000)
-                    script_blocks.push_back(body.substr(content_start, block_len));
-
-                // Advance past </script>
-                size_t close_gt = body.find('>', close_pos);
-                spos = (close_gt != std::string::npos) ? close_gt + 1 : close_pos + 9;
-            }
-        }
-
-        // For each script block, search for JS globals using simple find()
-        // instead of constructing a new regex per global per block.
-        for (const auto &block : script_blocks) {
-            for (const auto &gname : sigs.js_globals) {
-                // Patterns: "window.<gname>" or "var <gname>"
-                bool found = (block.find("window." + gname) != std::string::npos ||
-                              block.find("var "    + gname) != std::string::npos);
-                if (found) {
-                    std::string label = "window." + gname;
-                    bool dup = false;
-                    for (const auto &e : fp.js_globals)
-                        if (e == label) { dup = true; break; }
-                    if (!dup) fp.js_globals.push_back(label);
-                }
-            }
-        }
-    }
-
-    {
-        // Framework/CMS HTML attribute signatures come from signatures.conf [attrs].
-        const auto &sigs = platform_signatures();
-
-        for (const auto &sig : sigs.attr_sigs) {
-            if (sig.label.empty()) continue;  // deliberately suppressed
-            // Search in the lowercase body copy for case-insensitive match
-            std::string la = sig.attr;
-            for (char &c : la) c = (char)tolower((unsigned char)c);
-            if (lbody.find(la) != std::string::npos) {
-                std::string entry = "attr:" + sig.label;
-                bool dup = false;
-                for (const auto &e : fp.js_globals)
-                    if (e == entry) { dup = true; break; }
-                if (!dup) fp.js_globals.push_back(entry);
-            }
-        }
-    }
-
-    {
-        // Score each platform/framework against the signals collected above.
-        // All per-platform rules, meta-tag hints, and cross-platform suppression
-        // (e.g. Next.js implies React, so don't double-report React) come from
-        // signatures.conf [platform.*] / [meta_hint_platforms] / [suppress].
-        const auto &sigs = platform_signatures();
-
-        std::map<std::string, int> scores;
-        auto bump = [&](const std::string &platform, int weight) { scores[platform] += weight; };
-
-        for (const auto &[platform, rules] : sigs.platform_rules) {
-            for (const auto &rule : rules) {
-                switch (rule.kind) {
-                    case PlatformRule::Kind::PathContains:
-                        for (const auto &lp : fp.link_platform_paths)
-                            if (lp.find(rule.arg) != std::string::npos) { bump(platform, rule.weight); break; }
-                        break;
-
-                    case PlatformRule::Kind::JsGlobalEq:
-                        for (const auto &g : fp.js_globals)
-                            if (g == rule.arg) { bump(platform, rule.weight); break; }
-                        break;
-
-                    case PlatformRule::Kind::CommentContains:
-                        for (const auto &c : fp.html_comments)
-                            if (c.find(rule.arg) != std::string::npos) { bump(platform, rule.weight); break; }
-                        break;
-
-                    case PlatformRule::Kind::MetaGeneratorContains:
-                        if (fp.meta_generator.find(rule.arg) != std::string::npos)
-                            bump(platform, rule.weight);
-                        break;
-
-                    case PlatformRule::Kind::FieldAnyNonEmpty: {
-                        // arg = comma-separated list of HTTP header names (e.g. "X-Iinfo" or
-                        // "x_iinfo" -- underscores and hyphens are interchangeable). Looked up
-                        // directly against fp.raw_headers, so any response header can be used
-                        // as a signature straight from signatures.conf with no C++ change.
-                        bool any = false;
-                        for (auto fname : platform_sig_detail::split_comma(rule.arg)) {
-                            for (char &c : fname) {
-                                c = (char)tolower((unsigned char)c);
-                                if (c == '_') c = '-';
-                            }
-                            auto it = fp.raw_headers.find(fname);
-                            if (it != fp.raw_headers.end() && !it->second.empty()) { any = true; break; }
-                        }
-                        if (any) bump(platform, rule.weight);
-                        break;
-                    }
-
-                    case PlatformRule::Kind::BodyContains:
-                        // rule.arg was already lowercased at parse time.
-                        if (lbody.find(rule.arg) != std::string::npos)
-                            bump(platform, rule.weight);
-                        break;
-
-                    case PlatformRule::Kind::HeaderValueContains: {
-                        // rule.header and rule.arg were already lowercased at parse time.
-                        auto it = fp.raw_headers.find(rule.header);
-                        if (it != fp.raw_headers.end()) {
-                            std::string lv = it->second;
-                            for (char &c : lv) c = (char)tolower((unsigned char)c);
-                            if (lv.find(rule.arg) != std::string::npos)
-                                bump(platform, rule.weight);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Snapshot the *structural-only* scores (paths, JS globals, HTML
-        // comments, response body, header presence) before meta-tag hints
-        // get mixed in below. This is what lets us catch a spoofed
-        // meta:generator: a page can trivially lie in a <meta name=generator>
-        // tag (WAFs/honeypots sometimes do this on purpose to mislead
-        // scanners), but faking convincing paths, JS globals, and body
-        // content for a *different* platform at the same time is much
-        // harder, so a strong disagreement between the two is a real signal.
-        std::map<std::string, int> structural_scores = scores;
-
-        // --- Generic CMS/framework hints from meta tags (meta_generator, meta_cms, ...) ---
-        auto gen_hint = [&](const std::string &val, const std::string &platform, int w) {
-            if (!val.empty()) {
-                std::string lv = val;
-                for (char &c : lv) c = (char)tolower((unsigned char)c);
-                std::string lp = platform;
-                for (char &c : lp) c = (char)tolower((unsigned char)c);
-                if (lv.find(lp) != std::string::npos) bump(platform, w);
-            }
-        };
-        for (const std::string &platform : sigs.meta_hint_platforms) {
-            gen_hint(fp.meta_generator,  platform, 2);
-            gen_hint(fp.meta_cms,        platform, 2);
-            gen_hint(fp.meta_framework,  platform, 2);
-            gen_hint(fp.meta_powered_by, platform, 1);
-            gen_hint(fp.meta_built_with, platform, 1);
-        }
-
-        // --- Cross-platform suppression (e.g. Next.js >= 2 implies React; don't double-report) ---
-        for (const auto &sr : sigs.suppress_rules) {
-            auto it = scores.find(sr.trigger_platform);
-            if (it != scores.end() && it->second >= sr.trigger_min_score)
-                scores[sr.suppressed_platform] = 0;
-            auto sit = structural_scores.find(sr.trigger_platform);
-            if (sit != structural_scores.end() && sit->second >= sr.trigger_min_score)
-                structural_scores[sr.suppressed_platform] = 0;
-        }
-
-                // Pick winner (score >= 2 to avoid single-field false positives)
-        std::string best;
-        int best_score = 1; // minimum threshold
-        bool any_qualified = false;
-        for (const auto &[name, score] : scores) {
-            if (score > best_score) { best_score = score; best = name; any_qualified = true; }
-        }
-
-        // If two platforms tie, report both
-        std::vector<std::string> tied;
-        if (any_qualified) {
-            for (const auto &[name, score] : scores)
-                if (score == best_score && !name.empty()) tied.push_back(name);
-        }
-
-        if (tied.size() == 1)
-            fp.body_platform_hint = tied[0] + " (score=" + std::to_string(best_score) + ")";
-        else if (tied.size() > 1) {
-            fp.body_platform_hint = "";
-            for (size_t i = 0; i < tied.size(); ++i) {
-                if (i) fp.body_platform_hint += " / ";
-                fp.body_platform_hint += tied[i];
-            }
-            fp.body_platform_hint += " (tied, score=" + std::to_string(best_score) + ")";
-        }
-
-        // --- Generator-tag spoof check ---------------------------------
-        // Find the platform name meta_generator itself literally claims
-        // (if any), independent of the scored winner above.
-        std::string claimed;
-        {
-            std::string lgen = fp.meta_generator;
-            for (char &c : lgen) c = (char)tolower((unsigned char)c);
-            for (const std::string &platform : sigs.meta_hint_platforms) {
-                std::string lp = platform;
-                for (char &c : lp) c = (char)tolower((unsigned char)c);
-                if (!lp.empty() && lgen.find(lp) != std::string::npos) { claimed = platform; break; }
-            }
-        }
-
-        // Strongest structural (non-meta-tag) platform, independent of what
-        // the generator tag says.
-        std::string structural_top;
-        int structural_top_score = 1; // same "> 1" confidence bar as the main winner
-        for (const auto &[name, score] : structural_scores) {
-            if (score > structural_top_score) { structural_top_score = score; structural_top = name; }
-        }
-
-        if (!claimed.empty() && !structural_top.empty()) {
-            std::string lc = claimed, ls = structural_top;
-            for (char &c : lc) c = (char)tolower((unsigned char)c);
-            for (char &c : ls) c = (char)tolower((unsigned char)c);
-            int claimed_structural_score = 0;
-            for (const auto &[name, score] : structural_scores) {
-                std::string ln = name;
-                for (char &c : ln) c = (char)tolower((unsigned char)c);
-                if (ln == lc) { claimed_structural_score = score; break; }
-            }
-            // Flag only a *confident, contradicted* claim: real independent
-            // structural evidence (score >= 3, i.e. more than one corroborating
-            // signal) for a platform other than the one the generator tag
-            // names, while that claimed platform has little/no structural
-            // backing of its own. This intentionally stays quiet on weak/
-            // single-signal cases to avoid crying wolf on ordinary noise
-            // (shared JS libraries, boilerplate comments, etc.).
-            if (lc != ls && structural_top_score >= 3 && claimed_structural_score <= 1) {
-                fp.tamper_hint = "meta:generator claims '" + claimed + "' but structural evidence "
-                                  "(paths/JS/comments/body/headers) points to '" + structural_top +
-                                  "' (structural score " + std::to_string(structural_top_score) +
-                                  " vs " + std::to_string(claimed_structural_score) + " for " + claimed + ")";
-            }
-        }
-    }
-    if (!fp.is_redirect) fp.spa_locations = extract_spa_locations(body);
-}
-
-static std::vector<u8> dechunk_body(const u8 *body_ptr, size_t body_len)
-{
-    std::vector<u8> out;
-    out.reserve(body_len); // final size <= encoded size
-
-    size_t pos = 0;
-    while (pos < body_len) {
-        // ---- find end of the chunk-size line (terminated by \r\n) -------
-        size_t line_end = pos;
-        while (line_end + 1 < body_len &&
-               !(body_ptr[line_end] == '\r' && body_ptr[line_end + 1] == '\n'))
-            ++line_end;
-        if (line_end + 1 >= body_len) break; // malformed / truncated
-
-        // Chunk-size may have extensions after ';' (e.g. "1a3;foo=bar") —
-        // only the hex digits before ';' matter.
-        size_t size_str_len = line_end - pos;
-        std::string size_field(reinterpret_cast<const char *>(body_ptr + pos), size_str_len);
-        size_t semi = size_field.find(';');
-        if (semi != std::string::npos) size_field.resize(semi);
-
-        // Trim any stray whitespace
-        while (!size_field.empty() && isspace((unsigned char)size_field.back()))
-            size_field.pop_back();
-
-        size_t chunk_size = 0;
-        char *endptr = nullptr;
-        chunk_size = std::strtoul(size_field.c_str(), &endptr, 16);
-        if (endptr == size_field.c_str()) break; // not valid hex — malformed
-
-        size_t data_start = line_end + 2; // skip the \r\n after the size line
-
-        if (chunk_size == 0) break; // terminating chunk — trailer/final CRLF follows, ignore
-
-        if (data_start + chunk_size > body_len) {
-            // Truncated/incomplete final chunk (e.g. connection cut mid-read):
-            // take what we have and stop rather than reading out of bounds.
-            size_t avail = body_len - data_start;
-            out.insert(out.end(), body_ptr + data_start, body_ptr + data_start + avail);
-            break;
-        }
-
-        out.insert(out.end(), body_ptr + data_start, body_ptr + data_start + chunk_size);
-
-        pos = data_start + chunk_size;
-        // Skip the trailing \r\n that follows each chunk's data
-        if (pos + 1 < body_len && body_ptr[pos] == '\r' && body_ptr[pos + 1] == '\n')
-            pos += 2;
-    }
-
-    return out;
-}
-
-static std::vector<u8> decompress_body(const std::vector<u8> &resp)
-{
-    // ---- 1. Find header/body boundary ------------------------------------
-    size_t hdr_end = 0;
-    for (size_t i = 0; i + 3 < resp.size(); ++i) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            hdr_end = i + 4;
-            break;
-        }
-    }
-    if (hdr_end == 0) {
-        // Try \n\n fallback
-        for (size_t i = 0; i + 1 < resp.size(); ++i) {
-            if (resp[i]=='\n' && resp[i+1]=='\n') { hdr_end = i + 2; break; }
-        }
-    }
-    if (hdr_end == 0 || hdr_end >= resp.size()) return resp; // no body
-
-    // ---- 2. Extract Content-Encoding value (lowercase) -------------------
-    std::string ce = extract_header(resp, "Content-Encoding");
-
-    // ---- 2a. Extract Transfer-Encoding and dechunk first if needed -------
-    std::string te = extract_header(resp, "Transfer-Encoding");
-    for (char &c : te) c = (char)tolower((unsigned char)c);
-
-    const u8 *raw_body_ptr = resp.data() + hdr_end;
-    size_t    raw_body_len = resp.size() - hdr_end;
-
-    std::vector<u8> dechunked_storage; // keeps dechunked bytes alive if used
-    const u8 *body_ptr = raw_body_ptr;
-    size_t    body_len = raw_body_len;
-
-    if (te.find("chunked") != std::string::npos) {
-        dechunked_storage = dechunk_body(raw_body_ptr, raw_body_len);
-        body_ptr = dechunked_storage.data();
-        body_len = dechunked_storage.size();
-    }
-
-    if (ce.empty()) {
-        // No Content-Encoding: if we dechunked, we still need to hand back
-        // the dechunked plaintext body instead of the wire-framed original.
-        if (te.find("chunked") != std::string::npos) {
-            std::vector<u8> out;
-            out.reserve(hdr_end + body_len);
-            out.insert(out.end(), resp.begin(), resp.begin() + (std::ptrdiff_t)hdr_end);
-            out.insert(out.end(), body_ptr, body_ptr + body_len);
-            return out;
-        }
-        return resp; // nothing to do
-    }
-
-    // Lowercase for comparison
-    for (char &c : ce) c = (char)tolower((unsigned char)c);
-
-    std::vector<u8> decompressed;
-    bool success = false;
-
-    // ---- 3a. gzip / deflate via zlib ------------------------------------
-    if (ce.find("gzip") != std::string::npos ||
-        ce.find("deflate") != std::string::npos)
-    {
-        // zlib inflateInit2 with windowBits=47 auto-detects gzip vs raw deflate
-        z_stream zs{};
-        zs.next_in  = const_cast<Bytef *>(body_ptr);
-        zs.avail_in = (uInt)body_len;
-        int wbits = (ce.find("gzip") != std::string::npos) ? 15 + 16  // gzip
-                                                            : 15 + 32; // auto
-        if (inflateInit2(&zs, wbits) == Z_OK) {
-            decompressed.resize(body_len * 4 > 65536 ? body_len * 4 : 65536);
-            zs.next_out  = decompressed.data();
-            zs.avail_out = (uInt)decompressed.size();
-            int ret;
-            do {
-                if (zs.avail_out == 0) {
-                    size_t old = decompressed.size();
-                    decompressed.resize(old * 2);
-                    zs.next_out  = decompressed.data() + old;
-                    zs.avail_out = (uInt)old;
-                }
-                ret = inflate(&zs, Z_SYNC_FLUSH);
-            } while (ret == Z_OK || ret == Z_BUF_ERROR);
-            if (ret == Z_STREAM_END || ret == Z_OK || ret == Z_BUF_ERROR) {
-                decompressed.resize(zs.total_out);
-                success = !decompressed.empty();
-            }
-            inflateEnd(&zs);
-        }
-        if (!success) {
-            // deflate: try raw inflate (no zlib header) as last resort
-            z_stream zs2{};
-            zs2.next_in  = const_cast<Bytef *>(body_ptr);
-            zs2.avail_in = (uInt)body_len;
-            if (inflateInit2(&zs2, -15) == Z_OK) {
-                decompressed.resize(body_len * 4 > 65536 ? body_len * 4 : 65536);
-                zs2.next_out  = decompressed.data();
-                zs2.avail_out = (uInt)decompressed.size();
-                int ret2;
-                do {
-                    if (zs2.avail_out == 0) {
-                        size_t old = decompressed.size();
-                        decompressed.resize(old * 2);
-                        zs2.next_out  = decompressed.data() + old;
-                        zs2.avail_out = (uInt)old;
-                    }
-                    ret2 = inflate(&zs2, Z_SYNC_FLUSH);
-                } while (ret2 == Z_OK || ret2 == Z_BUF_ERROR);
-                if (ret2 == Z_STREAM_END || ret2 == Z_OK) {
-                    decompressed.resize(zs2.total_out);
-                    success = !decompressed.empty();
-                }
-                inflateEnd(&zs2);
-            }
-        }
-    }
-
-    // ---- 3b. Brotli (br) ------------------------------------------------
-#ifdef HAVE_BROTLI
-    else if (ce.find("br") != std::string::npos)
-    {
-        size_t decoded_size = body_len * 6 > 131072 ? body_len * 6 : 131072;
-        decompressed.resize(decoded_size);
-        BrotliDecoderResult bret = BrotliDecoderDecompress(
-            body_len, body_ptr,
-            &decoded_size, decompressed.data());
-        if (bret == BROTLI_DECODER_RESULT_SUCCESS) {
-            decompressed.resize(decoded_size);
-            success = !decompressed.empty();
-        } else {
-            // Buffer too small: try larger buffer (some br bodies are very sparse)
-            decoded_size = body_len * 20 > 524288 ? body_len * 20 : 524288;
-            decompressed.resize(decoded_size);
-            bret = BrotliDecoderDecompress(
-                body_len, body_ptr,
-                &decoded_size, decompressed.data());
-            if (bret == BROTLI_DECODER_RESULT_SUCCESS) {
-                decompressed.resize(decoded_size);
-                success = !decompressed.empty();
-            }
-        }
-    }
-#else
-    else if (ce.find("br") != std::string::npos)
-    {
-        // Brotli not compiled in — return the (already dechunked) body unchanged.
-        // Build with -DHAVE_BROTLI -lbrotlidec to enable.
-        fprintf(stderr, "  [decompress] br encoding detected but Brotli not compiled in"
-                        " — body will be undecompressed\n");
-        std::vector<u8> out;
-        out.reserve(hdr_end + body_len);
-        out.insert(out.end(), resp.begin(), resp.begin() + (std::ptrdiff_t)hdr_end);
-        out.insert(out.end(), body_ptr, body_ptr + body_len);
-        return out;
-    }
-#endif
-
-    // ---- 3c. Zstandard (zstd) -------------------------------------------
-#ifdef HAVE_ZSTD
-    else if (ce.find("zstd") != std::string::npos)
-    {
-        unsigned long long const frame_size =
-            ZSTD_getFrameContentSize(body_ptr, body_len);
-        size_t alloc = (frame_size != ZSTD_CONTENTSIZE_UNKNOWN &&
-                        frame_size != ZSTD_CONTENTSIZE_ERROR)
-                     ? (size_t)frame_size
-                     : body_len * 8 > 131072 ? body_len * 8 : 131072;
-        decompressed.resize(alloc);
-        size_t zret = ZSTD_decompress(decompressed.data(), alloc,
-                                      body_ptr, body_len);
-        if (!ZSTD_isError(zret)) {
-            decompressed.resize(zret);
-            success = !decompressed.empty();
-        } else {
-            fprintf(stderr, "  [decompress] zstd error: %s\n",
-                    ZSTD_getErrorName(zret));
-        }
-    }
-#else
-    else if (ce.find("zstd") != std::string::npos)
-    {
-        fprintf(stderr, "  [decompress] zstd encoding detected but libzstd not compiled in"
-                        " — body will be undecompressed\n");
-        std::vector<u8> out;
-        out.reserve(hdr_end + body_len);
-        out.insert(out.end(), resp.begin(), resp.begin() + (std::ptrdiff_t)hdr_end);
-        out.insert(out.end(), body_ptr, body_ptr + body_len);
-        return out;
-    }
-#endif
-
-    // ---- 4. Reassemble response: headers + decompressed body -------------
-    if (!success || decompressed.empty()) {
-        // Compression failed (or unrecognized ce) — still return the
-        // dechunked-but-not-decompressed body rather than the raw wire
-        // bytes, so downstream code never sees leftover chunk framing.
-        std::vector<u8> out;
-        out.reserve(hdr_end + body_len);
-        out.insert(out.end(), resp.begin(), resp.begin() + (std::ptrdiff_t)hdr_end);
-        out.insert(out.end(), body_ptr, body_ptr + body_len);
-        return out;
-    }
-
-    std::vector<u8> out;
-    out.reserve(hdr_end + decompressed.size());
-    // Copy headers verbatim
-    out.insert(out.end(), resp.begin(), resp.begin() + (std::ptrdiff_t)hdr_end);
-    // Append decompressed body
-    out.insert(out.end(), decompressed.begin(), decompressed.end());
-    return out;
-}
-
-/* Populate an HttpFingerprint from a raw response buffer */
-static HttpFingerprint make_http_fingerprint(const std::vector<u8> &resp,
-                                             const std::string     &phase,
-                                             bool                   is_ssl,
-                                             const TlsCertInfo     &cert_info = TlsCertInfo{})
-{
-
-    const std::vector<u8> decompressed_buf = decompress_body(resp);
-    const std::vector<u8> &effective       = decompressed_buf;
-
-    HttpFingerprint fp;
-    fp.phase       = phase;
-    fp.is_ssl      = is_ssl;
-    fp.status_code = extract_status_code(effective);
-    fp.status_line = extract_status_line(effective);
-    fp.server      = extract_header(effective, "Server");
-    fp.osd_name    = extract_header(effective, "osd-name");
-    fp.powered_by  = extract_header(effective, "X-Powered-By");
-    fp.title       = extract_title(effective);
-    fp.via         = extract_header(effective, "Via");
-    fp.x_generator = extract_header(effective, "X-Generator");
-    fp.location    = extract_header(effective, "Location");
-    fp.raw_headers = collect_all_headers(effective, &fp.duplicate_headers);
-
-    // ---- CDN / Cache / Proxy infrastructure headers ----
-    fp.x_amz_cf_pop              = extract_header(effective, "X-Amz-Cf-Pop");
-    fp.x_amz_cf_id               = extract_header(effective, "X-Amz-Cf-Id");
-    fp.x_cache                   = extract_header(effective, "X-Cache");
-    fp.cf_ray                    = extract_header(effective, "CF-Ray");
-    fp.cf_cache_status           = extract_header(effective, "CF-Cache-Status");
-    fp.x_served_by               = extract_header(effective, "X-Served-By");
-    fp.x_cache_hits              = extract_header(effective, "X-Cache-Hits");
-    fp.x_cache_lookup            = extract_header(effective, "X-Cache-Lookup");
-    fp.akamai_cache_key          = extract_header(effective, "Akamai-X-Get-Cache-Key");
-    fp.x_amz_request_id          = extract_header(effective, "X-Amz-Request-Id");
-    fp.x_amz_id_2                = extract_header(effective, "X-Amz-Id-2");
-    fp.x_amz_version_id          = extract_header(effective, "x-amz-version-id");
-    fp.x_amz_sse                 = extract_header(effective, "X-Amz-Server-Side-Encryption");
-    fp.x_amz_bucket_region       = extract_header(effective, "X-Amz-Bucket-Region");
-    fp.x_amzn_request_id         = extract_header(effective, "X-Amzn-RequestId");
-    fp.x_amzn_error_type         = extract_header(effective, "X-Amzn-Error-Type");
-    fp.x_via                     = extract_header(effective, "X-Via");
-    fp.x_forwarded_for           = extract_header(effective, "X-Forwarded-For");
-    fp.x_forwarded_proto         = extract_header(effective, "X-Forwarded-Proto");
-    fp.x_real_ip                 = extract_header(effective, "X-Real-IP");
-    fp.x_haproxy_server_state    = extract_header(effective, "X-Haproxy-Server-State");
-    fp.x_varnish                 = extract_header(effective, "X-Varnish");
-    fp.x_cacheable               = extract_header(effective, "X-Cacheable");
-    fp.x_cache_status            = extract_header(effective, "X-Cache-Status");
-    fp.x_cache_expiry            = extract_header(effective, "X-Cache-Expiry");
-    fp.age                       = extract_header(effective, "Age");
-    fp.x_drupal_cache            = extract_header(effective, "X-Drupal-Cache");
-    fp.x_drupal_dynamic_cache    = extract_header(effective, "X-Drupal-Dynamic-Cache");
-    fp.x_magento_cache_debug     = extract_header(effective, "X-Magento-Cache-Debug");
-    fp.x_wordpress_cache         = extract_header(effective, "X-WordPress-Cache");
-    fp.x_prestashop_cache        = extract_header(effective, "X-Prestashop-Cache");
-    // ---- Security ----
-    fp.www_authenticate          = extract_header(effective, "WWW-Authenticate");
-    fp.x_content_type_options    = extract_header(effective, "X-Content-Type-Options");
-    fp.strict_transport_security = extract_header(effective, "Strict-Transport-Security");
-    fp.report_to_group           = extract_report_to_group(effective);
-    fp.coop_report_to_group      = extract_coop_report_to(effective);
-    // ---- APM / Tracing ----
-    fp.x_newrelic_app_data       = extract_header(effective, "X-NewRelic-App-Data");
-    fp.x_request_id              = extract_header(effective, "X-Request-Id");
-    fp.server_timing             = extract_header(effective, "Server-Timing");
-    fp.x_cloud_trace_context     = extract_header(effective, "X-Cloud-Trace-Context");
-    // ---- CDN vendor specifics ----
-    fp.x_cdn                     = extract_header(effective, "X-CDN");
-    fp.x_edge_location           = extract_header(effective, "X-Edge-Location");
-    fp.x_edge_connect            = extract_header(effective, "X-Edge-Connect");
-    fp.x_edgeconnect_config      = extract_header(effective, "X-EdgeConnect-Config");
-    fp.x_edgeconnect_method      = extract_header(effective, "X-EdgeConnect-Method");
-    fp.x_cache_key               = extract_header(effective, "X-Cache-Key");
-    fp.x_timer                   = extract_header(effective, "X-Timer");
-    fp.x_host                    = extract_header(effective, "X-Host");
-    fp.x_backend                 = extract_header(effective, "X-Backend");
-    fp.x_backend_server          = extract_header(effective, "X-Backend-Server");
-    fp.x_orig_cache              = extract_header(effective, "X-Orig-Cache");
-    fp.x_proxy_cache             = extract_header(effective, "X-Proxy-Cache");
-    // ---- AWS extended ----
-    fp.x_amz_storage_class       = extract_header(effective, "X-Amz-Storage-Class");
-    fp.x_amz_delete_marker       = extract_header(effective, "X-Amz-Delete-Marker");
-    fp.x_amz_expiration          = extract_header(effective, "X-Amz-Expiration");
-    fp.x_amz_replication_status  = extract_header(effective, "X-Amz-Replication-Status");
-    fp.x_amz_request_charged     = extract_header(effective, "X-Amz-Request-Charged");
-    // ---- GCP / GCS ----
-    fp.x_google_cache_control    = extract_header(effective, "X-Google-Cache-Control");
-    fp.x_google_cache_hit        = extract_header(effective, "X-Google-Cache-Hit");
-    fp.x_google_load_balancer    = extract_header(effective, "X-Google-Load-Balancer");
-    fp.x_google_backend          = extract_header(effective, "X-Google-Backend");
-    fp.x_google_appengine_app    = extract_header(effective, "X-Google-AppEngine-App");
-    fp.x_google_appengine_country= extract_header(effective, "X-Google-AppEngine-Country");
-    fp.x_guploader               = extract_header(effective, "X-GUploader");
-    fp.x_gcs_bucket              = extract_header(effective, "X-GCS-Bucket");
-    fp.x_gcs_object_generation   = extract_header(effective, "X-GCS-Object-Generation");
-    // ---- Azure / MS Edge ----
-    fp.x_ms_edge_ref             = extract_header(effective, "X-MS-Edge-Ref");
-    fp.x_ms_request_id           = extract_header(effective, "X-MS-RequestId");
-    fp.x_ms_client_request_id    = extract_header(effective, "X-MS-Client-RequestId");
-    fp.x_ms_correlation_request_id = extract_header(effective, "X-MS-Correlation-RequestId");
-    fp.x_azure_ref               = extract_header(effective, "X-Azure-Ref");
-    fp.x_azure_request_id        = extract_header(effective, "X-Azure-RequestId");
-    fp.x_msedge_ref              = extract_header(effective, "X-MSEdge-Ref");
-    // ---- Load balancer ----
-    fp.x_lb_node                 = extract_header(effective, "X-LB-Node");
-    fp.x_lb_tag                  = extract_header(effective, "X-LB-Tag");
-    fp.x_lb_instance             = extract_header(effective, "X-LB-Instance");
-    fp.x_lb_server               = extract_header(effective, "X-LB-Server");
-    fp.x_lb_backend              = extract_header(effective, "X-LB-Backend");
-    fp.x_proxy_id                = extract_header(effective, "X-Proxy-Id");
-    fp.x_proxy_server            = extract_header(effective, "X-Proxy-Server");
-    fp.x_proxy_backend           = extract_header(effective, "X-Proxy-Backend");
-    fp.x_haproxy_node            = extract_header(effective, "X-HAProxy-Node");
-    fp.x_haproxy_backend         = extract_header(effective, "X-HAProxy-Backend");
-    fp.x_haproxy_config          = extract_header(effective, "X-HAProxy-Config");
-    // ---- Nginx / Varnish / Squid ----
-    fp.x_nginx_cache_status      = extract_header(effective, "X-Nginx-Cache-Status");
-    fp.x_nginx_proxy             = extract_header(effective, "X-Nginx-Proxy");
-    fp.x_cache_id                = extract_header(effective, "X-Cache-Id");
-    fp.x_cache_ttl               = extract_header(effective, "X-Cache-TTL");
-    fp.x_cache_time              = extract_header(effective, "X-Cache-Time");
-    fp.x_cache_request           = extract_header(effective, "X-Cache-Request");
-    fp.x_cache_response          = extract_header(effective, "X-Cache-Response");
-    fp.x_cache_info              = extract_header(effective, "X-Cache-Info");
-    fp.x_squid_error             = extract_header(effective, "X-Squid-Error");
-    fp.x_squid_request_id        = extract_header(effective, "X-Squid-Request-Id");
-    fp.x_varnish_cache           = extract_header(effective, "X-Varnish-Cache");
-    fp.x_varnish_age             = extract_header(effective, "X-Varnish-Age");
-    fp.x_varnish_backend         = extract_header(effective, "X-Varnish-Backend");
-    fp.x_varnish_session         = extract_header(effective, "X-Varnish-Session");
-    fp.x_varnish_hit             = extract_header(effective, "X-Varnish-Hit");
-    fp.x_varnish_ttl             = extract_header(effective, "X-Varnish-TTL");
-    // ---- Auth ----
-    fp.x_auth_token              = extract_header(effective, "X-Auth-Token");
-    fp.x_auth_request_redirect   = extract_header(effective, "X-Auth-Request-Redirect");
-    fp.x_auth_request_url        = extract_header(effective, "X-Auth-Request-URL");
-    fp.x_auth_user               = extract_header(effective, "X-Auth-User");
-    fp.x_auth_user_groups        = extract_header(effective, "X-Auth-User-Groups");
-    fp.x_auth_service            = extract_header(effective, "X-Auth-Service");
-    fp.x_csrf_token              = extract_header(effective, "X-CSRF-Token");
-    fp.x_csrf_param              = extract_header(effective, "X-CSRF-Param");
-    fp.x_csrf_header             = extract_header(effective, "X-CSRF-Header");
-    // ---- Debug / CMS ----
-    fp.x_debug                   = extract_header(effective, "X-Debug");
-    fp.x_debug_token             = extract_header(effective, "X-Debug-Token");
-    fp.x_debug_token_link        = extract_header(effective, "X-Debug-Token-Link");
-    fp.x_drupal_route            = extract_header(effective, "X-Drupal-Route");
-    fp.x_drupal_ajax_token       = extract_header(effective, "X-Drupal-Ajax-Token");
-    fp.x_wordpress_theme         = extract_header(effective, "X-WordPress-Theme");
-    fp.x_wordpress_plugin        = extract_header(effective, "X-WordPress-Plugin");
-    fp.x_magento_store           = extract_header(effective, "X-Magento-Store");
-    fp.x_magento_theme           = extract_header(effective, "X-Magento-Theme");
-    fp.x_magento_layout          = extract_header(effective, "X-Magento-Layout");
-    fp.x_prestashop_store        = extract_header(effective, "X-Prestashop-Store");
-    fp.x_prestashop_theme        = extract_header(effective, "X-Prestashop-Theme");
-    // ---- Timing / Rate limiting ----
-    fp.x_response_time           = extract_header(effective, "X-Response-Time");
-    fp.x_execution_time          = extract_header(effective, "X-Execution-Time");
-    fp.x_process_time            = extract_header(effective, "X-Process-Time");
-    fp.x_generator_duration      = extract_header(effective, "X-Generator-Duration");
-    fp.x_powered_by_duration     = extract_header(effective, "X-Powered-By-Duration");
-    fp.x_ratelimit_limit         = extract_header(effective, "X-RateLimit-Limit");
-    fp.x_ratelimit_remaining     = extract_header(effective, "X-RateLimit-Remaining");
-    fp.x_ratelimit_reset         = extract_header(effective, "X-RateLimit-Reset");
-    fp.x_ratelimit_retry_after   = extract_header(effective, "X-RateLimit-Retry-After");
-    fp.x_ratelimit_resource      = extract_header(effective, "X-RateLimit-Resource");
-    // ---- Misc ----
-    fp.x_mailer                  = extract_header(effective, "X-Mailer");
-    fp.x_php_script              = extract_header(effective, "X-PHP-Script");
-    fp.x_php_origin              = extract_header(effective, "X-PHP-Origin");
-    fp.x_object_version          = extract_header(effective, "X-Object-Version");
-    fp.x_object_delete_marker    = extract_header(effective, "X-Object-Delete-Marker");
-    fp.x_object_expiry           = extract_header(effective, "X-Object-Expiry");
-    fp.x_object_storage_class    = extract_header(effective, "X-Object-Storage-Class");
-    fp.x_bucket_location         = extract_header(effective, "X-Bucket-Location");
-    fp.x_bucket_versioning       = extract_header(effective, "X-Bucket-Versioning");
-    // ---- CI/CD / DevOps identity headers ----
-    fp.x_jenkins                 = extract_header(effective, "X-Jenkins");
-    fp.x_hudson                  = extract_header(effective, "X-Hudson");
-    fp.x_teamcity_node_id        = extract_header(effective, "X-TeamCity-Node-Id");
-    fp.x_gitlab_meta             = extract_header(effective, "X-Gitlab-Meta");
-    fp.x_harness_account         = extract_header(effective, "x-harness-account");
-    fp.is_redirect = (fp.status_code >= 300 && fp.status_code < 400);
-    fp.is_4xx      = (fp.status_code >= 400 && fp.status_code < 500);
-    fp.tls_cert    = cert_info;
-
-    // Build printable snippet (first 200 chars of response)
-    size_t snip = std::min(effective.size(), (size_t)200);
-    for (size_t i = 0; i < snip; ++i) {
-        unsigned char c = effective[i];
-        fp.raw_snippet += (c >= 32 && c < 127) ? (char)c : '.';
-    }
-
-    // ---- HTML body signals (meta tags, comments, links, JS globals) ----
-    extract_html_body_signals(effective, fp);
-
-    return fp;
-}
-
-
-static HttpFingerprint merge_http_fingerprints(
-    const std::vector<HttpFingerprint> &fps)
-{
-    if (fps.empty()) return {};
-    if (fps.size() == 1) return fps[0];   // nothing to merge
-    auto merge_field = [](const std::vector<HttpFingerprint> &src,
-                          std::string HttpFingerprint::*field) -> std::string {
-        std::vector<std::string> seen_lc;   // lowercase copies for dedup
-        std::vector<std::string> ordered;   // original-case, insertion order
-
-        for (const auto &fp : src) {
-            const std::string &val = fp.*field;
-            if (val.empty()) continue;
-
-            // Normalise: collapse whitespace, trim
-            std::string clean;
-            clean.reserve(val.size());
-            bool ws = false;
-            for (unsigned char c : val) {
-                if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
-                    if (!ws) { clean += ' '; ws = true; }
-                } else { clean += (char)c; ws = false; }
-            }
-            while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
-            while (!clean.empty() && clean.back()  == ' ') clean.pop_back();
-            if (clean.empty()) continue;
-
-            std::string lc = clean;
-            for (char &c : lc) c = (char)tolower((unsigned char)c);
-            bool dup = false;
-            for (const auto &s : seen_lc) if (s == lc) { dup = true; break; }
-            if (!dup) { seen_lc.push_back(lc); ordered.push_back(clean); }
-        }
-
-        if (ordered.empty()) return "";
-        std::string result = ordered[0];
-        for (size_t i = 1; i < ordered.size(); ++i) result += " | " + ordered[i];
-        return result;
-    };
-
-    // Helper for vector<string> fields: union of all unique entries
-    auto merge_vec = [](const std::vector<HttpFingerprint> &src,
-                        std::vector<std::string> HttpFingerprint::*field)
-        -> std::vector<std::string>
-    {
-        std::vector<std::string> result;
-        for (const auto &fp : src) {
-            for (const auto &v : fp.*field) {
-                bool dup = false;
-                std::string lv = v;
-                for (char &c : lv) c = (char)tolower((unsigned char)c);
-                for (const auto &r : result) {
-                    std::string lr = r;
-                    for (char &c : lr) c = (char)tolower((unsigned char)c);
-                    if (lr == lv) { dup = true; break; }
-                }
-                if (!dup) result.push_back(v);
-            }
-        }
-        return result;
-    };
-
-    HttpFingerprint merged;
-    merged.phase = "merged";
-
-    // Merge all simple string fields
-    merged.server         = merge_field(fps, &HttpFingerprint::server);
-    merged.osd_name       = merge_field(fps, &HttpFingerprint::osd_name);
-    merged.powered_by     = merge_field(fps, &HttpFingerprint::powered_by);
-
-    {
-        auto is_redirect_title = [](const std::string &t) -> bool {
-            if (t.size() < 13) return false;
-            // lower-case compare of first 13 chars against "redirecting to"
-            // (we check both 13-char prefix "redirecting t" and full "redirecting to ")
-            static const char kRedirPrefix[] = "redirecting to";
-            for (size_t i = 0; i < sizeof(kRedirPrefix) - 1 && i < t.size(); ++i) {
-                if ((char)tolower((unsigned char)t[i]) != kRedirPrefix[i])
-                    return false;
-            }
-            return true;
-        };
-
-        std::string best_title;
-        std::string last_any_title;
-        for (const auto &fp : fps) {
-            if (fp.title.empty()) continue;
-            last_any_title = fp.title;
-            if (!is_redirect_title(fp.title))
-                best_title = fp.title;   // keep updating — we want the LAST such title
-        }
-        merged.title = best_title.empty() ? last_any_title : best_title;
-    }
-    merged.via            = merge_field(fps, &HttpFingerprint::via);
-    merged.x_generator    = merge_field(fps, &HttpFingerprint::x_generator);
-    // Location / redirect_url: keep from last hop that had one
-    for (const auto &fp : fps) {
-        if (!fp.location.empty())     merged.location     = fp.location;
-        if (!fp.redirect_url.empty()) merged.redirect_url = fp.redirect_url;
-    }
-    merged.x_amz_cf_pop              = merge_field(fps, &HttpFingerprint::x_amz_cf_pop);
-    merged.x_amz_cf_id               = merge_field(fps, &HttpFingerprint::x_amz_cf_id);
-    merged.x_cache                   = merge_field(fps, &HttpFingerprint::x_cache);
-    merged.cf_ray                    = merge_field(fps, &HttpFingerprint::cf_ray);
-    merged.cf_cache_status           = merge_field(fps, &HttpFingerprint::cf_cache_status);
-    merged.x_served_by               = merge_field(fps, &HttpFingerprint::x_served_by);
-    merged.x_cache_hits              = merge_field(fps, &HttpFingerprint::x_cache_hits);
-    merged.x_cache_lookup            = merge_field(fps, &HttpFingerprint::x_cache_lookup);
-    merged.akamai_cache_key          = merge_field(fps, &HttpFingerprint::akamai_cache_key);
-    merged.x_amz_request_id         = merge_field(fps, &HttpFingerprint::x_amz_request_id);
-    merged.x_amz_id_2                = merge_field(fps, &HttpFingerprint::x_amz_id_2);
-    merged.x_amz_version_id         = merge_field(fps, &HttpFingerprint::x_amz_version_id);
-    merged.x_amz_sse                 = merge_field(fps, &HttpFingerprint::x_amz_sse);
-    merged.x_amz_bucket_region       = merge_field(fps, &HttpFingerprint::x_amz_bucket_region);
-    merged.x_amzn_request_id        = merge_field(fps, &HttpFingerprint::x_amzn_request_id);
-    merged.x_amzn_error_type        = merge_field(fps, &HttpFingerprint::x_amzn_error_type);
-    merged.x_via                     = merge_field(fps, &HttpFingerprint::x_via);
-    merged.x_forwarded_for           = merge_field(fps, &HttpFingerprint::x_forwarded_for);
-    merged.x_forwarded_proto         = merge_field(fps, &HttpFingerprint::x_forwarded_proto);
-    merged.x_real_ip                 = merge_field(fps, &HttpFingerprint::x_real_ip);
-    merged.x_haproxy_server_state    = merge_field(fps, &HttpFingerprint::x_haproxy_server_state);
-    merged.x_varnish                 = merge_field(fps, &HttpFingerprint::x_varnish);
-    merged.x_cacheable               = merge_field(fps, &HttpFingerprint::x_cacheable);
-    merged.x_cache_status            = merge_field(fps, &HttpFingerprint::x_cache_status);
-    merged.x_cache_expiry            = merge_field(fps, &HttpFingerprint::x_cache_expiry);
-    merged.age                       = merge_field(fps, &HttpFingerprint::age);
-    merged.x_drupal_cache            = merge_field(fps, &HttpFingerprint::x_drupal_cache);
-    merged.x_drupal_dynamic_cache    = merge_field(fps, &HttpFingerprint::x_drupal_dynamic_cache);
-    merged.x_magento_cache_debug     = merge_field(fps, &HttpFingerprint::x_magento_cache_debug);
-    merged.x_wordpress_cache         = merge_field(fps, &HttpFingerprint::x_wordpress_cache);
-    merged.x_prestashop_cache        = merge_field(fps, &HttpFingerprint::x_prestashop_cache);
-    merged.www_authenticate          = merge_field(fps, &HttpFingerprint::www_authenticate);
-    merged.x_content_type_options    = merge_field(fps, &HttpFingerprint::x_content_type_options);
-    merged.strict_transport_security = merge_field(fps, &HttpFingerprint::strict_transport_security);
-    merged.report_to_group           = merge_field(fps, &HttpFingerprint::report_to_group);
-    merged.coop_report_to_group      = merge_field(fps, &HttpFingerprint::coop_report_to_group);
-    merged.x_newrelic_app_data       = merge_field(fps, &HttpFingerprint::x_newrelic_app_data);
-    merged.x_request_id              = merge_field(fps, &HttpFingerprint::x_request_id);
-    merged.server_timing             = merge_field(fps, &HttpFingerprint::server_timing);
-    merged.x_cloud_trace_context     = merge_field(fps, &HttpFingerprint::x_cloud_trace_context);
-    merged.x_cdn                     = merge_field(fps, &HttpFingerprint::x_cdn);
-    merged.x_edge_location           = merge_field(fps, &HttpFingerprint::x_edge_location);
-    merged.x_edge_connect            = merge_field(fps, &HttpFingerprint::x_edge_connect);
-    merged.x_edgeconnect_config      = merge_field(fps, &HttpFingerprint::x_edgeconnect_config);
-    merged.x_edgeconnect_method      = merge_field(fps, &HttpFingerprint::x_edgeconnect_method);
-    merged.x_cache_key               = merge_field(fps, &HttpFingerprint::x_cache_key);
-    merged.x_timer                   = merge_field(fps, &HttpFingerprint::x_timer);
-    merged.x_host                    = merge_field(fps, &HttpFingerprint::x_host);
-    merged.x_backend                 = merge_field(fps, &HttpFingerprint::x_backend);
-    merged.x_backend_server         = merge_field(fps, &HttpFingerprint::x_backend_server);
-    merged.x_orig_cache              = merge_field(fps, &HttpFingerprint::x_orig_cache);
-    merged.x_proxy_cache             = merge_field(fps, &HttpFingerprint::x_proxy_cache);
-    merged.x_amz_storage_class       = merge_field(fps, &HttpFingerprint::x_amz_storage_class);
-    merged.x_amz_delete_marker       = merge_field(fps, &HttpFingerprint::x_amz_delete_marker);
-    merged.x_amz_expiration          = merge_field(fps, &HttpFingerprint::x_amz_expiration);
-    merged.x_amz_replication_status  = merge_field(fps, &HttpFingerprint::x_amz_replication_status);
-    merged.x_amz_request_charged    = merge_field(fps, &HttpFingerprint::x_amz_request_charged);
-    merged.x_google_cache_control    = merge_field(fps, &HttpFingerprint::x_google_cache_control);
-    merged.x_google_cache_hit        = merge_field(fps, &HttpFingerprint::x_google_cache_hit);
-    merged.x_google_load_balancer    = merge_field(fps, &HttpFingerprint::x_google_load_balancer);
-    merged.x_google_backend          = merge_field(fps, &HttpFingerprint::x_google_backend);
-    merged.x_google_appengine_app    = merge_field(fps, &HttpFingerprint::x_google_appengine_app);
-    merged.x_google_appengine_country= merge_field(fps, &HttpFingerprint::x_google_appengine_country);
-    merged.x_guploader               = merge_field(fps, &HttpFingerprint::x_guploader);
-    merged.x_gcs_bucket              = merge_field(fps, &HttpFingerprint::x_gcs_bucket);
-    merged.x_gcs_object_generation   = merge_field(fps, &HttpFingerprint::x_gcs_object_generation);
-    merged.x_ms_edge_ref             = merge_field(fps, &HttpFingerprint::x_ms_edge_ref);
-    merged.x_ms_request_id           = merge_field(fps, &HttpFingerprint::x_ms_request_id);
-    merged.x_ms_client_request_id    = merge_field(fps, &HttpFingerprint::x_ms_client_request_id);
-    merged.x_ms_correlation_request_id = merge_field(fps, &HttpFingerprint::x_ms_correlation_request_id);
-    merged.x_azure_ref               = merge_field(fps, &HttpFingerprint::x_azure_ref);
-    merged.x_azure_request_id        = merge_field(fps, &HttpFingerprint::x_azure_request_id);
-    merged.x_msedge_ref              = merge_field(fps, &HttpFingerprint::x_msedge_ref);
-    merged.x_lb_node                 = merge_field(fps, &HttpFingerprint::x_lb_node);
-    merged.x_lb_tag                  = merge_field(fps, &HttpFingerprint::x_lb_tag);
-    merged.x_lb_instance             = merge_field(fps, &HttpFingerprint::x_lb_instance);
-    merged.x_lb_server               = merge_field(fps, &HttpFingerprint::x_lb_server);
-    merged.x_lb_backend              = merge_field(fps, &HttpFingerprint::x_lb_backend);
-    merged.x_proxy_id                = merge_field(fps, &HttpFingerprint::x_proxy_id);
-    merged.x_proxy_server            = merge_field(fps, &HttpFingerprint::x_proxy_server);
-    merged.x_proxy_backend           = merge_field(fps, &HttpFingerprint::x_proxy_backend);
-    merged.x_haproxy_node            = merge_field(fps, &HttpFingerprint::x_haproxy_node);
-    merged.x_haproxy_backend         = merge_field(fps, &HttpFingerprint::x_haproxy_backend);
-    merged.x_haproxy_config          = merge_field(fps, &HttpFingerprint::x_haproxy_config);
-    merged.x_nginx_cache_status      = merge_field(fps, &HttpFingerprint::x_nginx_cache_status);
-    merged.x_nginx_proxy             = merge_field(fps, &HttpFingerprint::x_nginx_proxy);
-    merged.x_cache_id                = merge_field(fps, &HttpFingerprint::x_cache_id);
-    merged.x_cache_ttl               = merge_field(fps, &HttpFingerprint::x_cache_ttl);
-    merged.x_cache_time              = merge_field(fps, &HttpFingerprint::x_cache_time);
-    merged.x_cache_request           = merge_field(fps, &HttpFingerprint::x_cache_request);
-    merged.x_cache_response          = merge_field(fps, &HttpFingerprint::x_cache_response);
-    merged.x_cache_info              = merge_field(fps, &HttpFingerprint::x_cache_info);
-    merged.x_squid_error             = merge_field(fps, &HttpFingerprint::x_squid_error);
-    merged.x_squid_request_id        = merge_field(fps, &HttpFingerprint::x_squid_request_id);
-    merged.x_varnish_cache           = merge_field(fps, &HttpFingerprint::x_varnish_cache);
-    merged.x_varnish_age             = merge_field(fps, &HttpFingerprint::x_varnish_age);
-    merged.x_varnish_backend         = merge_field(fps, &HttpFingerprint::x_varnish_backend);
-    merged.x_varnish_session         = merge_field(fps, &HttpFingerprint::x_varnish_session);
-    merged.x_varnish_hit             = merge_field(fps, &HttpFingerprint::x_varnish_hit);
-    merged.x_varnish_ttl             = merge_field(fps, &HttpFingerprint::x_varnish_ttl);
-    merged.x_auth_token              = merge_field(fps, &HttpFingerprint::x_auth_token);
-    merged.x_auth_request_redirect   = merge_field(fps, &HttpFingerprint::x_auth_request_redirect);
-    merged.x_auth_request_url        = merge_field(fps, &HttpFingerprint::x_auth_request_url);
-    merged.x_auth_user               = merge_field(fps, &HttpFingerprint::x_auth_user);
-    merged.x_auth_user_groups        = merge_field(fps, &HttpFingerprint::x_auth_user_groups);
-    merged.x_auth_service            = merge_field(fps, &HttpFingerprint::x_auth_service);
-    merged.x_csrf_token              = merge_field(fps, &HttpFingerprint::x_csrf_token);
-    merged.x_csrf_param              = merge_field(fps, &HttpFingerprint::x_csrf_param);
-    merged.x_csrf_header             = merge_field(fps, &HttpFingerprint::x_csrf_header);
-    merged.x_debug                   = merge_field(fps, &HttpFingerprint::x_debug);
-    merged.x_debug_token             = merge_field(fps, &HttpFingerprint::x_debug_token);
-    merged.x_debug_token_link        = merge_field(fps, &HttpFingerprint::x_debug_token_link);
-    merged.x_drupal_route            = merge_field(fps, &HttpFingerprint::x_drupal_route);
-    merged.x_drupal_ajax_token       = merge_field(fps, &HttpFingerprint::x_drupal_ajax_token);
-    merged.x_wordpress_theme         = merge_field(fps, &HttpFingerprint::x_wordpress_theme);
-    merged.x_wordpress_plugin        = merge_field(fps, &HttpFingerprint::x_wordpress_plugin);
-    merged.x_magento_store           = merge_field(fps, &HttpFingerprint::x_magento_store);
-    merged.x_magento_theme           = merge_field(fps, &HttpFingerprint::x_magento_theme);
-    merged.x_magento_layout          = merge_field(fps, &HttpFingerprint::x_magento_layout);
-    merged.x_prestashop_store        = merge_field(fps, &HttpFingerprint::x_prestashop_store);
-    merged.x_prestashop_theme        = merge_field(fps, &HttpFingerprint::x_prestashop_theme);
-    merged.x_response_time           = merge_field(fps, &HttpFingerprint::x_response_time);
-    merged.x_execution_time          = merge_field(fps, &HttpFingerprint::x_execution_time);
-    merged.x_process_time            = merge_field(fps, &HttpFingerprint::x_process_time);
-    merged.x_generator_duration      = merge_field(fps, &HttpFingerprint::x_generator_duration);
-    merged.x_powered_by_duration     = merge_field(fps, &HttpFingerprint::x_powered_by_duration);
-    merged.x_ratelimit_limit         = merge_field(fps, &HttpFingerprint::x_ratelimit_limit);
-    merged.x_ratelimit_remaining     = merge_field(fps, &HttpFingerprint::x_ratelimit_remaining);
-    merged.x_ratelimit_reset         = merge_field(fps, &HttpFingerprint::x_ratelimit_reset);
-    merged.x_ratelimit_retry_after   = merge_field(fps, &HttpFingerprint::x_ratelimit_retry_after);
-    merged.x_ratelimit_resource      = merge_field(fps, &HttpFingerprint::x_ratelimit_resource);
-    merged.x_mailer                  = merge_field(fps, &HttpFingerprint::x_mailer);
-    merged.x_php_script              = merge_field(fps, &HttpFingerprint::x_php_script);
-    merged.x_php_origin              = merge_field(fps, &HttpFingerprint::x_php_origin);
-    merged.x_object_version         = merge_field(fps, &HttpFingerprint::x_object_version);
-    merged.x_object_delete_marker    = merge_field(fps, &HttpFingerprint::x_object_delete_marker);
-    merged.x_object_expiry           = merge_field(fps, &HttpFingerprint::x_object_expiry);
-    merged.x_object_storage_class    = merge_field(fps, &HttpFingerprint::x_object_storage_class);
-    merged.x_bucket_location         = merge_field(fps, &HttpFingerprint::x_bucket_location);
-    merged.x_bucket_versioning       = merge_field(fps, &HttpFingerprint::x_bucket_versioning);
-    // CI/CD
-    merged.x_jenkins                 = merge_field(fps, &HttpFingerprint::x_jenkins);
-    merged.x_hudson                  = merge_field(fps, &HttpFingerprint::x_hudson);
-    merged.x_teamcity_node_id        = merge_field(fps, &HttpFingerprint::x_teamcity_node_id);
-    merged.x_gitlab_meta             = merge_field(fps, &HttpFingerprint::x_gitlab_meta);
-    merged.x_harness_account         = merge_field(fps, &HttpFingerprint::x_harness_account);
-    // Meta tags
-    merged.meta_generator            = merge_field(fps, &HttpFingerprint::meta_generator);
-    merged.meta_software             = merge_field(fps, &HttpFingerprint::meta_software);
-    merged.meta_author               = merge_field(fps, &HttpFingerprint::meta_author);
-    merged.meta_developer            = merge_field(fps, &HttpFingerprint::meta_developer);
-    merged.meta_framework            = merge_field(fps, &HttpFingerprint::meta_framework);
-    merged.meta_cms                  = merge_field(fps, &HttpFingerprint::meta_cms);
-    merged.meta_powered_by           = merge_field(fps, &HttpFingerprint::meta_powered_by);
-    merged.meta_built_with           = merge_field(fps, &HttpFingerprint::meta_built_with);
-    merged.meta_created_by           = merge_field(fps, &HttpFingerprint::meta_created_by);
-    merged.meta_application_name     = merge_field(fps, &HttpFingerprint::meta_application_name);
-    merged.meta_progid               = merge_field(fps, &HttpFingerprint::meta_progid);
-    merged.meta_msapplication_config = merge_field(fps, &HttpFingerprint::meta_msapplication_config);
-    merged.meta_msapplication_tile_image  = merge_field(fps, &HttpFingerprint::meta_msapplication_tile_image);
-    merged.meta_msapplication_tile_color  = merge_field(fps, &HttpFingerprint::meta_msapplication_tile_color);
-    merged.meta_apple_title          = merge_field(fps, &HttpFingerprint::meta_apple_title);
-    merged.meta_apple_capable        = merge_field(fps, &HttpFingerprint::meta_apple_capable);
-    merged.body_platform_hint        = merge_field(fps, &HttpFingerprint::body_platform_hint);
-    merged.duplicate_headers         = merge_vec(fps, &HttpFingerprint::duplicate_headers);
-    merged.tamper_hint               = merge_field(fps, &HttpFingerprint::tamper_hint);
-
-    // Vector fields: union
-    merged.html_comments       = merge_vec(fps, &HttpFingerprint::html_comments);
-    merged.link_platform_paths = merge_vec(fps, &HttpFingerprint::link_platform_paths);
-    merged.js_globals          = merge_vec(fps, &HttpFingerprint::js_globals);
-    merged.spa_locations       = merge_vec(fps, &HttpFingerprint::spa_locations);
-
-    // SSL / cert: take from first SSL hop
-    merged.is_ssl = false;
-    for (const auto &fp : fps) {
-        if (fp.is_ssl) {
-            merged.is_ssl = true;
-            if (!merged.tls_cert.populated && fp.tls_cert.populated)
-                merged.tls_cert = fp.tls_cert;
-        }
-    }
-
-    // Status: keep from the final (last) fingerprint
-    merged.status_code = fps.back().status_code;
-    merged.status_line = fps.back().status_line;
-    merged.is_redirect = fps.back().is_redirect;
-    merged.is_4xx      = fps.back().is_4xx;
-
-    return merged;
-}
-
-// ============================================================================
-// Version-line renderer
-//
-// Output model: up to kMaxSlots (10) "info" entries are shown per port,
-// joined by " | ". Slot 1 is always the primary identity (product+version
-// merged from the probe engine, or the HTTP Server: header — whichever is
-// more informative). Every other slot is filled from a single generic,
-// table-driven candidate list built from signatures.conf [identity_headers]
-// plus a small fixed set of HTML-<meta>-tag-sourced fields.
-//
-// Adding support for a NEW *header* on the version line requires NO C++
-// change at all any more: add one line to signatures.conf's
-// [identity_headers] section (see PlatformSignatureSet::identity_headers,
-// resolved against HttpFingerprint::raw_headers, which already captures
-// every response header generically). The only fields still hardcoded below
-// are the handful sourced from parsed HTML <meta> tags rather than headers
-// (meta_generator, meta_cms, meta:author, ...) — those aren't in
-// raw_headers because they were never HTTP headers to begin with, so a
-// conf-file header table can't reach them. Anything HTTP-header-shaped
-// (Server, X-Powered-By, X-Jenkins, X-Powered-By-Plesk, X-Aspnet-Version,
-// whatever ships next) goes in signatures.conf, full stop.
-// ============================================================================
-static constexpr size_t kMaxSlots = 10;
-
-// Fields whose raw value is already self-descriptive (contains a product
-// name, e.g. meta:generator "WordPress 6.4.2") are printed bare. Fields that
-// only carry a bare token/version number are printed as "Label: value" so
-// the reader knows what the value refers to. This mirrors the bare/labeled
-// distinction used by signatures.conf's [identity_headers] rows below —
-// same rules, just for the HTML-<meta>-tag-sourced subset that a header
-// table can't cover.
-struct MetaFieldSpec {
-    std::string HttpFingerprint::*field;
-    const char                    *label;
-    bool                            bare;
-};
-
-static const MetaFieldSpec kMetaIdentityFields[] = {
-    // ---- self-descriptive (bare) ----
-    { &HttpFingerprint::meta_generator,        "meta:generator",   true  },
-    { &HttpFingerprint::meta_cms,              "meta:cms",         true  },
-    { &HttpFingerprint::meta_framework,        "meta:framework",   true  },
-    { &HttpFingerprint::meta_software,         "meta:software",    true  },
-    { &HttpFingerprint::meta_powered_by,       "meta:powered-by",  true  },
-    { &HttpFingerprint::meta_built_with,       "meta:built-with",  true  },
-    { &HttpFingerprint::meta_created_by,       "meta:created-by",  true  },
-    { &HttpFingerprint::meta_application_name, "app-name",         true  },
-    // ---- bare-token fields: need the label to make sense of the value ----
-    { &HttpFingerprint::meta_author,           "Author",           false },
-    { &HttpFingerprint::meta_developer,        "Developer",        false },
-};
-
-
-static void print_result(const ScanResult                  &result,
-                         const std::string                 &method_label,
-                         const std::vector<HttpFingerprint> &http_fps,
-                         bool                                confirmed_websocket)
-{
-    (void)method_label; // no longer printed
-
-    const std::string bar(60, '=');
-    std::vector<HttpFingerprint> effective_fps;
-    if (http_fps.size() > 1) {
-        effective_fps.push_back(merge_http_fingerprints(http_fps));
-    } else {
-        effective_fps = http_fps;
-    }
-    std::string fp_title;
-    {
-        auto is_redirect_title = [](const std::string &t) -> bool {
-            static const char kPfx[] = "redirecting to";
-            for (size_t i = 0; i < sizeof(kPfx) - 1 && i < t.size(); ++i)
-                if ((char)tolower((unsigned char)t[i]) != kPfx[i]) return false;
-            return t.size() >= sizeof(kPfx) - 1;
-        };
-
-        std::string last_any;
-        const std::vector<HttpFingerprint> &scan_fps =
-            (http_fps.size() > 1) ? http_fps : effective_fps;
-
-        for (const auto &fp : scan_fps) {
-            if (fp.title.empty()) continue;
-            last_any = fp.title;
-            if (!is_redirect_title(fp.title))
-                fp_title = fp.title;   // updated to LAST non-redirect title
-        }
-        if (fp_title.empty()) fp_title = last_any;  // fallback
-
-        // Trim SEO title: keep only the first segment before | separator.
-        // e.g. "plucky-agen.fr | Plucky, le plaisir simple..."  -> "plucky-agen.fr"
-        // e.g. "Plex Media Server 1.2.3"                        -> unchanged
-        if (!fp_title.empty()) {
-            size_t pipe = fp_title.find('|');
-            if (pipe != std::string::npos)
-                fp_title = fp_title.substr(0, pipe);
-            // Trim whitespace
-            size_t s = fp_title.find_first_not_of(" \t");
-            size_t e = fp_title.find_last_not_of(" \t");
-            fp_title = (s == std::string::npos) ? "" : fp_title.substr(s, e - s + 1);
-            // If still too long after trimming, it's not a useful tech identity
-            if (fp_title.size() > 50) fp_title = "";
-        }
-    }
-
-    std::string display_version = result.version;
-    std::string display_extra   = result.extrainfo;
-    if (display_version.empty() && !display_extra.empty()) {
-        display_version = display_extra;
-        display_extra.clear();
-    }
-
-    // Helper to trim whitespace and normalize newlines/spaces
-    auto clean_field = [](const std::string& s) -> std::string {
-        std::string cleaned;
-        cleaned.reserve(s.size());
-
-        // First, collapse all whitespace (including newlines) to single spaces
-        bool in_whitespace = false;
-        for (char c : s) {
-            if (c == '\r' || c == '\n' || c == '\t' || c == ' ') {
-                if (!in_whitespace) {
-                    cleaned += ' ';
-                    in_whitespace = true;
-                }
-            } else {
-                cleaned += c;
-                in_whitespace = false;
-            }
-        }
-
-        // Trim leading/trailing spaces
-        size_t start = cleaned.find_first_not_of(" \t");
-        if (start == std::string::npos) return "";
-        size_t end = cleaned.find_last_not_of(" \t");
-        cleaned = cleaned.substr(start, end - start + 1);
-
-        return cleaned;
-    };
-
-    // Strip a redundant leading "version:"/"version " token from a value
-    // that's about to be combined with a product name, so we don't print
-    // "Jenkins CI server: version: 2.440.3" — just "Jenkins CI server: 2.440.3".
-    auto strip_version_label = [](std::string s) -> std::string {
-        std::string lower = s;
-        for (char &c : lower) c = (char)tolower((unsigned char)c);
-        if (lower.rfind("version:", 0) == 0)      s = s.substr(8);
-        else if (lower.rfind("version ", 0) == 0) s = s.substr(7);
-        size_t p = s.find_first_not_of(' ');
-        return (p == std::string::npos) ? "" : s.substr(p);
-    };
-
-    auto clean_via = [&](const std::string &raw) -> std::string {
-        if (raw.empty()) return "";
-        // Must contain at least one digit (the protocol version like 1.1 or 2)
-        bool has_digit = false;
-        for (char c : raw) if (isdigit((unsigned char)c)) { has_digit = true; break; }
-        if (!has_digit) return "";
-        // Collapse whitespace, strip control chars
-        std::string out;
-        out.reserve(raw.size());
-        bool in_ws = false;
-        for (unsigned char c : raw) {
-            if (c == '\r' || c == '\n') continue;
-            if (c == ' ' || c == '\t') {
-                if (!in_ws && !out.empty()) { out += ' '; in_ws = true; }
-            } else {
-                out += (char)c;
-                in_ws = false;
-            }
-        }
-        while (!out.empty() && out.back() == ' ') out.pop_back();
-        // Truncate if absurdly long (malformed / injected header)
-        if (out.size() > 120) out = out.substr(0, 117) + "...";
-        // Strip the leading HTTP version token (e.g. "1.1 ", "2 ")
-        auto sp = out.find(' ');
-        if (sp != std::string::npos)
-            out = out.substr(sp + 1);
-        while (!out.empty() && out.front() == ' ')
-            out.erase(out.begin());
-        // Collapse CloudFront's "hash.cloudfront.net (CloudFront)" -> "CloudFront"
-        {
-            std::string lower = out;
-            for (char &c : lower) c = (char)tolower((unsigned char)c);
-            if (lower.find("cloudfront") != std::string::npos)
-                out = "CloudFront";
-        }
-        return out;
-    };
-
-    auto val_lc = [](const std::string &s) {
-        std::string r = s;
-        for (char &c : r) c = (char)tolower((unsigned char)c);
-        return r;
-    };
-    std::set<std::string> shown_values;
-
-    // Clean the product/version fields before adding to shown_values
-    std::string clean_product = clean_field(result.product);
-    std::string clean_version = clean_field(display_version);
-    std::string clean_extra   = clean_field(display_extra);
-    std::string clean_service = clean_field(result.service);
-
-    if (!clean_version.empty()) shown_values.insert(val_lc(clean_version));
-    if (!clean_product.empty())  shown_values.insert(val_lc(clean_product));
-    if (!clean_service.empty())  shown_values.insert(val_lc(clean_service));
-
-    // Shared dedup set — probe fields are inserted here first, then passed
-    // into fp.print() so HTTP fingerprint phases never repeat them.
-    std::set<std::string> seen_keys;
-
-    auto probe_emit = [&](const std::string &label, const std::string &val) {
-        if (val.empty()) return;
-        seen_keys.insert(label);
-        // Clean the value before printing
-        std::string cleaned = clean_field(val);
-        if (cleaned.empty()) return;
-        std::cout << std::left << std::setw(13) << label << "\033[32m" << cleaned << "\033[0m" << "\n";
-    };
-
-
-    auto alnum_lc = [](const std::string &s) -> std::string {
-        std::string r;
-        r.reserve(s.size());
-        for (unsigned char c : s)
-            if (isalnum(c)) r += (char)tolower(c);
-        return r;
-    };
-
-    // Does the string contain a digit sequence (version-like token)?
-    auto has_version_token = [](const std::string &s) -> bool {
-        for (char c : s) if (isdigit((unsigned char)c)) return true;
-        return false;
-    };
-
-    // Is candidate 'a' subsumed by (or equal to) already-chosen 'b'?
-    // True when the alnum core of one contains the alnum core of the other.
-    auto is_subsumed = [&](const std::string &a, const std::string &b) -> bool {
-        if (a.empty() || b.empty()) return false;
-        std::string al = alnum_lc(a), bl = alnum_lc(b);
-        if (al == bl) return true;
-        // shorter one inside longer one
-        if (al.size() <= bl.size()) return bl.find(al) != std::string::npos;
-        return al.find(bl) != std::string::npos;
-    };
-
-    // Between two candidates for the same conceptual slot, pick the better one:
-    // prefer the one with a version token; if tie, prefer the longer one.
-    auto better_candidate = [&](const std::string &a, const std::string &b) -> const std::string & {
-        bool av = has_version_token(a), bv = has_version_token(b);
-        if (av && !bv) return a;
-        if (bv && !av) return b;
-        return (a.size() >= b.size()) ? a : b;
-    };
-
-    // ---- gather raw candidates from HTTP fingerprints ----------------------
-    std::string fp_server, fp_osd, fp_powered_by, fp_x_generator, fp_via;
-    std::string fp_report_to; // proxy/backend name from Report-To or COOP-Report-Only
-    std::string fp_meta_generator, fp_meta_cms, fp_meta_framework,
-                fp_meta_software, fp_meta_powered_by, fp_meta_built_with,
-                fp_meta_app_name, fp_meta_created_by;
-
-    for (const auto &fp : effective_fps) {
-        if (fp_server.empty()           && !fp.server.empty())
-            fp_server           = clean_field(fp.server);
-        if (fp_osd.empty()              && !fp.osd_name.empty())
-            fp_osd              = clean_field(fp.osd_name);
-        if (fp_powered_by.empty()       && !fp.powered_by.empty())
-            fp_powered_by       = clean_field(fp.powered_by);
-        if (fp_x_generator.empty()      && !fp.x_generator.empty())
-            fp_x_generator      = clean_field(fp.x_generator);
-        if (fp_via.empty()              && !fp.via.empty())
-            fp_via              = clean_field(fp.via);
-        if (fp_report_to.empty()        && !fp.report_to_group.empty())
-            fp_report_to        = clean_field(fp.report_to_group);
-        if (fp_report_to.empty()        && !fp.coop_report_to_group.empty())
-            fp_report_to        = clean_field(fp.coop_report_to_group);
-        if (fp_meta_generator.empty()   && !fp.meta_generator.empty())
-            fp_meta_generator   = clean_field(fp.meta_generator);
-        if (fp_meta_cms.empty()         && !fp.meta_cms.empty())
-            fp_meta_cms         = clean_field(fp.meta_cms);
-        if (fp_meta_framework.empty()   && !fp.meta_framework.empty())
-            fp_meta_framework   = clean_field(fp.meta_framework);
-        if (fp_meta_software.empty()    && !fp.meta_software.empty())
-            fp_meta_software    = clean_field(fp.meta_software);
-        if (fp_meta_powered_by.empty()  && !fp.meta_powered_by.empty())
-            fp_meta_powered_by  = clean_field(fp.meta_powered_by);
-        if (fp_meta_built_with.empty()  && !fp.meta_built_with.empty())
-            fp_meta_built_with  = clean_field(fp.meta_built_with);
-        if (fp_meta_app_name.empty()    && !fp.meta_application_name.empty())
-            fp_meta_app_name    = clean_field(fp.meta_application_name);
-        if (fp_meta_created_by.empty()  && !fp.meta_created_by.empty())
-            fp_meta_created_by  = clean_field(fp.meta_created_by);
-    }
-
-    // ---- generic table-driven pass ----------------------------------------
-    // First-non-empty-fingerprint-wins, same rule as the hand-written
-    // gathers above. Produces {raw, display, label} triples; "raw" is used
-    // for subsumption checks, "display" is what actually gets printed.
-    //
-    // Two sources feed this, merged into one list so downstream dedup/print
-    // logic doesn't need to know or care which one a candidate came from:
-    //   1. signatures.conf [identity_headers] — any HTTP response header,
-    //      looked up straight out of HttpFingerprint::raw_headers. This is
-    //      the one to extend for a new header; no C++ change needed.
-    //   2. kMetaIdentityFields — the handful of fields parsed out of HTML
-    //      <meta> tags rather than headers, so they can't live in
-    //      raw_headers and still need a named struct field.
-    struct GenericCandidate { std::string raw; std::string display; std::string label; };
-    std::vector<GenericCandidate> generic_candidates;
-
-    for (const auto &spec : platform_signatures().identity_headers) {
-        std::string header_lc = spec.header;
-        for (char &c : header_lc) c = (char)tolower((unsigned char)c);
-
-        std::string raw;
-        for (const auto &fp : effective_fps) {
-            auto it = fp.raw_headers.find(header_lc);
-            if (it != fp.raw_headers.end() && !it->second.empty()) {
-                raw = clean_field(it->second);
-                break;
-            }
-        }
-        if (raw.empty()) continue;
-        std::string display = spec.bare ? raw : (spec.label + ": " + raw);
-        generic_candidates.push_back({ raw, display, spec.label });
-    }
-
-    for (const auto &spec : kMetaIdentityFields) {
-        std::string raw;
-        for (const auto &fp : effective_fps) {
-            const std::string &val = fp.*(spec.field);
-            if (!val.empty()) { raw = clean_field(val); break; }
-        }
-        if (raw.empty()) continue;
-        std::string display = spec.bare ? raw : (std::string(spec.label) + ": " + raw);
-        generic_candidates.push_back({ raw, display, spec.label });
-    }
-
-    // ---- body_platform_hint: only add its own slot when it's NOT already
-    // implied by a meta field just printed above ------------------------
-    // body_platform_hint is the *scored* CMS/framework verdict from
-    // extract_html_body_signals(): structural evidence (paths, JS globals,
-    // HTML comments, body text) combined with meta-tag hints. When it agrees
-    // with a meta field already on the line (e.g. meta:generator already
-    // reads "Joomla 1.5"), printing "Joomla (score=2)" too is the same fact
-    // twice with nothing new -- that's the "why is Joomla printed twice"
-    // redundancy. It earns its own slot only when it names a platform not
-    // already visible in ANY meta field gen_hint() scores against -- exactly
-    // the useful case: no meta tag at all (or a misleading one), where
-    // structural signals are the *only* reason the platform is known.
-    {
-        std::string hint, meta_gen, meta_cms, meta_fw, meta_pb, meta_bw;
-        for (const auto &fp : effective_fps) {
-            if (hint.empty()     && !fp.body_platform_hint.empty()) hint     = clean_field(fp.body_platform_hint);
-            if (meta_gen.empty() && !fp.meta_generator.empty())     meta_gen = fp.meta_generator;
-            if (meta_cms.empty() && !fp.meta_cms.empty())           meta_cms = fp.meta_cms;
-            if (meta_fw.empty()  && !fp.meta_framework.empty())     meta_fw  = fp.meta_framework;
-            if (meta_pb.empty()  && !fp.meta_powered_by.empty())    meta_pb  = fp.meta_powered_by;
-            if (meta_bw.empty()  && !fp.meta_built_with.empty())    meta_bw  = fp.meta_built_with;
-        }
-        if (!hint.empty()) {
-            std::string already = meta_gen + " " + meta_cms + " " + meta_fw + " " + meta_pb + " " + meta_bw;
-            for (char &c : already) c = (char)tolower((unsigned char)c);
-
-            // Strip the trailing "(score=N)" / "(tied, score=N)" annotation
-            // to get just the platform name(s), possibly "A / B" if tied.
-            std::string names = hint;
-            size_t paren = names.find(" (");
-            if (paren != std::string::npos) names = names.substr(0, paren);
-
-            bool any_new = false;
-            size_t start = 0;
-            while (start <= names.size()) {
-                size_t sep = names.find(" / ", start);
-                std::string one = (sep == std::string::npos) ? names.substr(start)
-                                                               : names.substr(start, sep - start);
-                std::string lone = one;
-                for (char &c : lone) c = (char)tolower((unsigned char)c);
-                if (!lone.empty() && already.find(lone) == std::string::npos) any_new = true;
-                if (sep == std::string::npos) break;
-                start = sep + 3;
-            }
-
-            // The version line should show WHAT was detected, not the
-            // internal confidence score that drove the decision -- "score=3"
-            // is debugging detail, not identity info, and printing it here
-            // was the same class of noise as the earlier Joomla duplication,
-            // just triggered by a different case (a platform gen_hint()
-            // never saw, e.g. a real WordPress site alongside spoofed
-            // Drupal/HubSpot meta tags). 'names' (already stripped of the
-            // "(score=N)"/"(tied, score=N)" suffix above) is what gets
-            // shown; the full 'hint' -- WITH the score -- still exists on
-            // fp.body_platform_hint for the verbose dump and stays
-            // available to extract_html_body_signals()'s tamper check.
-            if (any_new) generic_candidates.push_back({ names, names, "Platform" });
-        }
-    }
-
-    auto extract_tech_version = [](const std::string &raw) -> std::string {
-        if (raw.empty()) return raw;
-
-        // Trim leading/trailing whitespace
-        size_t s = 0, e = raw.size();
-        while (s < e && isspace((unsigned char)raw[s])) ++s;
-        while (e > s && isspace((unsigned char)raw[e-1])) --e;
-        std::string val = raw.substr(s, e - s);
-        if (val.empty()) return val;
-        auto looks_clean = [](const std::string &v) -> bool {
-            if (v.empty()) return true;
-            // Too long to be a clean tech identity token
-            if (v.size() > 60) return false;
-            unsigned char fc = (unsigned char)v.front();
-            if (!isalnum(fc)) return false;
-            // Sentence/marketing punctuation — never in a tech version string
-            for (unsigned char c : v) {
-                if (c == ',' || c == '&' || c == '?' || c == '!'
-                    || c == 0xE2  // UTF-8 lead byte for • … etc
-                    || c == '|')  // pipe inside value = SEO title separator
-                    return false;
-            }
-            // Check for suspiciously long alphanum runs (junk indicator)
-            size_t run = 0;
-            for (unsigned char c : v) {
-                if (isalpha(c)) { ++run; if (run >= 10) return false; }
-                else run = 0;
-            }
-            return true;
-        };
-        if (looks_clean(val)) return val;
-
-        std::vector<std::string> tokens;
-        {
-            std::string tok;
-            for (size_t i = 0; i <= val.size(); ++i) {
-                char c = (i < val.size()) ? val[i] : '\0';
-                if (i == val.size() || c == ' ' || c == '\t' || c == '/') {
-                    if (!tok.empty()) { tokens.push_back(tok); tok.clear(); }
-                } else {
-                    tok += c;
-                }
-            }
-        }
-
-        // Helper: does this token look like a version number?
-        auto is_version_tok = [](const std::string &t) -> bool {
-            if (t.empty() || !isdigit((unsigned char)t[0])) return false;
-            bool has_dot = false;
-            for (char c : t) {
-                if (c == '.' || c == '-' || isalnum((unsigned char)c)) {
-                    if (c == '.') has_dot = true;
-                } else return false;
-            }
-            return has_dot;
-        };
-
-        // Helper: does this token look like a tech name (not pure garbage)?
-        // A tech-name token contains at least one letter and is <= 30 chars,
-        // once trailing branding punctuation (the "!" in "Joomla!", trailing
-        // ":" / ";") is stripped. That trailing punctuation is legitimately
-        // part of some products' own branding and must not disqualify the
-        // token -- it previously made extract_tech_version() silently drop
-        // the product name (e.g. "Joomla! 1.5" -> just "1.5"), which both
-        // looks like a parse failure and throws away real identity info an
-        // operator needs. The stripped form is what's returned so the stray
-        // punctuation doesn't show up on the version line either.
-        auto is_tech_tok = [](const std::string &t) -> std::pair<bool, std::string> {
-            std::string s = t;
-            while (!s.empty() && (s.back() == '!' || s.back() == ':' || s.back() == ';'))
-                s.pop_back();
-            if (s.empty() || s.size() > 30) return { false, "" };
-            bool has_letter = false;
-            for (char c : s) {
-                if (isalpha((unsigned char)c)) { has_letter = true; }
-                else if (!isdigit((unsigned char)c) && c != '-' && c != '_' && c != '.') return { false, "" };
-            }
-            return { has_letter, s };
-        };
-
-        // Step 2+3: find first version token; take the preceding tech word if valid.
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            if (is_version_tok(tokens[i])) {
-                if (i > 0) {
-                    auto [ok, tech] = is_tech_tok(tokens[i-1]);
-                    if (ok) {
-                        // tech + version
-                        return tech + " " + tokens[i];
-                    }
-                }
-                // Step 4: bare version
-                return tokens[i];
-            }
-        }
-
-        if (val.size() <= 60) {
-            bool has_sentence_punct = false;
-            for (unsigned char c : val) {
-                if (c == ',' || c == '&' || c == '?' || c == '!' || c == 0xE2)
-                { has_sentence_punct = true; break; }
-            }
-            if (!has_sentence_punct) return val;
-        }
-        return "";  // discard — human/marketing text, not a tech identity
-    };
-
-    // ---- slot 1: primary identity ------------------------------------------
-    // Merge probe-engine product + version/extrainfo into a single
-    // "Product: Version" string (colon, not space) so it reads unambiguously
-    // instead of floating around as a separate "version: X" fragment.
-    std::string pv, pv_label;
-    {
-        std::string ver_part = !clean_version.empty() ? clean_version
-                                                        : strip_version_label(clean_extra);
-        if (!clean_product.empty() && !ver_part.empty()) {
-            pv       = clean_product + ": " + ver_part;
-            pv_label = "version";
-        } else if (!clean_product.empty()) {
-            pv       = clean_product;
-            pv_label = "product";
-        } else if (!ver_part.empty()) {
-            pv       = ver_part;
-            pv_label = "version";
-        } else if (!clean_extra.empty()) {
-            pv       = clean_extra;
-            pv_label = "extra";
-        }
-    }
-
-    std::string slot1, slot1_label;
-    std::string pv_leftover; // set if pv loses to fp_server, so it isn't lost
-    {
-        if (!fp_server.empty() && !pv.empty()) {
-            const std::string &winner = better_candidate(pv, fp_server);
-            if (&winner == &fp_server) {
-                slot1       = fp_server;
-                slot1_label = "server";
-                if (!is_subsumed(pv, fp_server)) pv_leftover = pv;
-            } else {
-                slot1       = pv;
-                slot1_label = pv_label;
-                if (!is_subsumed(fp_server, pv)) pv_leftover = fp_server;
-            }
-        } else if (!fp_server.empty()) {
-            slot1       = fp_server;
-            slot1_label = "server";
-        } else if (!pv.empty()) {
-            slot1       = pv;
-            slot1_label = pv_label;
-        }
-
-        if (slot1.empty() && !fp_osd.empty()) {
-            slot1 = fp_osd;
-            slot1_label = "osd-name";
-        }
-    }
-
-    struct LabeledCandidate { std::string value; std::string label; };
-
-    // Header/meta candidates are listed BEFORE the HTML <title> on purpose:
-    // a title is marketing copy ("Acme Inc — Home"), while these are actual
-    // tech identity signals. Ties are broken by document order below, so
-    // putting title last means it only wins slot2 when nothing more
-    // informative is available.
-    std::vector<LabeledCandidate> app_candidates_labeled;
-    app_candidates_labeled.push_back({ fp_meta_app_name,  "app-name"       });
-    app_candidates_labeled.push_back({ fp_powered_by,     "X-Powered-By"   });
-    app_candidates_labeled.push_back({ fp_x_generator,    "X-Generator"    });
-    app_candidates_labeled.push_back({ fp_meta_generator, "meta:generator" });
-    app_candidates_labeled.push_back({ fp_meta_cms,       "meta:cms"       });
-    app_candidates_labeled.push_back({ fp_meta_framework, "meta:framework" });
-    app_candidates_labeled.push_back({ fp_meta_software,  "meta:software"  });
-    app_candidates_labeled.push_back({ fp_meta_powered_by,"meta:powered-by"});
-    app_candidates_labeled.push_back({ fp_meta_built_with,"meta:built-with"});
-    app_candidates_labeled.push_back({ fp_meta_created_by,"meta:created-by"});
-    app_candidates_labeled.push_back({ fp_title,          "title"          });
-
-    // Dedup: among subsumption-related candidates keep the better one.
-    std::vector<LabeledCandidate> app_winners;
-    for (const auto &cand : app_candidates_labeled) {
-        if (cand.value.empty()) continue;
-        bool merged = false;
-        for (auto &w : app_winners) {
-            if (is_subsumed(cand.value, w.value) || is_subsumed(w.value, cand.value)) {
-                if (&better_candidate(w.value, cand.value) == &cand.value) {
-                    w.value = cand.value;
-                    w.label = cand.label;
-                }
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) app_winners.push_back(cand);
-    }
-
-    // The HTML title is the weakest identity signal we have (it's copy
-    // written for humans, not tech fingerprinting) so it gets dropped
-    // entirely once real header/meta identity info is available: either a
-    // header carries an actual version token (e.g. "4.0.30319"), or there
-    // are simply enough other identity candidates that the title would just
-    // be crowding out more useful information.
-    {
-        size_t non_title_count = 0;
-        bool   have_versioned  = false;
-        for (const auto &w : app_winners) {
-            if (w.label == "title") continue;
-            ++non_title_count;
-            if (has_version_token(w.value)) have_versioned = true;
-        }
-        if (have_versioned || non_title_count >= 3) {
-            app_winners.erase(
-                std::remove_if(app_winners.begin(), app_winners.end(),
-                                [](const LabeledCandidate &w) { return w.label == "title"; }),
-                app_winners.end());
-        }
-    }
-
-    std::string slot2, slot2_label;
-    size_t slot2_idx = std::string::npos;
-    for (size_t i = 0; i < app_winners.size(); ++i) {
-        if (!is_subsumed(app_winners[i].value, slot1)) {
-            slot2       = app_winners[i].value;
-            slot2_label = app_winners[i].label;
-            slot2_idx   = i;
-            break;
-        }
-    }
-
-    std::string fp_asset_server, fp_asset_title;
-    for (const auto &fp : http_fps) {
-        if (fp.phase.rfind("asset-follow", 0) != 0) continue;
-        if (fp_asset_server.empty() && !fp.server.empty()) fp_asset_server = clean_field(fp.server);
-        if (fp_asset_title.empty()  && !fp.title.empty())  fp_asset_title  = clean_field(fp.title);
-    }
-
-    struct LabeledExtra { std::string value; std::string label; };
-    std::vector<LabeledExtra> extra_candidates;
-
-    // Suppress product values that are just a raw Via: echo
-    // (e.g. "Via: 1.1 google") — the fp_via candidate handles those properly.
-    auto product_is_via_echo = [&]() -> bool {
-        std::string lp = clean_product;
-        for (char &c : lp) c = (char)tolower((unsigned char)c);
-        return lp.rfind("via:", 0) == 0 || lp.rfind("via ", 0) == 0;
-    };
-    (void)product_is_via_echo;
-
-    if (!fp_server.empty() && !is_subsumed(fp_server, slot1))
-        extra_candidates.push_back({ fp_server, "server" });
-    if (!pv_leftover.empty() && !is_subsumed(pv_leftover, slot1))
-        extra_candidates.push_back({ pv_leftover, pv_label.empty() ? "version" : pv_label });
-    if (!fp_asset_server.empty() && !is_subsumed(fp_asset_server, fp_server)
-        && !is_subsumed(fp_asset_server, slot1))
-        extra_candidates.push_back({ fp_asset_server, "server (asset)" });
-    if (!fp_asset_title.empty() && !is_subsumed(fp_asset_title, slot2)
-        && !is_subsumed(fp_asset_title, slot1))
-        extra_candidates.push_back({ fp_asset_title, "title (asset)" });
-    // Note: value is what's actually printed for slots 3+ (see filled_slots
-    // below), so a bare token like "cf-nel" needs its label folded in here —
-    // otherwise it prints unlabeled and the reader has no idea what it is.
-    if (!fp_via.empty())
-        extra_candidates.push_back({ "Proxy: " + fp_via, "Proxy" });
-    if (!fp_report_to.empty() && !is_subsumed(fp_report_to, fp_via))
-        extra_candidates.push_back({ "Proxy: " + fp_report_to, "Proxy" });
-    for (size_t i = 0; i < app_winners.size(); ++i) {
-        if (i == slot2_idx) continue;
-        extra_candidates.push_back({ app_winners[i].value, app_winners[i].label });
-    }
-    // Universal pass: anything generic_candidates picked up that isn't
-    // already covered by slot1/slot2/an existing extra candidate.
-    for (const auto &gc : generic_candidates) {
-        bool dup = is_subsumed(gc.raw, slot1) || (!slot2.empty() && is_subsumed(gc.raw, slot2));
-        if (!dup) {
-            for (const auto &ec : extra_candidates) {
-                if (is_subsumed(gc.raw, ec.value)) { dup = true; break; }
-            }
-        }
-        if (!dup) extra_candidates.push_back({ gc.display, gc.label });
-    }
-
-    // Fill slot3..slot10 from extra_candidates, skipping anything already
-    // covered (subsumed) by slot1, slot2, or an earlier extra slot.
-    std::vector<std::string> filled_slots; // slot3..slotN values, in order
-    {
-        for (const auto &ec : extra_candidates) {
-            if (filled_slots.size() + 2 >= kMaxSlots) break; // slot1+slot2 already used 2 of 10
-            if (ec.value.empty()) continue;
-            if (is_subsumed(ec.value, slot1)) continue;
-            if (!slot2.empty() && is_subsumed(ec.value, slot2)) continue;
-            bool dup = false;
-            for (const auto &prior : filled_slots)
-                if (is_subsumed(ec.value, prior)) { dup = true; break; }
-            if (dup) continue;
-            filled_slots.push_back(ec.value);
-        }
-    }
-
-    auto apply_per_segment = [&](const std::string &val,
-                                 std::function<std::string(const std::string &)> fn)
-        -> std::string
-    {
-        const std::string pipe_sep = " | ";
-        if (val.find(pipe_sep) == std::string::npos)
-            return fn(val);   // single value — fast path
-
-        std::string result;
-        size_t pos = 0;
-        while (pos <= val.size()) {
-            size_t next = val.find(pipe_sep, pos);
-            std::string seg = (next == std::string::npos)
-                              ? val.substr(pos)
-                              : val.substr(pos, next - pos);
-            std::string extracted = fn(seg);
-            if (!extracted.empty()) {
-                if (!result.empty()) result += " & ";
-                result += extracted;
-            }
-            if (next == std::string::npos) break;
-            pos = next + pipe_sep.size();
-        }
-        return result.empty() ? val : result;
-    };
-
-    if (!slot1.empty())
-        slot1 = apply_per_segment(slot1, extract_tech_version);
-    if (!slot2.empty())
-        slot2 = apply_per_segment(slot2, extract_tech_version);
-
-    // ---- assemble final output ---------------------------------------------
-    std::vector<std::string> out_parts;
-    if (!slot1.empty()) out_parts.push_back(slot1);
-    if (!slot2.empty()) out_parts.push_back(slot2);
-    for (const auto &v : filled_slots) out_parts.push_back(v);
-    if (out_parts.size() > kMaxSlots) out_parts.resize(kMaxSlots);
-
-    // ---- tamper / anomaly marker -------------------------------------------
-    // Appended AFTER the kMaxSlots cap (and not counted against it) so a
-    // possible-spoofing signal can never get silently truncated off the end
-    // of a long version line -- that's exactly the kind of response an
-    // operator most needs to see. Two independent heuristics feed this:
-    //   1. tamper_hint: meta:generator's claimed platform disagrees with
-    //      what the structural (path/JS-global/comment/body) scorer found
-    //      (see extract_html_body_signals) -- a common WAF/honeypot trick is
-    //      serving a fake generator tag while running something else.
-    //   2. duplicate_headers: the same header name appeared twice in one
-    //      response with two different values -- a sign of response
-    //      splitting, a rewriting proxy, or a spoofed banner layered in
-    //      front of the real one.
-    {
-        std::string tamper_note;
-        for (const auto &fp : effective_fps) {
-            if (!fp.tamper_hint.empty()) { tamper_note = fp.tamper_hint; break; }
-        }
-        size_t dup_count = 0;
-        for (const auto &fp : effective_fps) dup_count += fp.duplicate_headers.size();
-
-        std::string marker;
-        if (!tamper_note.empty()) marker = "TAMPER? " + tamper_note;
-        if (dup_count > 0) {
-            if (!marker.empty()) marker += "; ";
-            marker += std::to_string(dup_count) + " duplicate header"
-                      + (dup_count == 1 ? "" : "s") + " w/ conflicting values";
-        }
-        if (!marker.empty()) out_parts.push_back("[" + marker + "]");
-    }
-
-    if (confirmed_websocket) {
-        std::cout << "\033[32mwebsocket\033[0m\n";
-    } else if (!out_parts.empty()) {
-        for (size_t i = 0; i < out_parts.size(); ++i) {
-            if (i) std::cout << " | ";
-            std::cout << "\033[32m" << out_parts[i] << "\033[0m";
-        }
-        bool redirect_followed = method_label.find("redirect") != std::string::npos;
-        bool multi_hop         = http_fps.size() > 1;
-        if (redirect_followed || multi_hop)
-            std::cout << "  (need attention)";
-        std::cout << "\n";
-    } else {
-        std::cout << "?\n";
-    }
-    (void)probe_emit;
-    (void)seen_keys;
-    (void)val_lc;
-    (void)shown_values;
-
-    {
-        bool has_version = !clean_version.empty();
-        bool has_server  = false;
-        bool has_title   = !fp_title.empty();
-        bool has_tls_fp  = false;
-        TlsCertInfo best_cert;
-        int  best_status = 0;
-        std::string content_length_hdr;
-
-        for (const auto &fp : effective_fps) {
-            if (!fp.server.empty())    has_server  = true;
-            if (fp.is_ssl && fp.tls_cert.populated) {
-                has_tls_fp  = true;
-                // Take the first populated cert
-                if (!best_cert.populated) {
-                    best_cert   = fp.tls_cert;
-                    best_status = fp.status_code;
-                }
-            }
-        }
-
-        // Check 404 + Content-Length match for best SSL fingerprint response
-        bool is_404_cl_match = false;
-        if (best_status == 404 && !effective_fps.empty()) {
-            // Find the matching fingerprint to read Content-Length
-            for (const auto &fp : effective_fps) {
-                if (fp.is_ssl && fp.status_code == 404) {
-                    is_404_cl_match = true;
-                    break;
-                }
-            }
-        }
-
-        bool no_info = !has_version && !has_server && !has_title;
-
-        if (no_info && has_tls_fp && best_cert.populated &&
-            !best_cert.subject.empty() &&
-            (best_status == 404 || is_404_cl_match || best_status == 0 || best_status == 200))
-        {
-
-            std::string cn;
-            const std::string &subj = best_cert.subject;
-            size_t cn_pos = subj.find("CN=");
-            if (cn_pos == std::string::npos) {
-                // Try case-insensitive
-                std::string lsubj = subj;
-                for (char &c : lsubj) c = (char)tolower((unsigned char)c);
-                cn_pos = lsubj.find("cn=");
-            }
-            if (cn_pos != std::string::npos) {
-                size_t val_start = cn_pos + 3;
-                // Find end: next unescaped comma or end of string
-                size_t val_end = val_start;
-                while (val_end < subj.size()) {
-                    if (subj[val_end] == '\\') { val_end += 2; continue; } // skip escaped char
-                    if (subj[val_end] == ',')  break;
-                    ++val_end;
-                }
-                cn = subj.substr(val_start, val_end - val_start);
-                // Trim whitespace
-                while (!cn.empty() && isspace((unsigned char)cn.front())) cn.erase(cn.begin());
-                while (!cn.empty() && isspace((unsigned char)cn.back()))  cn.pop_back();
-            }
-
-            if (!cn.empty()) {
-                std::cout << cn << "  [TLS cert fallback]\n";
-                // Also print the full subject for context if it adds info
-                if (best_cert.subject != cn)
-                    std::cout << "Cert Subject : "
-                              << best_cert.subject.substr(0, 52)
-                              << (best_cert.subject.size() > 52 ? "..." : "")
-                              << "\n";
-                // Print TLS version so operator knows this came from a cert
-                if (!best_cert.tls_version.empty())
-                    std::cout << "TLS Ver : " << best_cert.tls_version << "\n";
-            }
-        }
-    }
-
-    if (result.service.empty() && result.product.empty() && effective_fps.empty())
-        std::cout << "(no match found)\n";
-
-    // Raw fingerprint only when there are no HTTP FPs
-    if (!result.fingerprint.empty() && effective_fps.empty()) {
-        std::cout << "\n+- Raw Fingerprint (first 200 chars) ----------------------\n";
-        std::cout << result.fingerprint.substr(0, 200) << "\n";
-        std::cout << "+-----------------------------------------------------------\n";
-    }
-}
-
-static std::map<std::string, std::string> g_dns_cache;
-static std::mutex                         g_dns_cache_mu;
-
-static std::string resolve_host(const std::string &host)
-{
-    // -- 1. Numeric IP literal (v4 or v6) — delegate to shiv's normalizer --
-    std::string norm;
-    if (normalize_ip_string(host, norm)) return norm;
-
-    // -- 2. Cache hit --------------------------------------------------------
-    {
-        std::lock_guard<std::mutex> lk(g_dns_cache_mu);
-        auto it = g_dns_cache.find(host);
-        if (it != g_dns_cache.end()) return it->second;
-    }
-
-    // -- 3. DNS resolution — one call now checks both A and AAAA records ----
-    std::string result;
-    if (resolve_domain_to_ip(host, result)) {
-        std::lock_guard<std::mutex> lk(g_dns_cache_mu);
-        g_dns_cache[host] = result;
-        return result;
-    }
-    return host;
-}
-
-static bool is_ip_literal(const std::string &s)
-{
-    return get_ip_version(s.c_str()) != 0;
-}
-
-static bool is_lan_ip(const std::string &s)
-{
-    int ver = get_ip_version(s.c_str());
-
-    if (ver == 4) {
-        struct in_addr addr{};
-        inet_pton(AF_INET, s.c_str(), &addr);
-        uint32_t ip = ntohl(addr.s_addr);
-
-        return ((ip & 0xFF000000) == 0x0A000000) ||  // 10.0.0.0/8
-               ((ip & 0xFFF00000) == 0xAC100000) ||  // 172.16.0.0/12
-               ((ip & 0xFFFF0000) == 0xC0A80000) ||  // 192.168.0.0/16
-               ((ip & 0xFFFF0000) == 0xA9FE0000) ||  // 169.254.0.0/16
-               ((ip & 0xFF000000) == 0x7F000000);    // 127.0.0.0/8
-    }
-
-    if (ver == 6) {
-        struct in6_addr a6{};
-        inet_pton(AF_INET6, s.c_str(), &a6);
-        const uint8_t *b = a6.s6_addr;
-
-        if ((b[0] & 0xFE) == 0xFC) return true;                 // fc00::/7  (ULA)
-        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return true; // fe80::/10 (link-local)
-
-        static const uint8_t loopback6[16] = {0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1};
-        return memcmp(b, loopback6, 16) == 0;                    // ::1
-    }
-
     return false;
 }
 
-static std::string resolve_ip_to_domain(const std::string &ip)
-{
-    std::string cached;
-    if (ptr_cache_lookup(ip, cached)) return cached;
-    if (custom_dns_configured()) {
-        std::string domain;
-        bool ok = resolve_ptr_via_configured_dns(ip, domain);
-        ptr_cache_store(ip, ok ? domain : "");
-        return ok ? domain : "";
-    }
-    // Accept both IPv4 and IPv6 reverse-DNS lookups
-    struct sockaddr_storage ss{};
-    socklen_t ss_len = 0;
-    make_sockaddr_from_ip(ip, 0, ss, ss_len);
-    if (ss_len == 0) return ""; 
-    auto prom = std::make_shared<std::promise<std::string>>();
-    std::future<std::string> fut = prom->get_future();
-    std::string ip_copy = ip;
-
-    std::thread([prom, ss, ss_len, ip_copy]() mutable {
-        char host[NI_MAXHOST] = {};
-        int rc = getnameinfo(reinterpret_cast<const struct sockaddr *>(&ss),
-                             ss_len, host, sizeof(host), nullptr, 0, NI_NAMEREQD);
-        std::string result = (rc == 0) ? host : "";
-        if (!result.empty() && result.back() == '.') result.pop_back();
-        if (result == ip_copy) result.clear();
-        if (!result.empty()) {
-            bool all_numdot = true;
-            for (char c : result)
-                if (!isdigit((unsigned char)c) && c != '.') { all_numdot = false; break; }
-            if (all_numdot) result.clear();
-        }
-        try {
-            prom->set_value(result);
-        } catch (const std::future_error &) {
-            // ignore -- shouldn't happen since prom is kept alive via the shared_ptr
-        }
-    }).detach();
-
-    if (fut.wait_for(std::chrono::seconds(2)) == std::future_status::timeout) {
-        fprintf(stderr, "[Host] Reverse-DNS for %s timed out (2s) -- skipping PTR lookup\n",
-                ip.c_str());
-        return "";   // does NOT block -- the detached thread finishes on its own
-    }
-    std::string result = fut.get();
-    ptr_cache_store(ip, result);
-    return result;
+uint16_t next_dns_id() {
+    thread_local std::mt19937 gen{std::random_device{}()};
+    return static_cast<uint16_t>(gen());
 }
 
-static int connect_with_timeout(const std::string &ip, int port,
-                                int connect_timeout_sec)
-{
-    // Build address — support both IPv4 and IPv6 targets.
-    struct sockaddr_storage addr_storage{};
-    socklen_t addr_len = 0;
-    int family = make_sockaddr_from_ip(ip, (uint16_t)port, addr_storage, addr_len);
-    if (addr_len == 0) return -1;  // not a valid IP address
-    int fd = ::socket(family, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
-    // SO_KEEPALIVE: lets the OS detect dead connections during long reads
-    {
-        int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-    }
-    // TCP_NODELAY: disable Nagle — we control framing ourselves; avoids 40ms delays
-#ifdef TCP_NODELAY
-    {
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    }
-#endif
-
-    // Switch to non-blocking for the connect race
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) { close(fd); return -1; }
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { close(fd); return -1; }
-
-    int rc = ::connect(fd, reinterpret_cast<struct sockaddr *>(&addr_storage), addr_len);
-    if (rc < 0 && errno != EINPROGRESS) {
-        close(fd); return -1;
+bool udp_dns_query_one(const std::string& server, const std::string& qname, uint16_t qtype,
+                        int timeout_ms, std::string& out) {
+    sockaddr_storage ss{};
+    socklen_t sl = 0;
+    int fam = 0;
+    in_addr a4{};
+    in6_addr a6{};
+    if (inet_pton(AF_INET, server.c_str(), &a4) == 1) {
+        auto* sa = reinterpret_cast<sockaddr_in*>(&ss);
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons(53);
+        sa->sin_addr = a4;
+        sl = sizeof(sockaddr_in);
+        fam = AF_INET;
+    } else if (inet_pton(AF_INET6, server.c_str(), &a6) == 1) {
+        auto* sa = reinterpret_cast<sockaddr_in6*>(&ss);
+        sa->sin6_family = AF_INET6;
+        sa->sin6_port = htons(53);
+        sa->sin6_addr = a6;
+        sl = sizeof(sockaddr_in6);
+        fam = AF_INET6;
+    } else {
+        return false;
     }
 
-    if (rc != 0) {
-        // EINPROGRESS — wait for writability via poll() (no FD_SETSIZE limit)
-        struct pollfd pfd{ fd, POLLOUT, 0 };
-        int timeout_ms = connect_timeout_sec * 1000;
-        int ret;
-        do {
-            ret = ::poll(&pfd, 1, timeout_ms);
-        } while (ret < 0 && errno == EINTR);
+    const uint16_t id = next_dns_id();
+    std::vector<uint8_t> pkt = build_dns_query(id, qname, qtype);
+    if (pkt.empty()) return false;
 
-        if (ret <= 0) {
-            // 0 = timeout (firewall drop); <0 = fatal poll error
-            close(fd); return -1;
+    int fd = socket(fam, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+
+    timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    if (connect(fd, reinterpret_cast<sockaddr*>(&ss), sl) != 0 ||
+        send(fd, pkt.data(), pkt.size(), 0) != static_cast<ssize_t>(pkt.size())) {
+        close(fd);
+        return false;
+    }
+
+    uint8_t buf[2048];
+    const ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    close(fd);
+    if (n < 12) return false;
+    const size_t len = static_cast<size_t>(n);
+
+    uint16_t rid;
+    std::memcpy(&rid, buf, 2);
+    if (ntohs(rid) != id) return false;
+    uint16_t rflags;
+    std::memcpy(&rflags, buf + 2, 2);
+    rflags = ntohs(rflags);
+    if ((rflags & 0x000F) != 0) return false;
+    uint16_t qdc, anc;
+    std::memcpy(&qdc, buf + 4, 2);
+    qdc = ntohs(qdc);
+    std::memcpy(&anc, buf + 6, 2);
+    anc = ntohs(anc);
+    if (anc == 0) return false;
+
+    size_t pos = 12;
+    for (uint16_t i = 0; i < qdc; ++i) {
+        std::string dummy;
+        pos = decode_dns_name(buf, len, pos, dummy);
+        pos += 4;
+        if (pos > len) return false;
+    }
+    return parse_dns_answer(buf, len, qtype, pos, anc, out);
+}
+
+bool udp_dns_query(const std::vector<std::string>& servers, const std::string& qname,
+                    uint16_t qtype, int timeout_ms, std::string& out) {
+    for (const auto& srv : servers) {
+        if (terminate_flag.load(std::memory_order_relaxed)) return false;
+        if (udp_dns_query_one(srv, qname, qtype, timeout_ms, out) && !out.empty()) return true;
+    }
+    return false;
+}
+
+std::string ptr_qname_v4(uint32_t ip) {
+    std::ostringstream ss;
+    ss << ((ip) & 0xFF) << "." << ((ip >> 8) & 0xFF) << "." << ((ip >> 16) & 0xFF) << "." << ((ip >> 24) & 0xFF)
+       << ".in-addr.arpa";
+    return ss.str();
+}
+std::string nibble_reversed_v6(u128 ip) {
+    std::ostringstream ss;
+    for (int i = 0; i < 32; ++i) ss << std::hex << static_cast<int>((ip >> (i * 4)) & 0xF) << ".";
+    return ss.str();
+}
+std::string ptr_qname_v6(u128 ip) { return nibble_reversed_v6(ip) + "ip6.arpa"; }
+
+std::string v4_to_string(uint32_t ip) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+                  (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+    return buf;
+}
+
+std::string v6_to_string(u128 ip) {
+    in6_addr a{};
+    for (int i = 0; i < 16; ++i) a.s6_addr[15 - i] = static_cast<uint8_t>((ip >> (i * 8)) & 0xFF);
+    char buf[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &a, buf, sizeof(buf));
+    return buf;
+}
+
+int connect_with_timeout(const char* host, int port, int timeout_ms) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    char portbuf[8];
+    std::snprintf(portbuf, sizeof(portbuf), "%d", port);
+    if (getaddrinfo(host, portbuf, &hints, &res) != 0 || !res) return -1;
+
+    int fd = -1;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) continue;
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int rc = connect(fd, p->ai_addr, p->ai_addrlen);
+        bool connected = (rc == 0);
+        if (!connected && errno == EINPROGRESS) {
+            pollfd pfd{fd, POLLOUT, 0};
+            if (poll(&pfd, 1, timeout_ms) > 0) {
+                int err = 0;
+                socklen_t elen = sizeof(err);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+                connected = (err == 0);
+            }
         }
-        // Check for async connect error via SO_ERROR
-        int err = 0; socklen_t elen = sizeof(err);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err != 0) {
-            close(fd); return -1;
+        if (connected) {
+            fcntl(fd, F_SETFL, flags);
+            timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            freeaddrinfo(res);
+            return fd;
         }
+        close(fd);
+        fd = -1;
     }
-
-    // Restore blocking mode — callers set their own I/O timeouts via setsockopt
-    if (fcntl(fd, F_SETFL, flags) < 0) { close(fd); return -1; }
+    freeaddrinfo(res);
     return fd;
 }
 
-static void set_io_timeouts(int fd, int timeout_sec)
-{
-    struct timeval tv{ timeout_sec, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+constexpr size_t kMaxWhoisResponse = 8u * 1024 * 1024;
+constexpr int    kWhoisDeadlineSec = 30;
+
+bool bulk_cymru_query(const std::vector<std::string>& ip_strings, int timeout_ms,
+                       std::unordered_map<std::string, std::string>& out_labels) {
+    int fd = connect_with_timeout("whois.cymru.com", kCymruWhoisPort, timeout_ms);
+    if (fd < 0) return false;
+
+    std::string req = "begin\nverbose\n";
+    for (const auto& s : ip_strings) { req += s; req += '\n'; }
+    req += "end\n";
+
+    size_t sent = 0;
+    while (sent < req.size()) {
+        if (terminate_flag.load(std::memory_order_relaxed)) { close(fd); return false; }
+        const ssize_t n = send(fd, req.data() + sent, req.size() - sent, MSG_NOSIGNAL);
+        if (n <= 0) { close(fd); return false; }
+        sent += static_cast<size_t>(n);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kWhoisDeadlineSec);
+    std::string resp;
+    char buf[16384];
+    for (;;) {
+        if (terminate_flag.load(std::memory_order_relaxed)) break;
+        if (resp.size() > kMaxWhoisResponse || std::chrono::steady_clock::now() > deadline) break;
+        const ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        resp.append(buf, static_cast<size_t>(n));
+    }
+    close(fd);
+    if (resp.empty()) return false;
+
+    size_t pos = 0;
+    bool first = true;
+    while (pos < resp.size()) {
+        const size_t nl = resp.find('\n', pos);
+        std::string line = resp.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = (nl == std::string::npos) ? resp.size() : nl + 1;
+        if (first) { first = false; continue; }
+        if (line.empty()) continue;
+        std::vector<std::string> f = split_pipe(line);
+        if (f.size() < 7) continue;
+        const std::string& asn = f[0];
+        if (asn.empty() || asn == "NA") continue;
+        std::string name = f[6];
+        sanitize_inplace(name);
+        out_labels[f[1]] = name.empty() ? ("AS" + asn) : (name + " (AS" + asn + ")");
+    }
+    return true;
 }
 
-static bool buffer_tail_has_html_close(const std::vector<u8> &data)
-{
-    static constexpr const char *kNeedles[] = { "</html>", "</body>" };
-    size_t tail_start = data.size() > 64 ? data.size() - 64 : 0;
-    const u8 *base = data.data() + tail_start;
-    size_t    len  = data.size() - tail_start;
+void resolve_owners(const std::vector<std::pair<std::string, uint32_t>>& v4_samples,
+                     const std::vector<std::pair<std::string, u128>>& v6_samples,
+                     const Options& opts,
+                     std::vector<std::string>& v4_labels, std::vector<std::string>& v6_labels,
+                     size_t& resolved, size_t& attempted) {
+    v4_labels.assign(v4_samples.size(), std::string());
+    v6_labels.assign(v6_samples.size(), std::string());
+    resolved = 0;
+    attempted = v4_samples.size() + v6_samples.size();
+    if (attempted == 0) return;
 
-    for (const char *needle : kNeedles) {
-        size_t nlen = strlen(needle);
-        if (nlen > len) continue;
-        for (size_t i = 0; i + nlen <= len; ++i) {
-            bool match = true;
-            for (size_t k = 0; k < nlen; ++k) {
-                if ((char)tolower((unsigned char)base[i + k]) != needle[k]) {
-                    match = false; break;
+    const size_t cap = std::min(attempted, kMaxOwnerLookups);
+    if (cap < attempted)
+        std::cerr << "[discover] --owner: capped at " << kMaxOwnerLookups << " of " << attempted
+                   << " ranges to bound lookup load\n";
+
+    std::vector<std::string> ip_text(cap);
+    for (size_t i = 0; i < cap; ++i) {
+        ip_text[i] = (i < v4_samples.size()) ? v4_to_string(v4_samples[i].second)
+                                              : v6_to_string(v6_samples[i - v4_samples.size()].second);
+    }
+
+    std::vector<std::pair<size_t, size_t>> chunks;
+    for (size_t start = 0; start < cap; start += kBulkChunkSize)
+        chunks.emplace_back(start, std::min(start + kBulkChunkSize, cap));
+
+    const int nworkers = std::max(1, std::min({static_cast<int>(chunks.size()), opts.dns_concurrency, 8}));
+    std::atomic<size_t> next_chunk{0};
+    std::unordered_map<std::string, std::string> labels;
+    labels.reserve(cap);
+    std::mutex labels_mu;
+
+    auto worker = [&]() {
+        for (;;) {
+            size_t ci = next_chunk.fetch_add(1);
+            if (ci >= chunks.size() || terminate_flag.load(std::memory_order_relaxed)) return;
+            const auto [a, b] = chunks[ci];
+            std::vector<std::string> batch(ip_text.begin() + static_cast<long>(a), ip_text.begin() + static_cast<long>(b));
+            std::unordered_map<std::string, std::string> local;
+            if (bulk_cymru_query(batch, opts.dns_timeout_ms, local)) {
+                std::lock_guard<std::mutex> lk(labels_mu);
+                for (auto& kv : local) labels.emplace(std::move(kv.first), std::move(kv.second));
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(nworkers);
+    for (int t = 0; t < nworkers; ++t) pool.emplace_back(worker);
+    for (auto& th : pool) th.join();
+
+    std::vector<size_t> unresolved;
+    for (size_t i = 0; i < cap; ++i) {
+        auto it = labels.find(ip_text[i]);
+        if (it != labels.end()) {
+            if (i < v4_samples.size()) v4_labels[i] = it->second;
+            else v6_labels[i - v4_samples.size()] = it->second;
+            ++resolved;
+        } else if (opts.owner_ptr_fallback) {
+            unresolved.push_back(i);
+        }
+    }
+
+    if (!unresolved.empty() && !terminate_flag.load(std::memory_order_relaxed)) {
+        std::vector<std::string> servers = !opts.dns_servers.empty() ? opts.dns_servers
+                                          : !g_dns_servers.empty()   ? g_dns_servers
+                                                                      : owner_system_resolvers();
+        if (!servers.empty()) {
+            std::atomic<size_t> uidx{0};
+            const int pfworkers = std::max(1, std::min({static_cast<int>(unresolved.size()), opts.dns_concurrency, 8}));
+            auto pworker = [&]() {
+                for (;;) {
+                    size_t k = uidx.fetch_add(1);
+                    if (k >= unresolved.size() || terminate_flag.load(std::memory_order_relaxed)) return;
+                    size_t i = unresolved[k];
+                    std::string ptr;
+                    bool ok = (i < v4_samples.size())
+                        ? udp_dns_query(servers, ptr_qname_v4(v4_samples[i].second), 12, opts.dns_timeout_ms, ptr)
+                        : udp_dns_query(servers, ptr_qname_v6(v6_samples[i - v4_samples.size()].second), 12, opts.dns_timeout_ms, ptr);
+                    if (ok && !ptr.empty()) {
+                        if (ptr.back() == '.') ptr.pop_back();
+                        std::string label = "ptr:" + ptr;
+                        if (i < v4_samples.size()) v4_labels[i] = label;
+                        else v6_labels[i - v4_samples.size()] = label;
+                    }
+                }
+            };
+            std::vector<std::thread> ppool;
+            ppool.reserve(pfworkers);
+            for (int t = 0; t < pfworkers; ++t) ppool.emplace_back(pworker);
+            for (auto& th : ppool) th.join();
+            for (size_t i : unresolved) {
+                bool got = (i < v4_samples.size()) ? !v4_labels[i].empty() : !v6_labels[i - v4_samples.size()].empty();
+                if (got) ++resolved;
+            }
+        }
+    }
+}
+
+}
+
+namespace {
+
+enum class Kind { NwDb, ApnicDelegated, RirV4, RirV6 };
+
+struct Job {
+    char cc[3] = {0, 0, 0};
+    bool want_v4 = true;
+    bool want_v6 = true;
+};
+
+constexpr size_t kMaxLine         = 8 * 1024;
+constexpr size_t kCapStreamBytes  = 128u * 1024 * 1024;
+constexpr size_t kCapPageBytes    = 4u * 1024 * 1024;
+constexpr size_t kCapAsnPageBytes = 256u * 1024 * 1024;
+constexpr size_t kCapReplyBytes   = 8u * 1024 * 1024;
+
+struct Xfer {
+    std::string url;
+    size_t      cap = kCapPageBytes;
+    bool        not_found_ok = false;
+    CURL*       easy = nullptr;
+    size_t      total_bytes = 0;
+    long        http = 0;
+    double      secs = 0.0;
+    bool        aborted = false;
+    const char* abort_reason = nullptr;
+    bool        done = false;
+    bool        ok = false;
+    std::string note;
+    std::string body;
+
+    virtual ~Xfer() = default;
+    virtual bool on_data(const char* p, size_t n) { body.append(p, n); return true; }
+    virtual void on_finish() {}
+    virtual void on_fail() { body.clear(); }
+    virtual void on_reset() {}
+
+    bool ingest(const char* p, size_t n) {
+        total_bytes += n;
+        if (total_bytes > cap) { aborted = true; abort_reason = "response too large"; return false; }
+        return on_data(p, n);
+    }
+
+    void reset() {
+        easy = nullptr;
+        total_bytes = 0;
+        http = 0;
+        secs = 0.0;
+        aborted = false;
+        abort_reason = nullptr;
+        done = false;
+        ok = false;
+        note.clear();
+        body.clear();
+        on_reset();
+    }
+};
+
+struct Source : Xfer {
+    Kind        kind = Kind::NwDb;
+    const char* label = "";
+    const Job*  job = nullptr;
+    bool        streaming = true;
+    std::string buf;
+    std::vector<V4> v4;
+    std::vector<V6> v6;
+
+    bool on_data(const char* p, size_t n) override;
+    void on_finish() override;
+    void on_fail() override { v4.clear(); v6.clear(); buf.clear(); }
+};
+
+size_t split_pipe(std::string_view line, std::string_view* f, size_t max) {
+    size_t n = 0;
+    while (n + 1 < max) {
+        size_t bar = line.find('|');
+        if (bar == std::string_view::npos) break;
+        f[n++] = line.substr(0, bar);
+        line.remove_prefix(bar + 1);
+    }
+    f[n++] = line;
+    return n;
+}
+
+void apnic_line(Source& s, std::string_view line) {
+    if (line[0] == '#') return;
+    const size_t p1 = line.find('|');
+    if (p1 == std::string_view::npos || p1 + 3 >= line.size()) return;
+    if (line[p1 + 3] != '|' || line[p1 + 1] != s.job->cc[0] || line[p1 + 2] != s.job->cc[1]) return;
+
+    std::string_view f[8];
+    if (split_pipe(line, f, 8) < 7) return;
+    if (!(f[6] == "allocated" || f[6] == "assigned")) return;
+
+    if (f[2] == "ipv4") {
+        if (!s.job->want_v4) return;
+        uint32_t start;
+        uint64_t count;
+        if (!parse_v4_addr(f[3], start) || !parse_u64(f[4], count) || count == 0) return;
+        uint64_t last = static_cast<uint64_t>(start) + count - 1;
+        if (last > 0xFFFFFFFFull) return;
+        s.v4.emplace_back(start, static_cast<uint32_t>(last));
+    } else if (f[2] == "ipv6") {
+        if (!s.job->want_v6) return;
+        u128 start;
+        uint64_t plen;
+        if (!parse_v6_addr(f[3], start) || !parse_u64(f[4], plen) || plen < 1 || plen > 128) return;
+        s.v6.push_back(v6_from_prefix(start, static_cast<unsigned>(plen)));
+    }
+}
+
+void rir_line(Source& s, std::string_view line) {
+    line = trim_sv(line);
+    if (line.empty() || line[0] == '#') return;
+    if (s.kind == Kind::RirV4) {
+        V4 iv;
+        if (parse_v4_cidr(line, iv)) s.v4.push_back(iv);
+    } else {
+        V6 iv;
+        if (parse_v6_cidr(line, iv)) s.v6.push_back(iv);
+    }
+}
+
+void handle_line(Source& s, std::string_view line) {
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    if (line.empty()) return;
+    if (s.kind == Kind::ApnicDelegated) apnic_line(s, line);
+    else                                rir_line(s, line);
+}
+
+bool feed(Source& s, const char* p, size_t len) {
+    if (!s.streaming) { s.buf.append(p, len); return true; }
+
+    size_t pos = 0;
+    if (!s.buf.empty()) {
+        const char* nl = static_cast<const char*>(std::memchr(p, '\n', len));
+        if (!nl) {
+            if (s.buf.size() + len > kMaxLine) { s.aborted = true; s.abort_reason = "line too long (not a delegation file?)"; return false; }
+            s.buf.append(p, len);
+            return true;
+        }
+        const size_t n = static_cast<size_t>(nl - p);
+        s.buf.append(p, n);
+        handle_line(s, s.buf);
+        s.buf.clear();
+        pos = n + 1;
+    }
+    while (pos < len) {
+        const char* start = p + pos;
+        const char* nl = static_cast<const char*>(std::memchr(start, '\n', len - pos));
+        if (!nl) {
+            if (len - pos > kMaxLine) { s.aborted = true; s.abort_reason = "line too long (not a delegation file?)"; return false; }
+            s.buf.assign(start, len - pos);
+            break;
+        }
+        const size_t n = static_cast<size_t>(nl - start);
+        handle_line(s, std::string_view(start, n));
+        pos += n + 1;
+    }
+    return true;
+}
+
+void finish(Source& s) {
+    if (s.streaming) {
+        if (!s.buf.empty()) { handle_line(s, s.buf); s.buf.clear(); }
+        return;
+    }
+    const std::string_view body(s.buf);
+    bool country_ok = false;
+    for (size_t pos = 0; (pos = body.find("/country/", pos)) != std::string_view::npos; ) {
+        pos += 9;
+        if (pos + 2 <= body.size() &&
+            lower_ascii(body[pos]) == lower_ascii(s.job->cc[0]) &&
+            lower_ascii(body[pos + 1]) == lower_ascii(s.job->cc[1]) &&
+            (pos + 2 == body.size() || !is_alnum_ascii(static_cast<unsigned char>(body[pos + 2])))) {
+            country_ok = true;
+            break;
+        }
+    }
+    if (!country_ok) {
+        s.note = "page is not attributed to this country (org page of an unrelated entity) - ignored";
+        return;
+    }
+
+    static constexpr std::string_view kKey = "CIDR:</span>";
+    size_t pos = 0;
+    while ((pos = body.find(kKey, pos)) != std::string_view::npos) {
+        pos += kKey.size();
+        while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t' || body[pos] == '\r' || body[pos] == '\n')) ++pos;
+        size_t e = pos;
+        while (e < body.size() && ((body[e] >= '0' && body[e] <= '9') || body[e] == '.' || body[e] == '/')) ++e;
+        V4 iv;
+        if (e > pos && parse_v4_cidr(body.substr(pos, e - pos), iv)) s.v4.push_back(iv);
+        pos = e;
+    }
+    s.buf.clear();
+    s.buf.shrink_to_fit();
+}
+
+bool Source::on_data(const char* p, size_t n) { return feed(*this, p, n); }
+void Source::on_finish() { finish(*this); }
+
+#if LIBCURL_VERSION_NUM >= 0x074700
+const std::string* cached_ca_bundle() {
+    static const std::string bundle = [] {
+        const char* path = nullptr;
+        curl_version_info_data* vi = curl_version_info(CURLVERSION_NOW);
+        if (vi && vi->cainfo && vi->cainfo[0]) path = vi->cainfo;
+        static const char* fallbacks[] = {
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+        };
+        std::ifstream f;
+        if (path) f.open(path, std::ios::binary);
+        for (size_t i = 0; !f.is_open() && i < 3; ++i) f.open(fallbacks[i], std::ios::binary);
+        if (!f.is_open()) return std::string();
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }();
+    return bundle.empty() ? nullptr : &bundle;
+}
+#endif
+
+size_t write_cb(char* p, size_t sz, size_t nm, void* ud) {
+    auto* x = static_cast<Xfer*>(ud);
+    if (terminate_flag.load(std::memory_order_relaxed)) {
+        x->aborted = true;
+        x->abort_reason = "interrupted";
+        return 0;
+    }
+    const size_t len = sz * nm;
+    return x->ingest(p, len) ? len : 0;
+}
+
+void configure_easy(Xfer& x, const Options& o, CURLSH* share) {
+    CURL* h = x.easy;
+    curl_easy_setopt(h, CURLOPT_URL, x.url.c_str());
+    curl_easy_setopt(h, CURLOPT_PRIVATE, &x);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &x);
+
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(h, CURLOPT_BUFFERSIZE, 262144L);
+    curl_easy_setopt(h, CURLOPT_USERAGENT, "Shiv-discover/1.0");
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, static_cast<long>(o.connect_timeout_sec));
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, static_cast<long>(o.total_timeout_sec));
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, 20L);
+    curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(h, CURLOPT_MAXREDIRS, 3L);
+    if (share) curl_easy_setopt(h, CURLOPT_SHARE, share);
+#if LIBCURL_VERSION_NUM >= 0x074700
+    if (const std::string* bundle = cached_ca_bundle()) {
+        curl_blob blob{const_cast<char*>(bundle->data()), bundle->size(), CURL_BLOB_COPY};
+        curl_easy_setopt(h, CURLOPT_CAINFO_BLOB, &blob);
+    }
+#endif
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "https");
+    curl_easy_setopt(h, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+    curl_easy_setopt(h, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS));
+    curl_easy_setopt(h, CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS));
+#endif
+}
+
+CURLMcode wait_multi(CURLM* m, int ms, int* nfds) {
+#if LIBCURL_VERSION_NUM >= 0x074200
+    return curl_multi_poll(m, nullptr, 0, ms, nfds);
+#else
+    return curl_multi_wait(m, nullptr, 0, ms, nfds);
+#endif
+}
+std::string nwdb_slug(const char* name) {
+    std::string out;
+    for (const char* p = name; *p; ++p) {
+        unsigned char c = static_cast<unsigned char>(*p);
+        if (is_alnum_ascii(c)) out.push_back(lower_ascii(static_cast<char>(c)));
+        else if ((c == ' ' || c == '-') && !out.empty() && out.back() != '-') out.push_back('-');
+    }
+    while (!out.empty() && out.back() == '-') out.pop_back();
+    return out;
+}
+bool err_tty() { static const bool t = isatty(STDERR_FILENO) != 0; return t; }
+bool out_tty() { static const bool t = isatty(STDOUT_FILENO) != 0; return t; }
+const char* col(const char* c) { return err_tty() ? c : ""; }
+const char* colo(const char* c) { return out_tty() ? c : ""; }
+constexpr const char* kReset = "\033[0m";
+constexpr const char* kGreen = "\033[32m";
+constexpr const char* kYellow = "\033[93m";
+constexpr const char* kRed = "\033[91m";
+constexpr const char* kBlue = "\033[94m";
+constexpr const char* kBold = "\033[1m";
+
+std::string format_time() {
+    const std::time_t t = std::time(nullptr);
+    std::string s(std::ctime(&t));
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    return s;
+}
+
+using ProgressFn = std::function<void(size_t, size_t)>;
+
+int run_transfers(const std::vector<Xfer*>& xs, const Options& o, size_t concurrency, const ProgressFn& progress) {
+    if (xs.empty()) return 0;
+    CURLM* multi = curl_multi_init();
+    if (!multi) return 1;
+    CURLSH* share = curl_share_init();
+    if (share) {
+        curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    }
+    if (concurrency == 0) concurrency = 1;
+    curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, static_cast<long>(concurrency));
+
+    size_t next = 0, active = 0, finished = 0;
+
+    auto launch = [&]() {
+        while (next < xs.size() && active < concurrency) {
+            Xfer* x = xs[next++];
+            x->easy = curl_easy_init();
+            if (!x->easy) {
+                x->done = true;
+                x->ok = false;
+                x->note = "curl_easy_init failed";
+                ++finished;
+                if (progress) progress(finished, xs.size());
+                continue;
+            }
+            configure_easy(*x, o, share);
+            curl_multi_add_handle(multi, x->easy);
+            ++active;
+            if (o.verbose) std::cerr << "[discover]   GET " << x->url << "\n";
+        }
+    };
+
+    auto reap = [&]() {
+        int left = 0;
+        while (CURLMsg* m = curl_multi_info_read(multi, &left)) {
+            if (m->msg != CURLMSG_DONE) continue;
+            CURL* h = m->easy_handle;
+            char* priv = nullptr;
+            curl_easy_getinfo(h, CURLINFO_PRIVATE, &priv);
+            Xfer* x = reinterpret_cast<Xfer*>(priv);
+            const CURLcode rc = m->data.result;
+            curl_multi_remove_handle(multi, h);
+            if (active > 0) --active;
+            ++finished;
+            if (x) {
+                long http = 0;
+                curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &http);
+                curl_easy_getinfo(h, CURLINFO_TOTAL_TIME, &x->secs);
+                x->http = http;
+                x->done = true;
+                x->easy = nullptr;
+                if (rc == CURLE_OK || (rc == CURLE_HTTP_RETURNED_ERROR && http == 404 && x->not_found_ok)) {
+                    x->on_finish();
+                    x->ok = x->note.empty();
+                } else {
+                    x->ok = false;
+                    if (x->aborted && x->abort_reason)        x->note = x->abort_reason;
+                    else if (rc == CURLE_HTTP_RETURNED_ERROR) x->note = "HTTP " + std::to_string(http);
+                    else                                       x->note = curl_easy_strerror(rc);
+                    x->on_fail();
                 }
             }
-            if (match) return true;
+            curl_easy_cleanup(h);
+            if (progress) progress(finished, xs.size());
+        }
+    };
+
+    int running = 0;
+    while (!terminate_flag.load(std::memory_order_relaxed)) {
+        launch();
+        curl_multi_perform(multi, &running);
+        reap();
+        if (active == 0 && next >= xs.size()) break;
+        if (next < xs.size() && active < concurrency) continue;
+        int nfds = 0;
+        if (wait_multi(multi, 200, &nfds) != CURLM_OK) break;
+    }
+
+    for (Xfer* x : xs) {
+        if (x->easy) {
+            curl_multi_remove_handle(multi, x->easy);
+            curl_easy_cleanup(x->easy);
+            x->easy = nullptr;
+        }
+    }
+    curl_multi_cleanup(multi);
+    if (share) curl_share_cleanup(share);
+    return terminate_flag.load(std::memory_order_relaxed) ? 130 : 0;
+}
+
+struct CurlGlobal {
+    bool ok;
+    CurlGlobal() : ok(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK) {}
+    ~CurlGlobal() { if (ok) curl_global_cleanup(); }
+    CurlGlobal(const CurlGlobal&) = delete;
+    CurlGlobal& operator=(const CurlGlobal&) = delete;
+};
+
+void save_file(const Options& o, const std::string& text) {
+    if (o.output_file.empty()) return;
+    std::ofstream f(o.output_file, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        std::cerr << col(kRed) << "[discover] cannot write '" << o.output_file << "'" << col(kReset) << "\n";
+        return;
+    }
+    f.write(text.data(), static_cast<std::streamsize>(text.size()));
+    std::cerr << "[discover] saved  : " << o.output_file << "\n";
+}
+
+void write_out(const Options& o, const std::string& text) {
+    std::cout.write(text.data(), static_cast<std::streamsize>(text.size()));
+    std::cout.flush();
+    save_file(o, text);
+}
+
+bool pick_country(const std::string& input, const Country*& out, CountryMatch::How& how) {
+    CountryMatch m = resolve_country(input);
+    if (!m.country) {
+        std::cerr << col(kRed) << "[discover] unknown country '" << input << "'" << col(kReset) << "\n";
+        if (!m.suggestions.empty()) {
+            std::cerr << "[discover] did you mean:\n";
+            for (const Country* c : m.suggestions)
+                std::cerr << "             " << c->name << "  (" << c->iso2 << ")\n";
+        } else {
+            std::cerr << "[discover] use a country name (\"nepal\", \"south korea\") or an ISO code (NP, NPL).\n";
+        }
+        return false;
+    }
+    out = m.country;
+    how = m.how;
+    return true;
+}
+
+void print_country_line(const Country& country, CountryMatch::How how, const std::string& input) {
+    std::cerr << col(kBold) << "[discover] country : " << country.name << " (" << country.iso2 << ")" << col(kReset);
+    if (how == CountryMatch::How::Prefix) std::cerr << "   <- '" << input << "' matched by prefix";
+    if (how == CountryMatch::How::Fuzzy)  std::cerr << "   <- '" << input << "' corrected to closest name";
+    std::cerr << "\n";
+}
+
+std::string pad_right(const std::string& s, size_t w) {
+    std::string out = s;
+    if (out.size() < w) out.append(w - out.size(), ' ');
+    return out;
+}
+
+}
+
+namespace {
+
+struct Cleaned {
+    std::vector<std::string> tokens;
+    std::string compact;
+};
+
+constexpr std::string_view kNoise[] = {
+    "ag", "and", "bhd", "bv", "co", "company", "corp", "corporation", "gmbh", "inc", "incorporated",
+    "limited", "llc", "llp", "ltd", "of", "plc", "private", "pte", "pty", "pvt", "sa", "sdn", "the"
+};
+
+bool is_noise(std::string_view t) {
+    return std::binary_search(std::begin(kNoise), std::end(kNoise), t);
+}
+
+bool all_digits(std::string_view s) {
+    return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+std::string_view strip_owner_suffixes(std::string_view s) {
+    s = trim_sv(s);
+    if (!s.empty() && s.back() == ')') {
+        const size_t p = s.rfind("(AS");
+        if (p != std::string_view::npos && s.size() >= p + 4 && all_digits(s.substr(p + 3, s.size() - p - 4)))
+            s = trim_sv(s.substr(0, p));
+    }
+    const size_t comma = s.rfind(',');
+    if (comma != std::string_view::npos) {
+        const std::string_view cc = trim_sv(s.substr(comma + 1));
+        if (cc.size() == 2 && cc[0] >= 'A' && cc[0] <= 'Z' && cc[1] >= 'A' && cc[1] <= 'Z')
+            s = s.substr(0, comma);
+    }
+    return s;
+}
+
+struct OwnerLabelParts {
+    std::string_view org;
+    std::string_view country;
+    std::string_view asn_digits;
+};
+
+OwnerLabelParts split_owner_label(std::string_view s) {
+    OwnerLabelParts out;
+    s = trim_sv(s);
+    if (!s.empty() && s.back() == ')') {
+        const size_t p = s.rfind("(AS");
+        if (p != std::string_view::npos && s.size() >= p + 4 && all_digits(s.substr(p + 3, s.size() - p - 4))) {
+            out.asn_digits = s.substr(p + 3, s.size() - p - 4);
+            s = trim_sv(s.substr(0, p));
+        }
+    }
+    const size_t comma = s.rfind(',');
+    if (comma != std::string_view::npos) {
+        const std::string_view cc = trim_sv(s.substr(comma + 1));
+        if (cc.size() == 2 && cc[0] >= 'A' && cc[0] <= 'Z' && cc[1] >= 'A' && cc[1] <= 'Z') {
+            out.country = cc;
+            s = trim_sv(s.substr(0, comma));
+        }
+    }
+    out.org = s;
+    return out;
+}
+
+struct OwnerRow {
+    std::string asn, range, country, org;
+};
+
+void collect_owner_rows(const std::vector<std::pair<std::string, uint32_t>>& v4_samples,
+                        const std::vector<std::string>& v4_labels,
+                        const std::vector<std::pair<std::string, u128>>& v6_samples,
+                        const std::vector<std::string>& v6_labels,
+                        const std::vector<char>* keep4, const std::vector<char>* keep6,
+                        std::vector<OwnerRow>& rows) {
+    auto add = [&](const std::string& range, const std::string& label) {
+        OwnerRow r;
+        r.range = range;
+        if (!label.empty()) {
+            const OwnerLabelParts p = split_owner_label(label);
+            r.org = std::string(p.org);
+            r.country = std::string(p.country);
+            if (!p.asn_digits.empty()) r.asn = "(AS" + std::string(p.asn_digits) + ")";
+        }
+        rows.push_back(std::move(r));
+    };
+    for (size_t i = 0; i < v4_samples.size(); ++i) {
+        if (keep4 && !(*keep4)[i]) continue;
+        add(v4_samples[i].first, v4_labels[i]);
+    }
+    for (size_t i = 0; i < v6_samples.size(); ++i) {
+        if (keep6 && !(*keep6)[i]) continue;
+        add(v6_samples[i].first, v6_labels[i]);
+    }
+}
+
+constexpr size_t kAsnColMin = 16, kRangeColMin = 28, kCountryColMin = 16;
+
+void render_owner_table(const std::vector<OwnerRow>& rows, bool color, std::string& out, bool with_range = true) {
+    size_t w1 = kAsnColMin, w2 = kRangeColMin, w3 = kCountryColMin;
+    for (const OwnerRow& r : rows) {
+        w1 = std::max(w1, r.asn.size() + 2);
+        if (with_range) w2 = std::max(w2, r.range.size() + 2);
+        w3 = std::max(w3, r.country.size() + 2);
+    }
+    if (color) out += colo(kGreen);
+    out += pad_right("ASN", w1);
+    if (with_range) out += pad_right("RANGE", w2);
+    out += pad_right("COUNTRY", w3);
+    out += "ORGANIZATION";
+    if (color) out += colo(kReset);
+    out += "\n\n";
+    for (const OwnerRow& r : rows) {
+        if (color) out += colo(kBlue);
+        out += pad_right(r.asn, w1);
+        if (color) out += colo(kReset);
+        if (with_range) out += pad_right(r.range, w2);
+        out += pad_right(r.country, w3);
+        if (color) out += colo(kYellow);
+        out += r.org;
+        if (color) out += colo(kReset);
+        out += "\n";
+    }
+}
+
+bool is_iso2(std::string_view s) {
+    if (s.size() != 2) return false;
+    for (const Country& c : kCountries)
+        if (c.iso2[0] == s[0] && c.iso2[1] == s[1]) return true;
+    return false;
+}
+
+void split_trailing_cc(std::string& name, std::string& cc) {
+    cc.clear();
+    const size_t n = name.size();
+    if (n < 4 || !is_iso2(std::string_view(name).substr(n - 2))) return;
+    size_t cut;
+    if (name[n - 3] == ',') cut = n - 3;
+    else if (n >= 5 && name[n - 3] == ' ' && name[n - 4] == ',') cut = n - 4;
+    else return;
+    cc = name.substr(n - 2);
+    name.resize(cut);
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+}
+
+Cleaned clean_name(std::string_view in, bool fallback_all) {
+    std::vector<std::string> raw;
+    tokenize(strip_owner_suffixes(in), raw);
+    Cleaned out;
+    out.tokens.reserve(raw.size());
+    for (const std::string& t : raw)
+        if (!is_noise(t)) out.tokens.push_back(t);
+    if (out.tokens.empty() && fallback_all) out.tokens = raw;
+    size_t n = 0;
+    for (const std::string& t : out.tokens) n += t.size();
+    out.compact.reserve(n);
+    for (const std::string& t : out.tokens) out.compact += t;
+    return out;
+}
+
+int tol_for(size_t len) { return len <= 3 ? 0 : (len <= 7 ? 1 : 2); }
+
+bool token_matches(const std::string& q, const std::string& t, bool fuzzy) {
+    if (q == t) return true;
+    if (!fuzzy) return q.size() >= 3 && t.size() > q.size() && t.compare(0, q.size(), q) == 0;
+    const int tol = tol_for(q.size());
+    return tol > 0 && edit_distance(q, t, tol) <= tol;
+}
+
+bool all_tokens_match(const Cleaned& q, const Cleaned& o, bool fuzzy) {
+    for (const std::string& qt : q.tokens) {
+        bool hit = false;
+        for (const std::string& ot : o.tokens) {
+            if (token_matches(qt, ot, fuzzy)) { hit = true; break; }
+        }
+        if (!hit) return false;
+    }
+    return true;
+}
+
+int org_score(const Cleaned& q, const Cleaned& o) {
+    if (q.tokens.empty() || o.tokens.empty()) return 0;
+    if (q.tokens == o.tokens) return 5;
+    if (q.compact.size() >= 4 && o.compact.find(q.compact) != std::string::npos) return 4;
+    if (all_tokens_match(q, o, false)) return 3;
+    if (all_tokens_match(q, o, true)) return 2;
+    if (q.compact.size() >= 5) {
+        const int tol = tol_for(q.compact.size());
+        if (approx_sub(q.compact, o.compact, tol) <= tol) return 1;
+    }
+    return 0;
+}
+
+int keep_threshold(int best) { return best >= 3 ? 3 : 1; }
+
+struct Nearest {
+    static constexpr size_t kMax = 5;
+    std::vector<std::pair<int, std::string>> items;
+
+    void offer(int d, const std::string& s) {
+        if (items.size() == kMax && d >= items.back().first) return;
+        for (const auto& it : items)
+            if (it.second == s) return;
+        auto pos = std::upper_bound(items.begin(), items.end(), d,
+                                    [](int v, const std::pair<int, std::string>& p) { return v < p.first; });
+        items.insert(pos, {d, s});
+        if (items.size() > kMax) items.pop_back();
+    }
+};
+
+uint32_t label_asn(std::string_view label) {
+    const size_t p = label.rfind("(AS");
+    if (p == std::string_view::npos || label.empty() || label.back() != ')' || label.size() < p + 4) return 0;
+    uint64_t v = 0;
+    if (!parse_u64(label.substr(p + 3, label.size() - p - 4), v) || v == 0 || v > 0xFFFFFFFFull) return 0;
+    return static_cast<uint32_t>(v);
+}
+
+bool parse_asn_arg(std::string_view in, uint32_t& asn) {
+    in = trim_sv(in);
+    if (in.size() >= 2 && lower_ascii(in[0]) == 'a' && lower_ascii(in[1]) == 's') in.remove_prefix(2);
+    uint64_t v = 0;
+    if (in.size() > 10 || !parse_u64(in, v) || v == 0 || v > 0xFFFFFFFFull) return false;
+    asn = static_cast<uint32_t>(v);
+    return true;
+}
+
+struct OwnerMatcher {
+    Cleaned  q;
+    uint32_t asn = 0;
+
+    int score(const std::string& label) const {
+        if (asn) return label_asn(label) == asn ? 5 : 0;
+        return org_score(q, clean_name(label, true));
+    }
+};
+
+bool make_owner_matcher(const std::string& name, OwnerMatcher& m) {
+    uint32_t asn = 0;
+    if (parse_asn_arg(name, asn)) { m.asn = asn; return true; }
+    m.q = clean_name(name, false);
+    return !m.q.tokens.empty();
+}
+
+struct OwnerFilter {
+    std::vector<char> keep4, keep6;
+    size_t kept_orgs = 0;
+    int    best = 0;
+    Nearest nearest;
+};
+
+void apply_owner_filter(const OwnerMatcher& m, const std::vector<std::string>& l4,
+                        const std::vector<std::string>& l6, OwnerFilter& f) {
+    std::unordered_map<std::string, int> cache;
+    auto score_of = [&](const std::string& label) -> int {
+        if (label.empty()) return 0;
+        auto it = cache.find(label);
+        if (it != cache.end()) return it->second;
+        const int s = m.score(label);
+        cache.emplace(label, s);
+        return s;
+    };
+    for (const auto& l : l4) f.best = std::max(f.best, score_of(l));
+    for (const auto& l : l6) f.best = std::max(f.best, score_of(l));
+    f.keep4.assign(l4.size(), 0);
+    f.keep6.assign(l6.size(), 0);
+    if (f.best == 0) {
+        if (m.asn == 0) {
+            for (const auto& kv : cache) {
+                const Cleaned c = clean_name(kv.first, true);
+                const int d = approx_sub(m.q.compact, c.compact, 4);
+                if (d <= 4) f.nearest.offer(d, kv.first);
+            }
+        }
+        return;
+    }
+    const int th = keep_threshold(f.best);
+    std::unordered_set<std::string> orgs;
+    for (size_t i = 0; i < l4.size(); ++i)
+        if (score_of(l4[i]) >= th) { f.keep4[i] = 1; orgs.insert(l4[i]); }
+    for (size_t i = 0; i < l6.size(); ++i)
+        if (score_of(l6[i]) >= th) { f.keep6[i] = 1; orgs.insert(l6[i]); }
+    f.kept_orgs = orgs.size();
+}
+
+[[maybe_unused]] uint64_t v4_cidr_size(const std::string& cidr) {
+    const size_t slash = cidr.find('/');
+    uint64_t p = 32;
+    if (slash != std::string::npos) parse_u64(std::string_view(cidr).substr(slash + 1), p);
+    return p > 32 ? 0 : (1ULL << (32 - p));
+}
+
+}
+
+namespace {
+
+struct AsnRow {
+    std::string asn, name, c3, c4;
+};
+
+void append_utf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0x10FFFF) {
+        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+bool ci_starts(std::string_view s, size_t pos, std::string_view lit) {
+    if (pos + lit.size() > s.size()) return false;
+    for (size_t i = 0; i < lit.size(); ++i)
+        if (lower_ascii(s[pos + i]) != lit[i]) return false;
+    return true;
+}
+
+bool tag_boundary(char c) {
+    return c == '>' || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '/';
+}
+
+size_t find_open_tag(std::string_view s, std::string_view name, size_t from) {
+    for (;;) {
+        const size_t p = s.find('<', from);
+        if (p == std::string_view::npos) return p;
+        if (ci_starts(s, p + 1, name)) {
+            const size_t after = p + 1 + name.size();
+            if (after >= s.size()) return std::string_view::npos;
+            if (tag_boundary(s[after])) return p;
+        }
+        from = p + 1;
+    }
+}
+
+size_t find_close_tag(std::string_view s, std::string_view name, size_t from) {
+    for (;;) {
+        const size_t p = s.find("</", from);
+        if (p == std::string_view::npos) return p;
+        if (ci_starts(s, p + 2, name)) {
+            const size_t after = p + 2 + name.size();
+            if (after >= s.size() || tag_boundary(s[after])) return p;
+        }
+        from = p + 2;
+    }
+}
+
+bool decode_entity(std::string_view ent, uint32_t& cp) {
+    if (ent == "amp") { cp = '&'; return true; }
+    if (ent == "lt") { cp = '<'; return true; }
+    if (ent == "gt") { cp = '>'; return true; }
+    if (ent == "quot") { cp = '"'; return true; }
+    if (ent == "apos") { cp = '\''; return true; }
+    if (ent == "nbsp") { cp = ' '; return true; }
+    if (ent.size() >= 2 && ent[0] == '#') {
+        uint64_t v = 0;
+        std::string_view digits = ent.substr(1);
+        int base = 10;
+        if (!digits.empty() && (digits[0] == 'x' || digits[0] == 'X')) { base = 16; digits.remove_prefix(1); }
+        if (digits.empty() || digits.size() > 7) return false;
+        auto r = std::from_chars(digits.data(), digits.data() + digits.size(), v, base);
+        if (r.ec != std::errc() || r.ptr != digits.data() + digits.size() || v > 0x10FFFF) return false;
+        cp = static_cast<uint32_t>(v);
+        return true;
+    }
+    return false;
+}
+
+std::string html_text(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    bool pending_space = false;
+    auto put = [&](char c) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { pending_space = !out.empty(); return; }
+        if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) return;
+        if (pending_space) { out.push_back(' '); pending_space = false; }
+        out.push_back(c);
+    };
+    for (size_t i = 0; i < s.size();) {
+        const char c = s[i];
+        if (c == '<') {
+            const size_t e = s.find('>', i);
+            if (e == std::string_view::npos) break;
+            i = e + 1;
+            continue;
+        }
+        if (c == '&') {
+            const size_t semi = s.find(';', i);
+            uint32_t cp = 0;
+            if (semi != std::string_view::npos && semi - i <= 10 && decode_entity(s.substr(i + 1, semi - i - 1), cp)) {
+                std::string tmp;
+                append_utf8(tmp, cp == 0xA0 ? ' ' : cp);
+                for (char t : tmp) put(t);
+                i = semi + 1;
+                continue;
+            }
+        }
+        put(c);
+        ++i;
+    }
+    return out;
+}
+
+bool valid_asn_cell(const std::string& s) {
+    return s.size() >= 3 && s.size() <= 12 && lower_ascii(s[0]) == 'a' && lower_ascii(s[1]) == 's' &&
+           all_digits(std::string_view(s).substr(2));
+}
+
+constexpr size_t kMaxRowsPerPage = 200000;
+constexpr size_t kMaxAsnRowBytes = 256u * 1024;
+constexpr size_t kStreamTail     = 16;
+
+bool parse_asn_row(std::string_view row, AsnRow& out) {
+    std::string cells[4];
+    size_t n = 0, cp = 0;
+    while (n < 4 && (cp = find_open_tag(row, "td", cp)) != std::string_view::npos) {
+        const size_t gt = row.find('>', cp);
+        if (gt == std::string_view::npos) break;
+        const size_t ce = find_close_tag(row, "td", gt);
+        cells[n++] = html_text(row.substr(gt + 1, ce == std::string_view::npos ? std::string_view::npos : ce - gt - 1));
+        cp = (ce == std::string_view::npos) ? row.size() : ce + 4;
+    }
+    if (n < 2 || !valid_asn_cell(cells[0]) || cells[1].empty()) return false;
+    sanitize_inplace(cells[1]);
+    if (cells[1].empty()) return false;
+    AsnRow r;
+    r.asn = std::move(cells[0]);
+    r.asn[0] = 'A';
+    r.asn[1] = 'S';
+    r.name = std::move(cells[1]);
+    if (all_digits(cells[2]) && cells[2].size() <= 10) r.c3 = std::move(cells[2]);
+    if (all_digits(cells[3]) && cells[3].size() <= 10) r.c4 = std::move(cells[3]);
+    out = std::move(r);
+    return true;
+}
+
+[[maybe_unused]] void parse_asn_rows(std::string_view body, std::vector<AsnRow>& rows) {
+    std::string_view scope = body;
+    const size_t tb = find_open_tag(body, "tbody", 0);
+    if (tb != std::string_view::npos) {
+        const size_t te = find_close_tag(body, "tbody", tb);
+        scope = body.substr(tb, te == std::string_view::npos ? std::string_view::npos : te - tb);
+    }
+    size_t pos = 0;
+    while (rows.size() < kMaxRowsPerPage && (pos = find_open_tag(scope, "tr", pos)) != std::string_view::npos) {
+        const size_t tr_end = find_close_tag(scope, "tr", pos);
+        const std::string_view row = scope.substr(pos, tr_end == std::string_view::npos ? std::string_view::npos : tr_end - pos);
+        pos = (tr_end == std::string_view::npos) ? scope.size() : tr_end + 4;
+        AsnRow r;
+        if (parse_asn_row(row, r)) rows.push_back(std::move(r));
+    }
+}
+
+struct AsnRowStream {
+    enum class State { Pre, Body, Done };
+    State                state = State::Pre;
+    std::string          carry;
+    std::vector<AsnRow>  pre_rows;
+    std::vector<AsnRow>  rows;
+
+    void reset() {
+        state = State::Pre;
+        std::string().swap(carry);
+        std::vector<AsnRow>().swap(pre_rows);
+        std::vector<AsnRow>().swap(rows);
+    }
+
+    bool feed(std::string_view chunk) {
+        if (state == State::Done) return true;
+        carry.append(chunk.data(), chunk.size());
+        const std::string_view sv(carry);
+        size_t pos = 0;
+        for (;;) {
+            const size_t tr = find_open_tag(sv, "tr", pos);
+            const std::string_view region = (tr == std::string_view::npos) ? sv : sv.substr(0, tr);
+            if (state == State::Pre) {
+                const size_t tb = find_open_tag(region, "tbody", pos);
+                if (tb != std::string_view::npos) {
+                    state = State::Body;
+                    std::vector<AsnRow>().swap(pre_rows);
+                    pos = tb + 6;
+                    continue;
+                }
+            }
+            if (state == State::Body) {
+                const size_t te = find_close_tag(region, "tbody", pos);
+                if (te != std::string_view::npos) {
+                    state = State::Done;
+                    std::string().swap(carry);
+                    return true;
+                }
+            }
+            if (tr == std::string_view::npos) {
+                if (sv.size() > kStreamTail) pos = std::max(pos, sv.size() - kStreamTail);
+                break;
+            }
+            const size_t end = find_close_tag(sv, "tr", tr);
+            if (end == std::string_view::npos) { pos = tr; break; }
+            AsnRow r;
+            if (parse_asn_row(sv.substr(tr, end - tr), r)) {
+                std::vector<AsnRow>& dst = (state == State::Pre) ? pre_rows : rows;
+                if (dst.size() >= kMaxRowsPerPage) {
+                    state = State::Done;
+                    std::string().swap(carry);
+                    return true;
+                }
+                dst.push_back(std::move(r));
+            }
+            pos = end + 4;
+        }
+        carry.erase(0, pos);
+        return carry.size() <= kMaxAsnRowBytes;
+    }
+
+    void finish() {
+        if (state != State::Done && !carry.empty()) {
+            const std::string_view sv(carry);
+            const size_t tr = find_open_tag(sv, "tr", 0);
+            if (tr != std::string_view::npos) {
+                AsnRow r;
+                if (parse_asn_row(sv.substr(tr), r))
+                    (state == State::Pre ? pre_rows : rows).push_back(std::move(r));
+            }
+        }
+        if (state == State::Pre) rows.swap(pre_rows);
+        std::string().swap(carry);
+    }
+};
+
+bool is_domain_line(std::string_view l) {
+    if (l.empty() || l.size() > 300) return false;
+    bool dot = false;
+    for (char ch : l) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (c == '.') dot = true;
+        else if (!(is_alnum_ascii(c) || c == '-' || c == '_' || c == '*' || c == ',')) return false;
+    }
+    return dot;
+}
+
+constexpr size_t kMaxDomains = 200000;
+
+bool parse_reverse_body(std::string_view body, std::vector<std::string>& domains, std::string& message) {
+    std::unordered_set<std::string> seen;
+    bool first = true;
+    size_t pos = 0;
+    while (pos < body.size() && domains.size() < kMaxDomains) {
+        const size_t nl = body.find('\n', pos);
+        std::string_view line = body.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
+        pos = (nl == std::string_view::npos) ? body.size() : nl + 1;
+        line = trim_sv(line);
+        if (line.empty()) continue;
+        if (!is_domain_line(line)) {
+            if (first) {
+                message.assign(line.substr(0, 200));
+                sanitize_inplace(message);
+                return false;
+            }
+            continue;
+        }
+        first = false;
+        std::string d(line);
+        if (seen.insert(d).second) domains.push_back(std::move(d));
+    }
+    return true;
+}
+
+bool normalize_range24(std::string_view in, std::string& out, bool& adjusted) {
+    in = trim_sv(in);
+    const size_t slash = in.find('/');
+    if (slash == std::string_view::npos) return false;
+    uint32_t base = 0;
+    uint64_t len = 0;
+    if (!parse_v4_addr(in.substr(0, slash), base) || !parse_u64(in.substr(slash + 1), len) || len != 24) return false;
+    adjusted = (base & 0xFFu) != 0;
+    out = v4_to_string(base & 0xFFFFFF00u) + "/24";
+    return true;
+}
+
+void json_skip_ws(std::string_view s, size_t& p) {
+    while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r' || s[p] == '\n')) ++p;
+}
+
+bool json_hex4(std::string_view s, size_t& p, uint32_t& out) {
+    if (p + 4 > s.size()) return false;
+    uint64_t v = 0;
+    auto r = std::from_chars(s.data() + p, s.data() + p + 4, v, 16);
+    if (r.ec != std::errc() || r.ptr != s.data() + p + 4) return false;
+    out = static_cast<uint32_t>(v);
+    p += 4;
+    return true;
+}
+
+bool json_read_string(std::string_view s, size_t& p, std::string& out) {
+    if (p >= s.size() || s[p] != '"') return false;
+    ++p;
+    out.clear();
+    while (p < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[p++]);
+        if (c == '"') return true;
+        if (out.size() > 4096 || c < 0x20) return false;
+        if (c != '\\') { out.push_back(static_cast<char>(c)); continue; }
+        if (p >= s.size()) return false;
+        const char e = s[p++];
+        switch (e) {
+            case '"':  out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/':  out.push_back('/'); break;
+            case 'b':  out.push_back('\b'); break;
+            case 'f':  out.push_back('\f'); break;
+            case 'n':  out.push_back('\n'); break;
+            case 'r':  out.push_back('\r'); break;
+            case 't':  out.push_back('\t'); break;
+            case 'u': {
+                uint32_t cp = 0;
+                if (!json_hex4(s, p, cp)) return false;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    uint32_t lo = 0;
+                    size_t q = p + 2;
+                    if (p + 1 < s.size() && s[p] == '\\' && s[p + 1] == 'u' && json_hex4(s, q, lo) &&
+                        lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        p = q;
+                    } else {
+                        cp = '?';
+                    }
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    cp = '?';
+                }
+                append_utf8(out, cp);
+                break;
+            }
+            default: return false;
         }
     }
     return false;
 }
 
-static std::vector<u8> capture_tcp(const std::string &ip, int port,
-                                   int timeout_sec,
-                                   const std::vector<u8> *payload,
-                                   bool verbose,
-                                   int connect_timeout_sec = 0,
-                                   async_io::SourcePort src_port = {})
-{
-    // Default: connect timeout is min(3, timeout) — skip filtered ports fast
-    if (connect_timeout_sec <= 0)
-        connect_timeout_sec = std::min(3, timeout_sec);
-
-    auto op = std::make_shared<async_io::Operation>();
-    op->ip   = ip;
-    op->port = port;
-    op->proto = async_io::Proto::TCP;
-    if (payload) op->send_payload = *payload;
-    op->timeouts.connect_sec    = connect_timeout_sec;
-    op->timeouts.first_byte_sec = timeout_sec;
-    // idle_sec left at 0 => reactor default (max(2, timeout_sec/2)), same
-    // math as the old recv_all_tcp()'s idle_timeout_sec.
-    op->src_port = src_port; // default EPHEMERAL — every normal call site is unaffected
-
-    auto data = async_io::run_blocking(async_io::shared_reactor(), op);
-
-    if (verbose) {
-        auto r = op->result.load();
-        if (r == async_io::OpResult::CONNECT_FAILED) {
-            std::string hint;
-            if (src_port.mode == async_io::SourcePort::Mode::FIXED) {
-                if (op->last_errno == EACCES)
-                    hint = " — no permission to bind that source port (need root/CAP_NET_BIND_SERVICE)";
-                else if (op->last_errno == EADDRINUSE)
-                    hint = " — source port already in use by another connection";
-            }
-            vlog::fail(verbose, "tcp connect failed (timeout=" + std::to_string(connect_timeout_sec) +
-                       "s): " + strerror(op->last_errno) + hint, 2);
-        } else if (payload && !payload->empty()) {
-            vlog::line(verbose, "tcp: sent " + std::to_string(payload->size()) + " bytes", 2);
-        }
+bool json_find_string(std::string_view s, std::string_view key, std::string& out) {
+    std::string needle = "\"";
+    needle += key;
+    needle += '"';
+    size_t from = 0;
+    while ((from = s.find(needle, from)) != std::string_view::npos) {
+        size_t p = from + needle.size();
+        from = p;
+        json_skip_ws(s, p);
+        if (p >= s.size() || s[p] != ':') continue;
+        ++p;
+        json_skip_ws(s, p);
+        if (json_read_string(s, p, out)) return true;
     }
-    return data;
+    return false;
 }
 
-struct TlsConfig {
-    // Server certificate verification
-    std::string ca_file;       // PEM CA bundle (e.g. /etc/ssl/certs/ca-certificates.crt)
-    std::string ca_path;       // directory of hashed CA certs (alternative to ca_file)
-    bool        verify_peer = false; // false = fingerprint only, no hard fail on bad cert
-
-    // Mutual TLS (mTLS) — optional
-    std::string client_cert;   // PEM client certificate file
-    std::string client_key;    // PEM private key file for client cert
-
-    // SNI override — if empty, the ip string is used
-    std::string sni_name;
-
-    bool has_client_cert() const { return !client_cert.empty() && !client_key.empty(); }
-};
-
-static bool g_verbose = false;   
-static TlsConfig g_tls_config;
-static std::string g_hostname;
-static std::string g_target_path = "/";
-static std::mutex g_probe_setup_mu;
-static TlsConfig snapshot_tls_config() {
-    std::lock_guard<std::mutex> lk(g_probe_setup_mu);
-    return g_tls_config;
-}
-static std::mutex g_stdout_mu;        
-static std::mutex g_srcport443_mu;
-static std::mutex g_probes_exclude_mu;
-static std::vector<u8> capture_ssl(const std::string &ip, int port,
-                                   int timeout_sec,
-                                   const std::vector<u8> *payload,
-                                   bool verbose,
-                                   TlsCertInfo *cert_out = nullptr,
-                                   int connect_timeout_sec = 0,
-                                   const std::string &sni_override = "")
-{
-    // Default: connect timeout is min(3, timeout) — skip filtered ports fast
-    if (connect_timeout_sec <= 0)
-        connect_timeout_sec = std::min(3, timeout_sec);
-
-    static bool ssl_initialised = false;
-    if (!ssl_initialised) {
-        // Use compat macros — no-ops on OpenSSL 1.1+, real calls on 1.0.x
-        COMPAT_SSL_library_init();
-        COMPAT_SSL_load_error_strings();
-        COMPAT_OpenSSL_add_all_algorithms();
-        ssl_initialised = true;
-    }
-
-    auto op = std::make_shared<async_io::Operation>();
-    op->ip    = ip;
-    op->port  = port;
-    op->proto = async_io::Proto::TLS;
-    if (payload) op->send_payload = *payload;
-    op->timeouts.connect_sec    = connect_timeout_sec;
-    op->timeouts.first_byte_sec = timeout_sec;
-    const TlsConfig tls_cfg = snapshot_tls_config();
-    op->tls.verify_peer  = tls_cfg.verify_peer;
-    op->tls.ca_file       = tls_cfg.ca_file;
-    op->tls.ca_path       = tls_cfg.ca_path;
-    op->tls.client_cert   = tls_cfg.client_cert;
-    op->tls.client_key    = tls_cfg.client_key;
-    op->tls.sni = !sni_override.empty()    ? sni_override
-                : !tls_cfg.sni_name.empty() ? tls_cfg.sni_name
-                                            : ip;
-
-    TlsCertInfo cert_info;
-    bool got_cert = false;
-    op->on_complete = [&cert_info, &got_cert](async_io::Operation &o) {
-        if (o.ssl_handle && o.result.load() == async_io::OpResult::SUCCESS) {
-            cert_info = extract_tls_cert_info(o.ssl_handle);
-            got_cert  = true;
-        }
-    };
-
-    auto data = async_io::run_blocking(async_io::shared_reactor(), op);
-
-    if (got_cert) {
-        if (verbose) cert_info.print(std::cerr);
-        if (cert_out) *cert_out = cert_info;
-    }
-
-    if (verbose) {
-        auto r = op->result.load();
-        switch (r) {
-            case async_io::OpResult::CONNECT_FAILED:
-                vlog::fail(verbose, "ssl connect failed (timeout=" + std::to_string(connect_timeout_sec) +
-                           "s): " + strerror(op->last_errno), 2);
-                break;
-            case async_io::OpResult::TLS_FAILED: {
-                std::string err_cat = "unknown";
-                switch (op->last_ssl_error) {
-                    case SSL_ERROR_SYSCALL:     err_cat = "syscall/IO error";         break;
-                    case SSL_ERROR_SSL:         err_cat = "SSL protocol error";       break;
-                    case SSL_ERROR_ZERO_RETURN: err_cat = "connection closed cleanly"; break;
-                    case SSL_ERROR_WANT_READ:   err_cat = "want-read (timeout?)";     break;
-                    case SSL_ERROR_WANT_WRITE:  err_cat = "want-write (timeout?)";    break;
-                    default:                    err_cat = "other";                     break;
-                }
-                vlog::fail(verbose, "ssl handshake failed on " + ip + ":" + std::to_string(port), 2);
-                vlog::line(verbose, err_cat + " (SSL_get_error=" + std::to_string(op->last_ssl_error) + ")", 3);
-                break;
-            }
-            default:
-                if (payload && !payload->empty())
-                    vlog::line(verbose, "ssl: sent " + std::to_string(payload->size()) + " bytes", 2);
-                break;
-        }
-    } else {
-        ERR_clear_error();
-    }
-
-    return data;
-}
-
-static bool ssl_port_check(const std::string &ip, int port,
-                            int connect_timeout_sec, bool verbose,
-                            TlsCertInfo *cert_out = nullptr)
-{
-    TlsCertInfo cert;
-    int check_timeout = std::clamp(connect_timeout_sec > 0 ? connect_timeout_sec : 3, 1, 5);
-
-    auto r = capture_ssl(ip, port, check_timeout, nullptr,
-                         verbose, &cert, check_timeout);
-
-    bool tls_ok = cert.populated;
-    if (cert_out) *cert_out = cert;
-
-    if (tls_ok) vlog::ok(verbose, "port " + std::to_string(port) + ": TLS confirmed", 2);
-    else        vlog::fail(verbose, "port " + std::to_string(port) + ": TLS not supported (plain TCP)", 2);
-
-    return tls_ok;
-}
-
-static std::vector<u8> capture_ssl_permissive(const std::string &ip, int port,
-                                              int timeout_sec,
-                                              const std::vector<u8> *payload,
-                                              bool verbose,
-                                              TlsCertInfo *cert_out = nullptr,
-                                              int connect_timeout_sec = 0,
-                                              const std::string &sni_override = "")
-{
-    if (connect_timeout_sec <= 0)
-        connect_timeout_sec = std::min(3, timeout_sec);
-
-    static bool ssl_initialised = false;
-    if (!ssl_initialised) {
-        COMPAT_SSL_library_init();
-        COMPAT_SSL_load_error_strings();
-        COMPAT_OpenSSL_add_all_algorithms();
-        ssl_initialised = true;
-    }
-
-    int fd = connect_with_timeout(ip, port, connect_timeout_sec);
-    if (fd < 0) {
-        vlog::fail(verbose, "ssl-permissive connect failed (timeout=" +
-                   std::to_string(connect_timeout_sec) + "s): " + strerror(errno), 2);
-        return {};
-    }
-    set_io_timeouts(fd, timeout_sec);
-
-    // Build a maximally permissive SSL context ---------------------------------
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) { close(fd); return {}; }
-
-    // Accept any protocol version the build supports.
-    // SSL_CTX_set_min_proto_version with 0 means "use the library's absolute
-    // minimum" (typically TLS 1.0 or SSL 3.0 depending on build flags).
-    SSL_CTX_set_min_proto_version(ctx, 0);
-#ifdef TLS1_3_VERSION
-    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-#endif
-
-    // ALL ciphers including weak / export / NULL / anonymous suites.
-    // @SECLEVEL=0 is required on OpenSSL 1.1+ to permit low-security suites.
-    if (SSL_CTX_set_cipher_list(ctx, "ALL:@SECLEVEL=0") != 1) {
-        vlog::warn(verbose, "ssl-permissive: ALL:@SECLEVEL=0 rejected, trying DEFAULT", 2);
-        SSL_CTX_set_cipher_list(ctx, "DEFAULT");
-    }
-
-    // No peer verification, no hostname checking.
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
-
-    vlog::line(verbose, "ssl-permissive: attempting on " + ip + ":" + std::to_string(port) +
-               " (all versions, all ciphers, no cert validation)", 2);
-
-    SSL *ssl = SSL_new(ctx);
-    if (!ssl) { SSL_CTX_free(ctx); close(fd); return {}; }
-    SSL_set_fd(ssl, fd);
-
-    const TlsConfig tls_cfg = snapshot_tls_config();
-    const std::string sni = !sni_override.empty()    ? sni_override
-                           : !tls_cfg.sni_name.empty() ? tls_cfg.sni_name
-                                                        : ip;
-    SSL_set_tlsext_host_name(ssl, sni.c_str());
-
-    // Attempt the TLS handshake with permissive settings ----------------------
-    if (SSL_connect(ssl) <= 0) {
-        int ssl_err = SSL_get_error(ssl, -1);
-        if (verbose) {
-            vlog::fail(verbose, "ssl-permissive handshake failed on " + ip + ":" +
-                       std::to_string(port) + " (even with permissive settings)", 2);
-            std::string err_cat = "unknown";
-            switch (ssl_err) {
-                case SSL_ERROR_SYSCALL:     err_cat = "syscall/IO error";   break;
-                case SSL_ERROR_SSL:         err_cat = "SSL protocol error"; break;
-                case SSL_ERROR_ZERO_RETURN: err_cat = "closed cleanly";     break;
-                default:                    err_cat = "other";             break;
-            }
-            vlog::line(verbose, err_cat + " (" + std::to_string(ssl_err) + ")", 3);
-            unsigned long e;
-            while ((e = ERR_get_error()) != 0) {
-                char eb[256]; ERR_error_string_n(e, eb, sizeof(eb));
-                vlog::line(verbose, std::string(eb), 3);
-            }
-        } else {
-            ERR_clear_error();
-        }
-        SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
-        return {};
-    }
-
-    // Extract cert info (best-effort; we already have VERIFY_NONE) -----------
-    TlsCertInfo cert_info = extract_tls_cert_info(ssl);
-    if (verbose) {
-        cert_info.print(std::cerr);
-        vlog::ok(verbose, "ssl-permissive handshake OK — version: " + cert_info.tls_version +
-                  " | cipher: " + cert_info.cipher, 2);
-    }
-    if (cert_out) *cert_out = cert_info;
-
-    if (payload && !payload->empty())
-        SSL_write(ssl, payload->data(), (int)payload->size());
-
-    const int idle_timeout_sec = std::max(2, timeout_sec / 2);
-    bool got_first = false;
-
-    std::vector<u8> data; char buf[CHUNK];
-    while ((int)data.size() < MAX_RESPONSE) {
-        int n = SSL_read(ssl, buf, sizeof(buf));
-        if (n <= 0) break;
-        data.insert(data.end(), buf, buf + n);
-        break;
-    }
-    SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
-    return data;
-}
-
-static std::vector<u8> capture_udp(const std::string &ip, int port,
-                                   int timeout_sec,
-                                   const std::vector<u8> *payload,
-                                   bool verbose)
-{
-
-    int family = AF_INET;
-    struct sockaddr_storage addr_storage{};
-    socklen_t addr_len = 0;
-
-    {
-        struct sockaddr_in *a4 = reinterpret_cast<struct sockaddr_in *>(&addr_storage);
-        if (inet_pton(AF_INET, ip.c_str(), &a4->sin_addr) == 1) {
-            a4->sin_family = AF_INET;
-            a4->sin_port   = htons((uint16_t)port);
-            addr_len = sizeof(struct sockaddr_in);
-            family   = AF_INET;
-        }
-    }
-    if (addr_len == 0) {
-        struct sockaddr_in6 *a6 = reinterpret_cast<struct sockaddr_in6 *>(&addr_storage);
-        if (inet_pton(AF_INET6, ip.c_str(), &a6->sin6_addr) == 1) {
-            a6->sin6_family = AF_INET6;
-            a6->sin6_port   = htons((uint16_t)port);
-            addr_len = sizeof(struct sockaddr_in6);
-            family   = AF_INET6;
-        }
-    }
-    if (addr_len == 0) return {}; 
-
-    static const u8 WAKE = '\n';
-    const u8 *pbuf = payload && !payload->empty() ? payload->data() : &WAKE;
-    size_t    plen = payload && !payload->empty() ? payload->size()  : 1;
-
-    for (int attempt = 1; attempt <= 2; attempt++) {
-        vlog::line(verbose, "udp attempt " + std::to_string(attempt) + ": sending " +
-                   std::to_string(plen) + "-byte probe", 2);
-        int fd = ::socket(family, SOCK_DGRAM, 0);
-        if (fd < 0) return {};
-        struct timeval tv{ timeout_sec, 0 };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        ::sendto(fd, pbuf, plen, 0,
-                 reinterpret_cast<struct sockaddr *>(&addr_storage), addr_len);
-        if (attempt == 2)
-            ::sendto(fd, "", 0, 0,
-                     reinterpret_cast<struct sockaddr *>(&addr_storage), addr_len);
-        std::vector<u8> data(CHUNK);
-        struct sockaddr_storage from{}; socklen_t fromlen = sizeof(from);
-        ssize_t n = ::recvfrom(fd, data.data(), data.size(), 0,
-                               reinterpret_cast<struct sockaddr *>(&from), &fromlen);
-        ::close(fd);
-        if (n > 0) {
-            vlog::ok(verbose, "udp attempt " + std::to_string(attempt) + " got " +
-                      std::to_string(n) + " bytes", 2);
-            data.resize((size_t)n);
-            return data;
-        }
-        vlog::fail(verbose, "udp attempt " + std::to_string(attempt) + ": no response (" +
-                   strerror(errno) + ")", 2);
-    }
-    vlog::fail(verbose, "udp: no response after 2 attempts", 2);
-    return {};
-}
-
-static std::vector<u8> capture_mqtt(const std::string &ip, int port,
-                                    int timeout_sec, bool verbose,
-                                    int connect_timeout_sec = 0)
-{
-    if (connect_timeout_sec <= 0)
-        connect_timeout_sec = std::min(3, timeout_sec);
-
-    int fd = connect_with_timeout(ip, port, connect_timeout_sec);
-    if (fd < 0) { vlog::fail(verbose, "mqtt connect failed", 2); return {}; }
-
-    set_io_timeouts(fd, timeout_sec);
-
-    std::vector<u8> collected;
-    const char CLIENT_ID[] = "scan_probe";
-    const int  cid_len     = (int)strlen(CLIENT_ID);
-
-    u8 connect_pkt[64]; int ci = 0;
-    connect_pkt[ci++] = 0x10; connect_pkt[ci++] = (u8)(12 + cid_len);
-    connect_pkt[ci++] = 0x00; connect_pkt[ci++] = 0x04;
-    connect_pkt[ci++] = 'M';  connect_pkt[ci++] = 'Q';
-    connect_pkt[ci++] = 'T';  connect_pkt[ci++] = 'T';
-    connect_pkt[ci++] = 0x04; connect_pkt[ci++] = 0x02;
-    connect_pkt[ci++] = 0x00; connect_pkt[ci++] = 0x3c;
-    connect_pkt[ci++] = 0x00; connect_pkt[ci++] = (u8)cid_len;
-    memcpy(connect_pkt + ci, CLIENT_ID, cid_len); ci += cid_len;
-    ::send(fd, connect_pkt, ci, 0);
-
-    u8 connack[4] = {};
-    ssize_t got = ::recv(fd, connack, 4, MSG_WAITALL);
-    if (got < 4) {
-        vlog::fail(verbose, "mqtt incomplete CONNACK (" + std::to_string(got) + " bytes)", 2);
-        collected.insert(collected.end(), connack, connack + got);
-        close(fd); return collected;
-    }
-    collected.insert(collected.end(), connack, connack + 4);
-    if (connack[3] != 0) {
-        vlog::fail(verbose, "mqtt broker requires auth (rc=" + std::to_string(connack[3]) + ")", 2);
-        close(fd); return collected;
-    }
-    vlog::ok(verbose, "mqtt CONNACK OK", 2);
-
-    const char TOPIC[] = "$SYS/broker/version"; const int tlen = (int)strlen(TOPIC);
-    int rem = 2 + 2 + tlen + 1;
-    u8 sub_pkt[64]; int si = 0;
-    sub_pkt[si++] = 0x82; sub_pkt[si++] = (u8)rem;
-    sub_pkt[si++] = 0x00; sub_pkt[si++] = 0x01;
-    sub_pkt[si++] = 0x00; sub_pkt[si++] = (u8)tlen;
-    memcpy(sub_pkt + si, TOPIC, tlen); si += tlen; sub_pkt[si++] = 0x00;
-    ::send(fd, sub_pkt, si, 0);
-
-    char buf[CHUNK];
-    while ((int)collected.size() < MAX_RESPONSE && !terminate_flag) {
-        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;
-        collected.insert(collected.end(), buf, buf + n);
-    }
-    close(fd);
-    return collected;
-}
-
-struct ProbeFileInfo {
-    std::set<int>                  ssl_ports;
-    std::map<int, std::vector<u8>> tcp_ports;
-    std::map<int, std::vector<u8>> udp_ports;
-    std::set<int>                  excluded;
-    bool has_tcp(int p) const { return tcp_ports.count(p) > 0; }
-    bool has_udp(int p) const { return udp_ports.count(p) > 0; }
-};
-
-static std::vector<u8> unescape_probe_string(const std::string &raw)
-{
-    std::vector<u8> result; result.reserve(raw.size());
-    size_t i = 0;
-    while (i < raw.size()) {
-        if (raw[i] == '\\' && i + 1 < raw.size()) {
-            char c = raw[i + 1];
-            if      (c == 'r')  { result.push_back(0x0d); i += 2; }
-            else if (c == 'n')  { result.push_back(0x0a); i += 2; }
-            else if (c == 't')  { result.push_back(0x09); i += 2; }
-            else if (c == '0')  { result.push_back(0x00); i += 2; }
-            else if (c == 'x' && i + 3 < raw.size()) {
-                std::string hex = raw.substr(i + 2, 2);
-                result.push_back((u8)strtol(hex.c_str(), nullptr, 16)); i += 4;
-            } else if (isdigit((unsigned char)c)) {
-                std::string oct_str; size_t j = i + 1;
-                while (j < raw.size() && isdigit((unsigned char)raw[j]) && oct_str.size() < 3)
-                    oct_str += raw[j++];
-                result.push_back((u8)strtol(oct_str.c_str(), nullptr, 8)); i = j;
-            } else if (c == '\\') { result.push_back('\\'); i += 2; }
-            else                  { result.push_back((u8)c); i += 2; }
-        } else {
-            result.push_back((u8)raw[i++]);
-        }
-    }
-    return result;
-}
-
-static void substitute_probe_vars(std::vector<u8> &payload,
-                                   const std::string &host,
-                                   int port)
-{
-    std::string s(payload.begin(), payload.end());
-    auto replace_all = [&](const std::string &from, const std::string &to) {
-        size_t pos = 0;
-        while ((pos = s.find(from, pos)) != std::string::npos) {
-            s.replace(pos, from.size(), to);
-            pos += to.size();
-        }
-    };
-    replace_all("%H", host);
-    replace_all("%P", std::to_string(port));
-    payload.assign(s.begin(), s.end());
-}
-
-static std::optional<int> safe_stoi(const std::string &s) {
-    try {
-        size_t pos = 0;
-        int v = std::stoi(s, &pos);
-        if (pos != s.size()) return std::nullopt;   // trailing junk, e.g. "80x"
-        return v;
-    } catch (const std::exception &) {
-        return std::nullopt;
-    }
-}
-
-static std::vector<int> expand_port_list(const std::string &token)
-{
-    std::vector<int> ports;
-    std::istringstream ss(token);
-    std::string part;
-    while (std::getline(ss, part, ',')) {
-        while (!part.empty() && isspace((unsigned char)part.front())) part.erase(part.begin());
-        while (!part.empty() && isspace((unsigned char)part.back()))  part.pop_back();
-        auto dash = part.find('-');
-        if (dash != std::string::npos) {
-            auto lo = safe_stoi(part.substr(0, dash));
-            auto hi = safe_stoi(part.substr(dash + 1));
-            if (!lo || !hi) {
-                fprintf(stderr, "[!] expand_port_list: skipping malformed range '%s'\n", part.c_str());
-                continue;
-            }
-            for (int p = *lo; p <= *hi; ++p) ports.push_back(p);
-        } else if (!part.empty()) {
-            auto v = safe_stoi(part);
-            if (!v) {
-                fprintf(stderr, "[!] expand_port_list: skipping malformed port '%s'\n", part.c_str());
-                continue;
-            }
-            ports.push_back(*v);
-        }
-    }
-    return ports;
-}
-
-static ProbeFileInfo parse_probe_file_info(const std::string &path)
-{
-    ProbeFileInfo info;
-    std::ifstream f(path);
-    if (!f) { fprintf(stderr, "[!] Cannot open probe file: %s\n", path.c_str()); return info; }
-
-    std::string current_proto;
-    std::string current_name;
-    std::vector<u8> current_payload;
-
-    std::string line;
-    while (std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-
-        if (line.rfind("Exclude ", 0) == 0) {
-            std::string spec = line.substr(8);
-            std::istringstream ss2(spec); std::string seg;
-            while (std::getline(ss2, seg, ',')) {
-                while (!seg.empty() && isspace((unsigned char)seg.front())) seg.erase(seg.begin());
-                auto col = seg.find(':');
-                if (col != std::string::npos) seg = seg.substr(col + 1);
-                for (int p : expand_port_list(seg)) info.excluded.insert(p);
-            }
-        } else if (line.rfind("Probe ", 0) == 0) {
-            std::istringstream tok(line.substr(6));
-            std::string proto, name, qstr;
-            tok >> proto >> name >> qstr;
-            current_proto   = proto;
-            current_name    = name;
-            current_payload.clear();
-            if (name != "NULL") {
-                size_t a = qstr.find('|'), b = qstr.rfind('|');
-                if (a != std::string::npos && b != a) {
-                    std::string raw = qstr.substr(a + 1, b - a - 1);
-                    current_payload = unescape_probe_string(raw);
-                }
-            }
-        } else if (line.rfind("ports ", 0) == 0 && current_proto == "TCP") {
-            for (int p : expand_port_list(line.substr(6)))
-                if (!info.has_tcp(p)) info.tcp_ports[p] = current_payload;
-
-        } else if (line.rfind("sslports ", 0) == 0 && current_proto == "TCP") {
-            for (int p : expand_port_list(line.substr(9))) {
-                info.ssl_ports.insert(p);
-                if (!info.has_tcp(p)) info.tcp_ports[p] = current_payload;
-            }
-
-        } else if (line.rfind("ports ", 0) == 0 && current_proto == "UDP") {
-            for (int p : expand_port_list(line.substr(6)))
-                if (!info.has_udp(p)) info.udp_ports[p] = current_payload;
-        }
-    }
-    return info;
-}
-
-enum class ScanMethod { MQTT, SSL, TCP, UDP, FALLBACK };
-struct MethodDecision { ScanMethod method; const std::vector<u8> *payload; };
-
-static MethodDecision decide_method(int port, const ProbeFileInfo &info, bool force_udp)
-{
-    if (force_udp) {
-        auto it = info.udp_ports.find(port);
-        return { ScanMethod::UDP, it != info.udp_ports.end() ? &it->second : nullptr };
-    }
-    if (port == 1883) return { ScanMethod::MQTT, nullptr };
-    if (info.ssl_ports.count(port)) {
-        auto it = info.tcp_ports.find(port);
-        return { ScanMethod::SSL, it != info.tcp_ports.end() ? &it->second : nullptr };
-    }
-    if (info.has_tcp(port)) {
-        auto it = info.tcp_ports.find(port);
-        return { ScanMethod::TCP, it != info.tcp_ports.end() ? &it->second : nullptr };
-    }
-    if (info.has_udp(port)) {
-        auto it = info.udp_ports.find(port);
-        return { ScanMethod::UDP, it != info.udp_ports.end() ? &it->second : nullptr };
-    }
-    return { ScanMethod::FALLBACK, nullptr };
-}
-
-static std::string bracket_if_ipv6(const std::string &host)
-{
-    if (!host.empty() && host.front() == '[') return host; // already bracketed
-    if (get_ip_version(host.c_str()) == 6) return "[" + host + "]";
-    return host;
-}
-
-static bool response_is_http_error(const std::vector<u8> &r)
-{
-    if (r.size() < 12) return false;
-    if (r[0]!='H'||r[1]!='T'||r[2]!='T'||r[3]!='P'||r[4]!='/') return false;
-    int code = (r[9]-'0')*100 + (r[10]-'0')*10 + (r[11]-'0');
-    return (code >= 400 && code <= 599);
-}
-
-static const std::vector<std::string> kIpHostFallbacks = {
-    "google.com", "azure.com", "microsoft.com"
-};
-
-static std::string make_host_header(const std::string &ip, int port, bool is_ssl,
-                                    const std::string &override_host = "")
-{
-    const std::string &raw_host = !override_host.empty() ? override_host
-                                : (!g_hostname.empty()   ? g_hostname : ip);
-    std::string host = bracket_if_ipv6(raw_host);
-    bool default_port = (is_ssl && port == 443) || (!is_ssl && port == 80);
-    return default_port ? host : (host + ":" + std::to_string(port));
-}
-static const char *kDefaultUserAgent =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36";
-
-static std::string make_get_request(const std::string &path, const std::string &ip,
-                                    int port, bool is_ssl,
-                                    const std::string &host_override = "")
-{
-    return "GET " + path + " HTTP/1.1\r\n"
-           "Host: " + make_host_header(ip, port, is_ssl, host_override) + "\r\n"
-           "User-Agent: " + kDefaultUserAgent + "\r\n"
-           "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-           "Accept-Language: en-US,en;q=0.5\r\n"
-           "Accept-Encoding: gzip, deflate, br\r\n"
-           "Connection: close\r\n\r\n";
-}
-
-static HttpFingerprint follow_http_asset(const std::string &ip, int port,
-                                         const std::string &path, bool is_ssl,
-                                         int timeout_sec, bool verbose)
-{
-    std::string req = make_get_request(path, ip, port, is_ssl);
-    std::vector<u8> payload(req.begin(), req.end());
-    std::vector<u8> resp;
-    if (is_ssl) {
-        TlsCertInfo unused_cert;
-        resp = capture_ssl(ip, port, timeout_sec, &payload, verbose, &unused_cert);
-    } else {
-        resp = capture_tcp(ip, port, timeout_sec, &payload, verbose);
-    }
-    if (resp.empty()) return HttpFingerprint{};
-    return make_http_fingerprint(resp, "asset-follow:" + path, is_ssl);
-}
-
-static bool confirm_websocket_upgrade(const std::string &ip, int port,
-                                      bool is_ssl, int timeout_sec, bool verbose)
-{
-    vlog::line(verbose, "websocket-confirm: status suggested possible upgrade -- "
-               "sending Upgrade probe to " + ip + ":" + std::to_string(port) +
-               (is_ssl ? "  (ssl)" : "  (plain)"), 1);
-
-    std::string req = "GET / HTTP/1.1\r\n"
-                       "Host: " + make_host_header(ip, port, is_ssl) + "\r\n"
-                       "Connection: Upgrade\r\n"
-                       "Upgrade: websocket\r\n"
-                       "Sec-WebSocket-Version: 13\r\n"
-                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
-    std::vector<u8> payload(req.begin(), req.end());
-
-    std::vector<u8> resp;
-    if (is_ssl) {
-        TlsCertInfo unused_cert;
-        resp = capture_ssl(ip, port, timeout_sec, &payload, verbose, &unused_cert);
-    } else {
-        resp = capture_tcp(ip, port, timeout_sec, &payload, verbose);
-    }
-
-    if (resp.empty()) {
-        vlog::fail(verbose, "websocket-confirm: no response to Upgrade probe", 2);
-        return false;
-    }
-
-    int code = extract_status_code(resp);
-    vlog::line(verbose, "websocket-confirm: got status " + std::to_string(code), 2);
-    if (code != 101) {
-        vlog::fail(verbose, "websocket-confirm: status != 101 -- not a websocket upgrade", 2);
-        return false;
-    }
-
-    std::string conn = extract_header(resp, "Connection");
-    std::string upg  = extract_header(resp, "Upgrade");
-    vlog::kv(verbose, "Connection", conn.empty() ? "(missing)" : conn, 2);
-    vlog::kv(verbose, "Upgrade",    upg.empty()  ? "(missing)" : upg,  2);
-
-    std::string conn_lc = conn, upg_lc = upg;
-    for (auto &c : conn_lc) c = (char)tolower((unsigned char)c);
-    for (auto &c : upg_lc)  c = (char)tolower((unsigned char)c);
-
-    bool ok = conn_lc.find("upgrade")   != std::string::npos
-           && upg_lc.find("websocket") != std::string::npos;
-
-    if (ok) vlog::ok(verbose,   "websocket-confirm: Connection/Upgrade headers match -- confirmed", 2);
-    else    vlog::fail(verbose, "websocket-confirm: 101 but headers don't confirm websocket -- rejecting", 2);
-
-    return ok;
-}
-
-static std::vector<u8> capture_http_get(const std::string &ip, int port,
-                                        int timeout_sec, bool verbose)
-{
-
-    std::vector<std::string> candidates;
-    if (!g_hostname.empty() && (!is_ip_literal(g_hostname) || is_lan_ip(ip))) {
-        candidates.push_back(g_hostname);
-    } else {
-        candidates = kIpHostFallbacks;
-        candidates.push_back(ip);
-    }
-
-    for (size_t ci = 0; ci < candidates.size(); ++ci) {
-        const std::string &host_cand = candidates[ci];
-        std::string req = make_get_request("/", ip, port, /*is_ssl=*/false, host_cand);
-        std::vector<u8> payload(req.begin(), req.end());
-        vlog::line(verbose, "http-get: GET / -> " + ip + ":" + std::to_string(port) +
-                   "  Host: " + host_cand, 2);
-        auto r = capture_tcp(ip, port, timeout_sec, &payload, verbose);
-        if (r.empty()) {
-            // TCP connection failed — try next candidate (different Host won't help
-            // a dead port, but attempt remaining entries anyway for completeness)
-            vlog::fail(verbose, "http-get Host:" + host_cand + " -> no TCP response", 2);
-            continue;
-        }
-        int code = extract_status_code(r);
-        if (code == 400 && ci + 1 < candidates.size()) {
-            vlog::line(verbose, "http-get Host:" + host_cand +
-                       " got 400 Bad Request — trying next fallback host", 2);
-            continue;   // 400: move to next Host candidate
-        }
-        // Any other status (200, 301, 403, 500 …) or 400 on last candidate: use it.
-        return r;
-    }
-    return {};
-}
-
-static bool looks_like_tls_record(const std::vector<u8> &resp) {
-    if (resp.size() < 5) return false;
-    u8 content_type = resp[0];
-    u8 ver_major     = resp[1];
-    u8 ver_minor     = resp[2];
-    if (content_type < 0x14 || content_type > 0x18) return false;
-    if (ver_major != 0x03) return false;
-    if (ver_minor > 0x04) return false;
-    return true;
-}
-
-static bool is_redirect(const std::vector<u8> &resp) {
-    if (resp.size() < 12) return false;
-    std::string s(resp.begin(), resp.begin() + std::min(resp.size(), (size_t)20));
-    static const std::regex re(R"(HTTP/[12][. ]\d*\s+3\d\d)");
-    std::smatch m;
-    return std::regex_search(s, m, re);
-}
-
-static std::string extract_location(const std::vector<u8> &resp) {
-    const size_t hard_cap = std::min(resp.size(), (size_t)8192);
-    size_t header_end = hard_cap;
-    for (size_t i = 0; i + 3 < hard_cap; ++i) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            header_end = i + 4;
-            break;
-        }
-    }
-
-    std::string s(resp.begin(), resp.begin() + (std::ptrdiff_t)header_end);
-    static const std::regex re(R"([Ll]ocation:\s*([^\r\n]+))", std::regex::icase);
-    std::smatch m;
-    if (std::regex_search(s, m, re)) {
-        std::string loc = m[1].str();
-        while (!loc.empty() && (loc.back() == '\r' || loc.back() == '\n' || loc.back() == ' '))
-            loc.pop_back();
-        return loc;
-    }
-    return "";
-}
-
-static std::vector<std::string> extract_spa_locations(const std::string &body)
-{
-    std::vector<std::string> results;
-    struct SpaPattern {
-        const char *src;
-        int         group;
-    };
-    static const SpaPattern kPatterns[] = {
-        // 1. window.location = '...', location.href = '...', etc.
-        {
-            R"((?:window|document|self|top|parent)?\.?location(?:\.href)?\s*=\s*['"`]([^'"`]+)['"`])",
-            1
-        },
-        // 2. location.replace('...'), location.assign('...')
-        {
-            R"((?:window|document|self|top|parent)?\.?location\.(?:replace|assign)\s*\(\s*['"`]([^'"`]+)['"`]\s*\))",
-            1
-        },
-        // 3. location = var + '/path.ext'  (concatenation, extension-bounded)
-        {
-            R"(location(?:\.href)?\s*=\s*.{0,60}\+\s*['"`]([^'"`]+\.(?:html?|php|jsp|js|htm|json|asp|aspx))['"`])",
-            1
-        },
-        // 4. .match(...)[N] + '/suffix'
-        {
-            R"(\.match\([^)]+\)\[\d\]\s*\+\s*['"`]([^'"`]+)['"`])",
-            1
-        },
-        // 5. Template-literal: location = `...`
-        {
-            R"(location\s*=\s*`([^`]+)`)",
-            1
-        },
-        // 6. location.pathname = '...'
-        {
-            R"(location\.pathname\s*=\s*['"`]([^'"`]+)['"`])",
-            1
-        },
-        // 7. Inline event handler: onclick="...location='...'"
-        {
-            R"(on(?:click|load|submit|change)\s*=\s*['"][^'"]{0,120}location\s*=\s*['"`]([^'"`]+)['"`])",
-            1
-        },
-        // 8. href="javascript:location.href=..."
-        {
-            R"(href\s*=\s*['"](?:javascript:)?location(?:\.href)?\s*=\s*([^'"]+)['"])",
-            1
-        },
-        // 9. <meta http-equiv="refresh" content="...url=..." or similar>
-        {
-            R"(<meta[^>]{0,200}url\s*=\s*([^'">\s]+))",
-            1
-        },
-        // 10. Quoted common admin/app paths: '/admin/index.html', '/dashboard.php', etc.
-        {
-            R"(['"`](/(?:web|admin|dashboard|ui|app|home|login|index)[^'"`]{0,80}\.(?:html?|php|jsp|js|htm|json|asp|aspx))['"`])",
-            1
-        },
-    };
-
-    // Pre-compile all patterns once
-    static std::vector<std::regex> compiled;
-    static bool compiled_ok = false;
-    if (!compiled_ok) {
-        compiled_ok = true;
-        for (const auto &p : kPatterns) {
-            try {
-                compiled.emplace_back(p.src,
-                    std::regex::ECMAScript | std::regex::icase | std::regex::optimize);
-            } catch (...) {
-                compiled.emplace_back(); // placeholder so indices stay aligned
-            }
-        }
-    }
-
-    // Cap scan to first 65536 bytes of body to bound worst-case backtracking
-    const std::string &scan_body = body.size() > 65536
-                                 ? body.substr(0, 65536)
-                                 : body;
-
-    for (size_t pi = 0; pi < compiled.size(); ++pi) {
-        const auto &re = compiled[pi];
-        try {
-            auto begin = std::sregex_iterator(scan_body.begin(), scan_body.end(), re);
-            auto end   = std::sregex_iterator();
-            for (auto it = begin; it != end; ++it) {
-                const std::smatch &m = *it;
-                int grp = kPatterns[pi].group;
-                if (grp < (int)m.size() && m[grp].matched) {
-                    std::string url = m[grp].str();
-                    // Trim whitespace
-                    while (!url.empty() && isspace((unsigned char)url.front()))
-                        url.erase(url.begin());
-                    while (!url.empty() && isspace((unsigned char)url.back()))
-                        url.pop_back();
-                    // Skip empty, bare-JS, or data: URIs — not routable
-                    if (url.empty()) continue;
-                    if (url.find("javascript:") == 0) continue;
-                    if (url.find("data:")       == 0) continue;
-                    if (url.find("mailto:")     == 0) continue;
-                    if (url.find("${")  != std::string::npos) continue; // template variable
-                    // Skip if url is just a bare variable reference (no slash or dot)
-                    bool has_slash_or_dot = false;
-                    for (char c : url) {
-                        if (c == '/' || c == '.') { has_slash_or_dot = true; break; }
-                    }
-                    if (!has_slash_or_dot) continue;
-                    // Deduplicate
-                    bool dup = false;
-                    for (const auto &r2 : results) if (r2 == url) { dup = true; break; }
-                    if (!dup) results.push_back(url);
-                    if (results.size() >= 20) goto spa_done; // cap at 20 per response
-                }
-            }
-        } catch (...) {
-        }
-    }
-spa_done:
-    return results;
-}
-
-static bool has_spa_redirect(const std::vector<u8> &resp)
-{
-    int code = extract_status_code(resp);
-    if (code >= 300 && code < 400) return false; // already a real redirect — not SPA
-
-    // Extract body text (after \r\n\r\n boundary)
-    size_t body_start = 0;
-    const size_t lim = std::min(resp.size(), (size_t)65536);
-    for (size_t i = 0; i + 3 < lim; ++i) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            body_start = i + 4; break;
-        }
-    }
-    if (body_start == 0) {
-        for (size_t i = 0; i + 1 < lim; ++i) {
-            if (resp[i]=='\n' && resp[i+1]=='\n') { body_start = i + 2; break; }
-        }
-    }
-    if (body_start >= resp.size()) return false;
-
-    std::string body(resp.begin() + (std::ptrdiff_t)body_start,
-                     resp.begin() + (std::ptrdiff_t)lim);
-    auto locs = extract_spa_locations(body);
-    return !locs.empty();
-}
-
-// Return the first SPA-detected URL from a 200 response body.
-// Empty string if none found or if response is already a 3xx redirect.
-static std::string get_spa_redirect_url(const std::vector<u8> &resp)
-{
-    int code = extract_status_code(resp);
-    if (code >= 300 && code < 400) return "";
-
-    size_t body_start = 0;
-    const size_t lim = std::min(resp.size(), (size_t)65536);
-    for (size_t i = 0; i + 3 < lim; ++i) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            body_start = i + 4; break;
-        }
-    }
-    if (body_start == 0) {
-        for (size_t i = 0; i + 1 < lim; ++i) {
-            if (resp[i]=='\n' && resp[i+1]=='\n') { body_start = i + 2; break; }
-        }
-    }
-    if (body_start >= resp.size()) return "";
-
-    std::string body(resp.begin() + (std::ptrdiff_t)body_start,
-                     resp.begin() + (std::ptrdiff_t)lim);
-    auto locs = extract_spa_locations(body);
-    return locs.empty() ? "" : locs[0];
-}
-
-struct ParsedUrl {
-    std::string scheme;  
-    std::string host;     
-    int         port = 0;  
-    std::string path;      
-    std::string host_hdr;  
-    std::string raw_host;
-    std::string &sni = raw_host;  
-};
-
-static ParsedUrl parse_redirect_url(const std::string &loc,
-                                    const std::string &cur_ip,
-                                    int                cur_port,
-                                    const std::string &cur_scheme)
-{
-    ParsedUrl out;
-
-    // Relative path — keep everything from the current connection
-    if (!loc.empty() && loc[0] == '/') {
-        out.scheme   = cur_scheme;
-        out.host     = cur_ip;
-        out.port     = cur_port;
-        out.path     = loc;
-        out.host_hdr = cur_ip + ":" + std::to_string(cur_port);
-        out.raw_host = cur_ip;   // will be overridden by caller's cur_sni
-        return out;
-    }
-    static const std::regex url_re(
-        R"(^(https?)://([^\s/:?#]+)(?::(\d+))?((?:/[^\s]*)?)$)",
-        std::regex::icase);
-    std::smatch m;
-    if (!std::regex_match(loc, m, url_re)) {
-        // Unparseable — stay on current connection, treat as root
-        out.scheme   = cur_scheme;
-        out.host     = cur_ip;
-        out.port     = cur_port;
-        out.path     = "/";
-        out.host_hdr = cur_ip + ":" + std::to_string(cur_port);
-        out.raw_host = cur_ip;   // will be overridden by caller's cur_sni
-        return out;
-    }
-
-    out.scheme = m[1].str();
-    // Convert scheme to lowercase
-    for (char &c : out.scheme) c = (char)tolower((unsigned char)c);
-
-    // Resolve the hostname to an IP for connecting
-    std::string raw_host = m[2].str();
-    out.host = resolve_host(raw_host);
-
-    // Port: explicit > scheme default
-    if (m[3].matched && !m[3].str().empty()) {
-        out.port = std::stoi(m[3].str());
-    } else {
-        out.port = (out.scheme == "https") ? 443 : 80;
-    }
-
-    out.path = m[4].str().empty() ? "/" : m[4].str();
-    bool is_default_port = (out.scheme == "https" && out.port == 443) ||
-                           (out.scheme == "http"  && out.port == 80);
-    out.host_hdr = is_default_port ? raw_host : (raw_host + ":" + std::to_string(out.port));
-    out.raw_host = raw_host;
-
-    return out;
-}
-
-static std::vector<u8> follow_redirects_fp(
-    const std::string              &origin_ip,    // starting IP
-    int                             origin_port,  // starting port
-    int                             timeout_sec,
-    bool                            verbose,
-    std::vector<u8>                 first_resp,
-    std::vector<HttpFingerprint>   &http_fps_out,
-    bool                            initial_is_ssl,
-    int                             max_hops = 8)
-{
-    std::vector<u8> cur      = std::move(first_resp);
-    std::string     cur_ip   = origin_ip;
-    int             cur_port = origin_port;
-    std::string     cur_scheme = initial_is_ssl ? "https" : "http";
-    std::string     cur_sni  = !g_tls_config.sni_name.empty()
-                                   ? g_tls_config.sni_name
-                                   : origin_ip;
-
-    for (int hop = 0; hop < max_hops && is_redirect(cur); ++hop) {
-        std::string loc = extract_location(cur);
-        if (loc.empty()) {
-            vlog::fail(verbose, "redirect hop " + std::to_string(hop + 1) + ": no Location header, stopping", 2);
-            break;
-        }
-
-        // -- Fingerprint the source (before following) ----------------------
-        bool src_ssl = (cur_scheme == "https");
-        std::string phase_src = (src_ssl ? "ssl-" : "") +
-                                std::string("redirect-src-hop") + std::to_string(hop + 1);
-        HttpFingerprint fp_src = make_http_fingerprint(cur, phase_src, src_ssl);
-        fp_src.redirect_url = loc;
-        http_fps_out.push_back(fp_src);
-
-        // -- Parse destination URL ------------------------------------------
-        ParsedUrl dst = parse_redirect_url(loc, cur_ip, cur_port, cur_scheme);
-        bool dst_ssl  = (dst.scheme == "https");
-
-        // For relative-path redirects, parse_redirect_url sets dst.sni = cur_ip
-        // which is the resolved IP — carry forward the real hostname instead.
-        if (!dst.sni.empty() && dst.sni == cur_ip)
-            dst.sni = cur_sni;
-
-        vlog::line(verbose, "redirect hop " + std::to_string(hop + 1) + ": " + loc + " -> " +
-                   dst.scheme + "://" + dst.host + ":" + std::to_string(dst.port) + dst.path +
-                   "  (SNI: " + dst.sni + ")", 2);
-
-        if (dst.scheme != cur_scheme || dst.host != cur_ip || dst.port != cur_port)
-            vlog::line(verbose, "scheme/host/port change: [" + cur_scheme + " " + cur_ip + ":" +
-                       std::to_string(cur_port) + "] -> [" + dst.scheme + " " + dst.host + ":" +
-                       std::to_string(dst.port) + "]", 3);
-
-        // -- Build the next request -----------------------------------------
-        std::string req = "GET " + dst.path + " HTTP/1.1\r\n"
-                          "Host: " + dst.host_hdr + "\r\n"
-                          "User-Agent: Mozilla/5.0\r\n"
-                          "Accept: */*\r\n"
-                          "Connection: close\r\n\r\n";
-        std::vector<u8> payload(req.begin(), req.end());
-        std::vector<u8> next;
-        TlsCertInfo cert_info;
-        if (dst_ssl) {
-            next = capture_ssl(dst.host, dst.port, timeout_sec, &payload, verbose,
-                               &cert_info, /*connect_timeout_sec=*/0, dst.sni);
-        } else {
-            next = capture_tcp(dst.host, dst.port, timeout_sec, &payload, verbose);
-        }
-
-        if (next.empty()) {
-            vlog::fail(verbose, "redirect hop " + std::to_string(hop + 1) + ": no response from " +
-                       dst.host + ":" + std::to_string(dst.port) + ", stopping", 2);
-            break;
-        }
-
-        // -- Fingerprint the destination response ---------------------------
-        std::string phase_dst = (dst_ssl ? "ssl-" : "") +
-                                std::string("redirect-dst-hop") + std::to_string(hop + 1);
-        HttpFingerprint fp_dst = make_http_fingerprint(next, phase_dst, dst_ssl, cert_info);
-        http_fps_out.push_back(fp_dst);
-
-        // Advance state for next iteration
-        cur        = std::move(next);
-        cur_ip     = dst.host;
-        cur_port   = dst.port;
-        cur_scheme = dst.scheme;
-        cur_sni    = dst.sni;   // carry the raw hostname forward for next hop's SNI
-    }
-    return cur;
-}
-
-// -- Thin compatibility wrappers so callers don't need changing -------------
-static std::vector<u8> follow_redirects_tcp_fp(
-    const std::string &ip, int port, int timeout_sec, bool verbose,
-    std::vector<u8> first_resp, std::vector<HttpFingerprint> &fps, int max_hops = 8)
-{
-    return follow_redirects_fp(ip, port, timeout_sec, verbose,
-                               std::move(first_resp), fps, false, max_hops);
-}
-
-static std::vector<u8> follow_redirects_ssl_fp(
-    const std::string &ip, int port, int timeout_sec, bool verbose,
-    std::vector<u8> first_resp, std::vector<HttpFingerprint> &fps, int max_hops = 8)
-{
-    return follow_redirects_fp(ip, port, timeout_sec, verbose,
-                               std::move(first_resp), fps, true, max_hops);
-}
-
-struct TwinFpResult {
-    std::vector<u8> best_response;  
-    bool            ssl_used = false; 
-};
-
-static TwinFpResult do_400_ssl_twin_fingerprint(
-    const std::string            &ip,
-    int                           port,
-    int                           timeout_sec,
-    bool                          verbose,
-    const std::vector<u8>        &plain_4xx_resp,
-    std::vector<HttpFingerprint> &http_fps_out)
-{
-    TwinFpResult result;
-
-    // -- Phase 1: fingerprint the plain 4xx response -----------------------
-    HttpFingerprint fp_plain = make_http_fingerprint(plain_4xx_resp, "4xx-plain", /*ssl=*/false);
-    http_fps_out.push_back(fp_plain);
-    if (verbose) fp_plain.print(std::cerr);
-    vlog::line(verbose, "twin-fp: plain HTTP returned " + std::to_string(fp_plain.status_code) +
-               " — server likely requires SSL; retrying over TLS for twin fingerprint", 2);
-
-    // -- Phase 2: retry over SSL/TLS ---------------------------------------
-    std::string req = make_get_request("/", ip, port, /*is_ssl=*/true);
-    std::vector<u8> payload(req.begin(), req.end());
-    TlsCertInfo cert_info;
-    auto ssl_resp = capture_ssl(ip, port, timeout_sec, &payload, verbose, &cert_info);
-
-    if (ssl_resp.empty()) {
-        vlog::fail(verbose, "twin-fp: SSL retry returned no data; keeping 4xx response", 2);
-        result.best_response = plain_4xx_resp;
-        result.ssl_used      = false;
-        return result;
-    }
-
-    // -- Phase 3: fingerprint the SSL response -----------------------------
-    HttpFingerprint fp_ssl = make_http_fingerprint(ssl_resp, "ssl-after-4xx", /*ssl=*/true,
-                                                   cert_info);
-    http_fps_out.push_back(fp_ssl);
-    if (verbose) fp_ssl.print(std::cerr);
-
-    // -- Phase 4: if the SSL response is also a redirect, follow it --------
-    if (fp_ssl.is_redirect) {
-        vlog::line(verbose, "twin-fp: SSL response is a " + std::to_string(fp_ssl.status_code) +
-                   " redirect — following with dual FP", 2);
-        ssl_resp = follow_redirects_ssl_fp(ip, port, timeout_sec, verbose,
-                                           std::move(ssl_resp), http_fps_out);
-    }
-
-    result.best_response = std::move(ssl_resp);
-    result.ssl_used      = true;
-    return result;
-}
-
-static std::vector<u8> try_source_port_443_fallback(const std::string &ip, int port,
-                                                     int timeout_sec, bool verbose,
-                                                     const std::vector<u8> &http_payload)
-{
-    async_io::SourcePort src443;
-    src443.mode = async_io::SourcePort::Mode::FIXED;
-    src443.port = 443;
-
-    std::lock_guard<std::mutex> lock(g_srcport443_mu);
-    vlog::line(verbose, "last resort: retrying with source port 443", 1);
-    auto r = capture_tcp(ip, port, timeout_sec, &http_payload, verbose,
-                         /*connect_timeout_sec=*/0, src443);
-    if (r.empty()) {
-        vlog::fail(verbose, "no response even with source port 443 — target likely down/filtered", 1);
-    }
-    return r;
-}
-
-static std::vector<u8> capture_fallback(const std::string            &ip,
-                                        int                           port,
-                                        int                           timeout_sec,
-                                        bool                          verbose,
-                                        std::string                  &method_out,
-                                        std::vector<HttpFingerprint> &http_fps_out)
-{
-    const std::string &req_path = g_target_path.empty() ? "/" : g_target_path;
-    std::string http_str = make_get_request(req_path, ip, port, /*is_ssl=*/false);
-    std::vector<u8> http_payload(http_str.begin(), http_str.end());
-
-    vlog::phase(verbose, "Fallback chain");
-    vlog::line(verbose, "trying plain HTTP", 1);
-    auto r = capture_tcp(ip, port, timeout_sec, &http_payload, verbose);
-    if (!r.empty()) {
-        vlog::ok(verbose, "got HTTP response: " + std::to_string(r.size()) + " bytes", 1);
-        int code = extract_status_code(r);
-
-        // -- Auto-detect: 4xx on plain HTTP -> twin fingerprint with SSL ----
-        if (code >= 400 && code < 500) {
-            auto twin = do_400_ssl_twin_fingerprint(ip, port, timeout_sec, verbose,
-                                                    r, http_fps_out);
-            if (twin.ssl_used) {
-                method_out = "ssl-after-4xx";
-                return twin.best_response;
-            }
-            // SSL failed; fall through with the 4xx response
-        }
-
-        // -- Auto-detect: 3xx redirect -> dual fingerprint ------------------
-        if (is_redirect(r)) {
-            r = follow_redirects_tcp_fp(ip, port, timeout_sec, verbose,
-                                        std::move(r), http_fps_out);
-        } else {
-            // Fingerprint a normal (non-redirect, non-4xx) HTTP response
-            http_fps_out.push_back(make_http_fingerprint(r, "http-initial", false));
-        }
-
-        method_out = "http";
-        return r;
-    }
-    vlog::fail(verbose, "no HTTP response", 1);
-
-    vlog::line(verbose, "trying HTTPS fallback", 1);
-    TlsCertInfo https_cert;
-    r = capture_ssl(ip, port, timeout_sec, &http_payload, verbose, &https_cert);
-    if (!r.empty()) {
-        vlog::ok(verbose, "got HTTPS/SSL response: " + std::to_string(r.size()) + " bytes", 1);
-        // -- Auto-detect: 3xx redirect over SSL -> dual fingerprint ---------
-        if (is_redirect(r)) {
-            r = follow_redirects_ssl_fp(ip, port, timeout_sec, verbose,
-                                        std::move(r), http_fps_out);
-        } else {
-            http_fps_out.push_back(make_http_fingerprint(r, "https-initial", true, https_cert));
-        }
-        method_out = "Default TLS";
-        return r;
-    }
-    vlog::fail(verbose, "no HTTPS/SSL response", 1);
-    r = try_source_port_443_fallback(ip, port, timeout_sec, verbose, http_payload);
-    if (!r.empty()) {
-        int code = extract_status_code(r);
-        if (code >= 400 && code < 500) {
-            auto twin = do_400_ssl_twin_fingerprint(ip, port, timeout_sec, verbose,
-                                                    r, http_fps_out);
-            if (twin.ssl_used) {
-                method_out = "ssl-after-4xx/srcport443";
-                return twin.best_response;
-            }
-        }
-        if (is_redirect(r)) {
-            r = follow_redirects_tcp_fp(ip, port, timeout_sec, verbose,
-                                        std::move(r), http_fps_out);
-        } else {
-            http_fps_out.push_back(make_http_fingerprint(r, "http-srcport443", false));
-        }
-        method_out = "http/srcport443";
-        return r;
-    }
-
-    method_out = "none";
-    return {};
-}
-
-struct Args {
-    std::string probes_file = "/usr/share/nmap/nmap-service-probes";
-    // Raw target string (argv[1]) — kept for display only
-    std::string target_raw;
-    // Resolved fields (filled by parse_target + main)
-    std::string ip;          // numeric IPv4 (after DNS resolution)
-    std::string hostname;    // original hostname (used for SNI, Host header)
-    std::string scheme;      // "http" | "https" | "" (auto-detect)
-    std::string path;        // request path (default "/")
-    uint16_t    port           = 0;
-    int         timeout        = 3;   // read/response timeout (seconds)
-    int         connect_timeout = 0;  // TCP SYN→ACK timeout; 0 = use timeout value
-    int         intensity   = 7;
-    bool        udp         = false;
-    bool        force_raw   = false;
-    bool        force_http  = false;
-    bool        force_https = false;
-    bool        verbose     = false;
-    std::string save_file;
-    // TLS certificate options
-    std::string tls_ca_file;
-    std::string tls_ca_path;
-    std::string tls_cert;
-    std::string tls_key;
-    std::string tls_sni;
-    bool        tls_verify = false;
-    // --host override: if set, this value is used verbatim in the Host: header
-    std::string host_override;
-};
-
-static int probe_read_timeout(const AllProbes &probes, int port,
-                              int proto, int default_sec)
-{
-    int best_ms = 0;
-    for (ServiceProbe *sp : probes.probes) {
-        if (sp->getProtocol() != proto) continue;
-        if (sp->portIsProbable(ServiceTunnel::NONE, (u16)port) ||
-            sp->portIsProbable(ServiceTunnel::SSL,  (u16)port)) {
-            int ms = sp->getTotalWaitMs();
-            if (ms > best_ms) best_ms = ms;
-        }
-    }
-    if (probes.nullProbe) {
-        int ms = probes.nullProbe->getTotalWaitMs();
-        if (ms > best_ms) best_ms = ms;
-    }
-
-    int probe_sec = (best_ms > 0) ? std::max(1, (best_ms + 999) / 1000) : 0;
-
-    return std::max(default_sec, probe_sec);
-}
-
-int run_version_probe(AllProbes &probes, const std::string &target_ip,
-                       uint16_t target_port, const VersionDetectOptions &opts)
-{
-    Args args;
-    args.hostname       = target_ip;
-    args.port           = target_port;
-    args.ip             = target_ip;
-    const std::string &ip = args.ip;
-    args.verbose        = opts.verbose;
-    args.timeout        = opts.timeout_sec;
-    args.connect_timeout = opts.connect_timeout_sec;
-    args.intensity      = opts.intensity;
-    args.udp            = opts.udp;
-    args.force_raw      = opts.force_raw;
-    args.force_http     = opts.force_http;
-    args.force_https    = opts.force_https;
-    args.tls_verify     = opts.tls_verify;
-    args.save_file      = opts.save_file;
-    args.tls_ca_file    = opts.tls_ca_file;
-    args.tls_ca_path    = opts.tls_ca_path;
-    args.tls_cert       = opts.tls_cert;
-    args.tls_key        = opts.tls_key;
-    args.tls_sni        = opts.tls_sni;
-    args.host_override  = opts.host_override;
-    std::string effective_host;
-    {
-        std::lock_guard<std::mutex> lk(g_probe_setup_mu);
-
-        g_verbose = args.verbose;
-
-        g_tls_config.ca_file     = args.tls_ca_file;
-        g_tls_config.ca_path     = args.tls_ca_path;
-        g_tls_config.client_cert = args.tls_cert;
-        g_tls_config.client_key  = args.tls_key;
-        g_tls_config.verify_peer = args.tls_verify;
-        vlog::phase(g_verbose, "Resolving host");
-        if (!args.host_override.empty()) {
-            effective_host = args.host_override;
-            vlog::line(g_verbose, "--host override: using '" + effective_host + "' in Host: header");
-        } else if (is_ip_literal(args.hostname)) {
-            if (is_lan_ip(args.hostname)) {
-                effective_host = args.hostname;
-                vlog::line(g_verbose, "LAN IP " + args.hostname + ": skipping reverse-DNS, using IP directly");
-            } else {
-                std::string rdns = resolve_ip_to_domain(args.hostname);
-                if (!rdns.empty()) {
-                    effective_host = rdns;
-                    vlog::ok(g_verbose, "reverse-DNS " + args.hostname + " -> '" + rdns + "'; using domain in Host: header");
-                } else {
-                    effective_host = args.hostname;
-                    vlog::fail(g_verbose, "reverse-DNS for " + args.hostname + " failed; using IP in Host: header");
-                }
-            }
-        } else {
-            effective_host = args.hostname;
-        }
-
-        g_tls_config.sni_name = args.tls_sni.empty() ? effective_host : args.tls_sni;
-
-        g_hostname    = effective_host;
-        g_target_path = args.path.empty() ? "/" : args.path;
-    }
-
-    vlog::phase(g_verbose, "Target");
-    vlog::kv(g_verbose, "Target",   args.target_raw);
-    vlog::kv(g_verbose, "Host",     args.hostname);
-    vlog::kv(g_verbose, "Host Hdr", g_hostname);
-    vlog::kv(g_verbose, "IP",       ip);
-    vlog::kv(g_verbose, "Port",     std::to_string(args.port));
-    vlog::kv(g_verbose, "Scheme",   args.scheme.empty() ? "auto-detect" : args.scheme);
-    vlog::kv(g_verbose, "Path",     args.path);
-
-    if (args.verbose) {
-        vlog::phase(g_verbose, "TLS configuration");
-        vlog::kv(g_verbose, "SNI",         g_tls_config.sni_name);
-        vlog::kv(g_verbose, "CA file",     args.tls_ca_file.empty() ? "(system default)" : args.tls_ca_file);
-        vlog::kv(g_verbose, "Verify peer", args.tls_verify ? "yes" : "no (info-only)");
-        if (!args.tls_cert.empty())
-            vlog::kv(g_verbose, "Client cert", args.tls_cert);
-    }
-    vlog::kv(g_verbose, "Timeouts", "connect=" + std::to_string(args.connect_timeout) + "s  read=" +
-              std::to_string(args.timeout) + "s  idle=" + std::to_string(std::max(2, args.timeout / 2)) + "s");
-
-    ProbeFileInfo pfi = parse_probe_file_info(args.probes_file);
-
-    std::vector<u8>              response;
-    std::string                  method_label;
-    int                          proto_int = IPPROTO_TCP;
-    std::vector<HttpFingerprint> http_fps;
-
-    if (args.udp) proto_int = IPPROTO_UDP;
-    const int read_to = probe_read_timeout(probes, args.port, proto_int, args.timeout);
-    vlog::kv(g_verbose, "Effective", "connect=" + std::to_string(args.connect_timeout) + "s  read=" +
-              std::to_string(read_to) + "s (" + (read_to > args.timeout ? "probe-derived" : "user --timeout") +
-              ")  idle=" + std::to_string(std::max(2, read_to / 2)) + "s");
-
-    vlog::phase(g_verbose, "Capture");
-
-    if (args.udp) {
-        vlog::line(g_verbose, "capturing UDP response from " + ip + ":" + std::to_string(args.port), 1);
-        auto dec = decide_method(args.port, pfi, true);
-
-        std::vector<u8> udp_payload;
-        const std::vector<u8> *pl = dec.payload;
-        if (pl && !pl->empty()) {
-            udp_payload = *pl;
-            const std::string &probe_host = g_hostname.empty() ? ip : g_hostname;
-            substitute_probe_vars(udp_payload, probe_host, args.port);
-            pl = &udp_payload;
-        }
-        response = capture_udp(ip, args.port, read_to, pl, args.verbose);
-        method_label = "udp";
-        if (response.empty())
-            vlog::fail(g_verbose, "udp: no response from " + ip + ":" + std::to_string(args.port), 1);
-
-    } else if (args.force_raw) {
-        vlog::line(g_verbose, "capturing raw TCP banner from " + ip + ":" + std::to_string(args.port), 1);
-        response = capture_tcp(ip, args.port, read_to, nullptr, args.verbose,
-                               args.connect_timeout);
-        method_label = "raw_tcp";
-
-    } else if (args.force_http) {
-        vlog::line(g_verbose, "capturing HTTP response from " + ip + ":" + std::to_string(args.port) +
-                   "  path: " + g_target_path, 1);
-        std::string hs = make_get_request(g_target_path, ip, args.port, false);
-        std::vector<u8> payload(hs.begin(), hs.end());
-        response = capture_tcp(ip, args.port, read_to, &payload, args.verbose,
-                               args.connect_timeout);
-        method_label = "http";
-
-        if (!response.empty()) {
-            int code = extract_status_code(response);
-
-            if (code >= 400 && code < 500) {
-                vlog::line(g_verbose, "force-http: got " + std::to_string(code) +
-                           " -> attempting 400-SSL twin fingerprint", 1);
-                auto twin = do_400_ssl_twin_fingerprint(ip, args.port, read_to,
-                                                        args.verbose, response, http_fps);
-                if (twin.ssl_used) {
-                    response     = std::move(twin.best_response);
-                    method_label = "ssl-after-4xx";
-                }
-            }
-            else if (is_redirect(response)) {
-                response = follow_redirects_tcp_fp(ip, args.port, read_to,
-                                                   args.verbose, std::move(response),
-                                                   http_fps);
-                method_label = "http-redirect";
-            } else {
-                http_fps.push_back(make_http_fingerprint(response, "http-initial", false));
-            }
-        }
-
-    } else if (args.force_https) {
-        vlog::line(g_verbose, "capturing HTTPS response from " + ip + ":" + std::to_string(args.port) +
-                   "  path: " + g_target_path, 1);
-        std::string hs = make_get_request(g_target_path, ip, args.port, true);
-        std::vector<u8> payload(hs.begin(), hs.end());
-        TlsCertInfo https_cert;
-        response = capture_ssl(ip, args.port, read_to, &payload, args.verbose,
-                               &https_cert, args.connect_timeout);
-        method_label = "https";
-
-        if (!response.empty()) {
-            if (is_redirect(response)) {
-                response = follow_redirects_ssl_fp(ip, args.port, read_to,
-                                                   args.verbose, std::move(response),
-                                                   http_fps);
-                method_label = "https-redirect";
-            } else {
-                http_fps.push_back(make_http_fingerprint(response, "https-initial", true, https_cert));
-            }
-        }
-
-    } else {
-        auto dec = decide_method(args.port, pfi, false);
-        if (dec.method == ScanMethod::MQTT) {
-            vlog::line(g_verbose, "probe file: port " + std::to_string(args.port) + " -> MQTT handshake", 1);
-            response = capture_mqtt(ip, args.port, read_to, args.verbose,
-                                    args.connect_timeout);
-            method_label = "mqtt";
-            goto capture_done;
-        }
-
-        if (dec.method == ScanMethod::UDP) {
-            proto_int = IPPROTO_UDP;
-            vlog::line(g_verbose, "auto-detected UDP for port " + std::to_string(args.port) +
-                       " (probe file has no TCP entry)", 1);
-            std::vector<u8> udp_payload;
-            const std::vector<u8> *pl = dec.payload;
-            if (pl && !pl->empty()) {
-                udp_payload = *pl;
-                substitute_probe_vars(udp_payload, ip, args.port);
-                pl = &udp_payload;
-            }
-            response = capture_udp(ip, args.port, read_to, pl, args.verbose);
-            method_label = "udp";
-            if (response.empty())
-                vlog::fail(g_verbose, "udp: no response from " + ip + ":" + std::to_string(args.port), 1);
-            goto capture_done;
-        }
-        bool is_ssl = false;
-        if (dec.method == ScanMethod::SSL) {
-            is_ssl = true;
-            if (args.verbose) {
-                vlog::line(g_verbose, "port " + std::to_string(args.port) +
-                           " is declared as sslports -- verifying TLS support (diagnostic only)", 1);
-                TlsCertInfo ssl_check_cert;
-                bool strict_ok = ssl_port_check(ip, args.port, 3, args.verbose, &ssl_check_cert);
-                if (!strict_ok) {
-                    vlog::fail(g_verbose, "strict TLS handshake failed on port " + std::to_string(args.port) +
-                               "; retrying with permissive SSL for diagnostics", 2);
-                    TlsCertInfo perm_cert;
-                    auto perm_test = capture_ssl_permissive(
-                        ip, args.port, 3, nullptr, args.verbose, &perm_cert, args.connect_timeout);
-                    if (!perm_test.empty() || !perm_cert.tls_version.empty())
-                        vlog::ok(g_verbose, "permissive SSL handshake succeeded on port " +
-                                 std::to_string(args.port) + " (version: " + perm_cert.tls_version + ")", 2);
-                    else
-                        vlog::fail(g_verbose, "permissive SSL also failed on port " + std::to_string(args.port) +
-                                   "; port is declared sslports -- keeping SSL mode (not falling back to plain TCP)", 2);
-                }
-            }
-        } else {
-            if (args.verbose) {
-                int precheck_to = std::min(2, args.connect_timeout > 0 ? args.connect_timeout : 2);
-                vlog::line(g_verbose, "port " + std::to_string(args.port) + " not declared as sslports -- "
-                           "running diagnostic TLS pre-check (timeout=" + std::to_string(precheck_to) +
-                           "s); real probing will still self-detect TLS if this is skipped", 1);
-                if (ssl_port_check(ip, args.port, precheck_to, args.verbose)) {
-                    vlog::ok(g_verbose, "TLS confirmed on port " + std::to_string(args.port) +
-                             " despite not being in sslports; switching to SSL mode", 2);
-                    is_ssl = true;
+constexpr size_t kMaxRoutes = 200000;
+
+bool json_string_array(std::string_view s, size_t from, std::string_view key, std::vector<std::string>& out) {
+    std::string needle = "\"";
+    needle += key;
+    needle += '"';
+    size_t f = s.find(needle, from);
+    while (f != std::string_view::npos) {
+        size_t p = f + needle.size();
+        json_skip_ws(s, p);
+        if (p < s.size() && s[p] == ':') {
+            ++p;
+            json_skip_ws(s, p);
+            if (p < s.size() && s[p] == '[') {
+                ++p;
+                for (;;) {
+                    json_skip_ws(s, p);
+                    if (p >= s.size()) return false;
+                    if (s[p] == ']') return true;
+                    if (s[p] == ',') { ++p; continue; }
+                    std::string v;
+                    if (!json_read_string(s, p, v) || out.size() >= kMaxRoutes) return false;
+                    out.push_back(std::move(v));
                 }
             }
         }
-
-        struct ProbeAttempt { std::string name; std::vector<u8> payload; };
-        std::vector<ProbeAttempt> attempts;
-        std::set<std::string>     seen;
-
-        auto add_attempt = [&](const std::string &name, const u8 *ps, int pslen) {
-            if (seen.count(name)) return; seen.insert(name);
-            ProbeAttempt pa; pa.name = name;
-            if (ps && pslen > 0) pa.payload.assign(ps, ps + pslen);
-            attempts.push_back(std::move(pa));
-        };
-
-        vlog::phase(g_verbose, "Probe planning");
-
-        if (probes.nullProbe) {
-            int plen = 0; const u8 *ps = probes.nullProbe->getProbeString(&plen);
-            vlog::line(g_verbose, std::string("phase 1: adding NULL probe '") + probes.nullProbe->getName() + "'", 1);
-            add_attempt(probes.nullProbe->getName(), ps, plen);
-        }
-
-        int phase2_count = 0;
-        for (ServiceProbe *sp : probes.probes) {
-            if (sp->getProtocol() != IPPROTO_TCP) continue;
-            if (!sp->portIsProbable(is_ssl ? ServiceTunnel::SSL : ServiceTunnel::NONE,
-                                    (u16)args.port)) continue;
-            int plen = 0; const u8 *ps = sp->getProbeString(&plen);
-            vlog::line(g_verbose, "phase 2: port " + std::to_string(args.port) + " explicit -> probe '" +
-                       sp->getName() + "' (rarity " + std::to_string(sp->getRarity()) + ")", 1);
-            add_attempt(sp->getName(), ps, plen);
-            phase2_count++;
-        }
-        if (phase2_count == 0)
-            vlog::line(g_verbose, "phase 2: no probes explicitly list port " + std::to_string(args.port), 1);
-
-        int phase3_count = 0;
-        for (ServiceProbe *sp : probes.probes) {
-            if (sp->getProtocol() != IPPROTO_TCP) continue;
-            if (sp->portIsProbable(is_ssl ? ServiceTunnel::SSL : ServiceTunnel::NONE,
-                                   (u16)args.port)) continue;
-            if (sp->getRarity() > args.intensity) continue;
-            int plen = 0; const u8 *ps = sp->getProbeString(&plen);
-            vlog::line(g_verbose, "phase 3: rarity " + std::to_string(sp->getRarity()) + " <= intensity " +
-                       std::to_string(args.intensity) + " -> probe '" + sp->getName() + "'", 1);
-            add_attempt(sp->getName(), ps, plen);
-            phase3_count++;
-        }
-        vlog::line(g_verbose, "phase 3: added " + std::to_string(phase3_count) +
-                   " non-explicit probes (intensity cap: " + std::to_string(args.intensity) + ")", 1);
-        vlog::kv(g_verbose, "Queued", std::to_string(attempts.size()) + " probes for port " +
-                  std::to_string(args.port));
-
-        vlog::phase(g_verbose, "Probing");
-
-        for (size_t attempt_idx = 0; attempt_idx < attempts.size() && !terminate_flag; ++attempt_idx) {
-            const ProbeAttempt &pa = attempts[attempt_idx];
-
-            vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": " + pa.name +
-                       "  (ssl: " + (is_ssl ? "yes" : "no") + ")", 1);
-
-            if (pa.payload.empty()) {
-                vlog::line(g_verbose, "payload: none (NULL banner grab)", 2);
-            } else if (g_verbose) {
-                std::string escaped;
-                escaped.reserve(pa.payload.size());
-                for (unsigned char c : pa.payload) {
-                    if      (c == '\r') escaped += "\\r";
-                    else if (c == '\n') escaped += "\\n";
-                    else if (c == '\t') escaped += "\\t";
-                    else if (c == '\\') escaped += "\\\\";
-                    else if (c == '"')  escaped += "\\\"";
-                    else if (c < 32 || c >= 127) {
-                        char buf[6]; snprintf(buf, sizeof(buf), "\\x%02x", c);
-                        escaped += buf;
-                    } else escaped += (char)c;
-                }
-                vlog::line(g_verbose, "payload: " + std::to_string(pa.payload.size()) +
-                           " bytes -- \"" + escaped + "\"", 2);
-            }
-            std::vector<u8> substituted_payload;
-            const std::vector<u8> *pl = nullptr;
-
-            if (!pa.payload.empty()) {
-                substituted_payload = pa.payload;
-                const std::string &probe_host = g_hostname.empty() ? ip : g_hostname;
-                substitute_probe_vars(substituted_payload, probe_host, args.port);
-
-                {
-                    std::string s(substituted_payload.begin(), substituted_payload.end());
-                    // NOTE: previously only matched "HTTP/1.1", which silently skipped this
-                    // whole fixup for HTTP/1.0 probes -- including the stock GetRequest probe
-                    // ("GET / HTTP/1.0\r\n\r\n"), the single most common probe run against any
-                    // web port. HTTP/1.0 is legal without Host:, but plenty of real-world
-                    // virtual-hosted/CDN-fronted targets need it anyway, so treat both versions
-                    // the same way here.
-                    bool is_http_req = (s.size() >= 4 &&
-                        (s.rfind("GET ",  0) == 0 ||
-                         s.rfind("HEAD ", 0) == 0 ||
-                         s.rfind("POST ", 0) == 0) &&
-                        (s.find("HTTP/1.1") != std::string::npos ||
-                         s.find("HTTP/1.0") != std::string::npos));
-
-                    if (is_http_req) {
-                        std::string sl = s;
-                        for (char &c : sl) c = (char)tolower((unsigned char)c);
-                        bool has_host = sl.find("\r\nhost:") != std::string::npos ||
-                                        sl.rfind("host:", 0) == 0;
-
-                        if (!has_host) {
-                            std::string host_val = make_host_header(ip, args.port, is_ssl);
-                            size_t term = s.find("\r\n\r\n");
-                            if (term != std::string::npos) {
-                                s = s.substr(0, term) +
-                                    "\r\nHost: " + host_val +
-                                    s.substr(term);
-                                vlog::line(g_verbose, "probe-fixup: injected Host: " + host_val +
-                                           " into HTTP probe (was missing)", 2);
-                            }
-                        }
-
-                        {
-                            std::string sl2 = s;
-                            for (char &c : sl2) c = (char)tolower((unsigned char)c);
-                            bool has_ua = sl2.find("\r\nuser-agent:") != std::string::npos ||
-                                         sl2.rfind("user-agent:", 0) == 0;
-                            if (!has_ua) {
-                                size_t term2 = s.find("\r\n\r\n");
-                                if (term2 != std::string::npos) {
-                                    s = s.substr(0, term2) +
-                                        "\r\nUser-Agent: " + std::string(kDefaultUserAgent) +
-                                        s.substr(term2);
-                                    vlog::line(g_verbose, "probe-fixup: injected User-Agent "
-                                               "into HTTP probe (was missing)", 2);
-                                }
-                            }
-                        }
-
-                        substituted_payload.assign(s.begin(), s.end());
-                    }
-                }
-
-                pl = &substituted_payload;
-            }
-
-            std::vector<u8> r;
-            TlsCertInfo probe_cert;
-            const int probe_first_byte_to = 3;
-            if (is_ssl) {
-                r = capture_ssl(ip, args.port, probe_first_byte_to, pl, args.verbose,
-                                &probe_cert, args.connect_timeout);
-                if (r.empty() && !terminate_flag) {
-                    vlog::line(args.verbose, "probe #" + std::to_string(attempt_idx) +
-                               ": strict SSL returned empty; retrying with permissive SSL", 2);
-                    TlsCertInfo perm_cert2;
-                    r = capture_ssl_permissive(ip, args.port, probe_first_byte_to, pl,
-                                               args.verbose, &perm_cert2,
-                                               args.connect_timeout);
-                    if (!r.empty() && !perm_cert2.tls_version.empty())
-                        probe_cert = perm_cert2;
-                }
-            } else {
-                r = capture_tcp(ip, args.port, probe_first_byte_to, pl, args.verbose,
-                                args.connect_timeout);
-            }
-
-            bool switched_to_ssl_midstream = false;
-            if (!r.empty()) {
-                if (!is_ssl && looks_like_tls_record(r)) {
-                    char tls_hdr[16];
-                    snprintf(tls_hdr, sizeof(tls_hdr), "0x%02x 0x%02x 0x%02x", r[0], r[1], r[2]);
-                    vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + " '" + pa.name +
-                               "' got " + std::to_string(r.size()) + " byte(s) that look like a raw TLS "
-                               "record (" + tls_hdr + ") on a plaintext attempt -- port is actually TLS; "
-                               "switching to SSL and retrying this probe instead of accepting it", 2);
-
-                    is_ssl = true;
-                    switched_to_ssl_midstream = true;
-
-                    TlsCertInfo retry_cert;
-                    std::vector<u8> r_ssl = capture_ssl(ip, args.port, probe_first_byte_to, pl,
-                                                        args.verbose, &retry_cert,
-                                                        args.connect_timeout);
-                    if (r_ssl.empty() && !terminate_flag) {
-                        TlsCertInfo retry_perm_cert;
-                        r_ssl = capture_ssl_permissive(ip, args.port, probe_first_byte_to, pl,
-                                                       args.verbose, &retry_perm_cert,
-                                                       args.connect_timeout);
-                    }
-
-                    if (r_ssl.empty()) {
-                        vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) +
-                                   ": SSL retry also produced nothing usable; discarding the "
-                                   "TLS-alert bytes and trying next probe over SSL", 2);
-                        continue;
-                    }
-                    r = std::move(r_ssl);
-                }
-                bool is_null_probe = pa.payload.empty();
-                if (is_null_probe) {
-                    int null_code = extract_status_code(r);
-                    bool looks_http = (r.size() >= 5 &&
-                                       r[0]=='H' && r[1]=='T' && r[2]=='T' &&
-                                       r[3]=='P' && r[4]=='/');
-                    if (looks_http && null_code != 0 && null_code != 200) {
-                        vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": NULL probe got HTTP " +
-                                   std::to_string(null_code) + " (not 200) on port " + std::to_string(args.port) +
-                                   " -- web port, NULL probe incompatible; skipping to next probe", 2);
-                        continue;
-                    }
-                }
-
-                if (args.port == 9100 && pa.name == "hp-pjl" && response_is_http_error(r)) {
-                    vlog::line(g_verbose, "port 9100: hp-pjl got HTTP error -- likely HTTP service, "
-                               "not a printer; retrying with HTTP GET", 2);
-                    auto hr = capture_http_get(ip, args.port, read_to, args.verbose);
-                    if (!hr.empty()) {
-                        vlog::ok(g_verbose, "port 9100: HTTP GET succeeded (" + std::to_string(hr.size()) +
-                                 " bytes)", 2);
-                        response     = std::move(hr);
-                        method_label = "http/port9100-fallback";
-                        goto capture_done;
-                    }
-                    vlog::fail(g_verbose, "port 9100: HTTP GET also failed, keeping hp-pjl response", 2);
-                }
-                bool probe_is_http_req = false;
-                if (!pa.payload.empty() && pa.payload.size() >= 4) {
-                    std::string ps_start(pa.payload.begin(),
-                                         pa.payload.begin() + std::min(pa.payload.size(), (size_t)5));
-                    probe_is_http_req = (ps_start.rfind("GET /", 0) == 0 ||
-                                        ps_start.rfind("HEAD ", 0) == 0 ||
-                                        ps_start.rfind("POST ", 0) == 0);
-                }
-                if (!probe_is_http_req && (!is_ssl || switched_to_ssl_midstream)) {
-                    int non_http_code = extract_status_code(r);
-                    bool looks_http_resp = (r.size() >= 5 &&
-                                            r[0]=='H' && r[1]=='T' && r[2]=='T' &&
-                                            r[3]=='P' && r[4]=='/');
-                    if (looks_http_resp && non_http_code == 400) {
-                        vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": non-HTTP probe '" +
-                                   pa.name + "' got HTTP 400 Bad Request -> server is likely HTTP; "
-                                   "falling back to GET / HTTP/1.1", 2);
-
-                        const std::string &probe_host = g_hostname.empty() ? ip : g_hostname;
-                        std::string get_req = "GET / HTTP/1.1\r\n"
-                                             "Host: " + probe_host + "\r\n"
-                                             "User-Agent: " + std::string(kDefaultUserAgent) + "\r\n"
-                                             "Accept: */*\r\n"
-                                             "Connection: close\r\n\r\n";
-                        std::vector<u8> get_payload(get_req.begin(), get_req.end());
-
-                        std::vector<u8> hr;
-                        TlsCertInfo fallback_cert;
-                        if (is_ssl) {
-                            hr = capture_ssl(ip, args.port, read_to, &get_payload, args.verbose,
-                                             &fallback_cert, args.connect_timeout);
-                        } else {
-                            hr = capture_tcp(ip, args.port, read_to, &get_payload, args.verbose,
-                                             args.connect_timeout);
-                        }
-                        if (!hr.empty()) {
-                            int hr_code = extract_status_code(hr);
-                            vlog::ok(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP GET fallback got " +
-                                     std::to_string(hr_code) + " (" + std::to_string(hr.size()) +
-                                     " bytes) -- using this response", 2);
-                            if (is_redirect(hr)) {
-                                hr = follow_redirects_tcp_fp(ip, args.port, read_to,
-                                                             args.verbose, std::move(hr),
-                                                             http_fps);
-                                method_label = "http-get-fallback-redirect/" + pa.name;
-                            } else {
-                                http_fps.push_back(
-                                    make_http_fingerprint(hr, "http-get-fallback", is_ssl));
-                                method_label = "http-get-fallback/" + pa.name;
-                            }
-                            response = std::move(hr);
-                            goto capture_done;
-                        }
-                        vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) +
-                                   ": HTTP GET fallback also got no response; keeping original 400", 2);
-                    }
-                }
-
-                // NOTE: previously gated on `!is_ssl`, so an HTTP probe (GET/HEAD/POST)
-                // that got a 4xx over SSL/TLS -- e.g. the stock GetRequest probe hitting
-                // a virtual-hosted HTTPS target without a Host: header -- had no retry
-                // path at all and the raw 400 was accepted as final. Now both transports
-                // are handled: plaintext keeps the original SSL-twin-fingerprint check
-                // (in case the port actually needs SSL), SSL retries directly with a
-                // proper Host-bearing GET over the same TLS connection.
-                if (probe_is_http_req) {
-                    int code = extract_status_code(r);
-                    if (code >= 400 && code < 500) {
-                        if (!is_ssl) {
-                        vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP probe '" +
-                                   pa.name + "' got " + std::to_string(code) + " -> trying 400-SSL twin FP", 2);
-                        auto twin = do_400_ssl_twin_fingerprint(ip, args.port, read_to,
-                                                                args.verbose, r, http_fps);
-                        if (twin.ssl_used) {
-                            response     = std::move(twin.best_response);
-                            method_label = "ssl-after-4xx/" + pa.name;
-                            goto capture_done;
-                        }
-                        vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": SSL failed; probe may "
-                                   "have sent Host-less request -> retrying with proper Host: header GET", 2);
-                        auto hr = capture_http_get(ip, args.port, read_to, args.verbose);
-                        if (!hr.empty()) {
-                            int hr_code = extract_status_code(hr);
-                            vlog::ok(g_verbose, "probe #" + std::to_string(attempt_idx) + ": Host-header retry got " +
-                                     std::to_string(hr_code) + " (" + std::to_string(hr.size()) +
-                                     " bytes) -- using this response", 2);
-                            if (is_redirect(hr)) {
-                                hr = follow_redirects_tcp_fp(ip, args.port, read_to,
-                                                             args.verbose, std::move(hr),
-                                                             http_fps);
-                                method_label = "http-host-retry-redirect/" + pa.name;
-                            } else {
-                                http_fps.push_back(
-                                    make_http_fingerprint(hr, "http-host-retry", false));
-                                method_label = "http-host-retry/" + pa.name;
-                            }
-                            response = std::move(hr);
-                            goto capture_done;
-                        }
-                        vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) +
-                                   ": Host-header retry also got no response; keeping original 400", 2);
-                        } else {
-                            // Already on SSL -- do_400_ssl_twin_fingerprint (plaintext-to-SSL
-                            // switch) and capture_http_get (plaintext-only) don't apply here.
-                            // Retry directly over SSL with a well-formed, Host-bearing GET.
-                            vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP probe '" +
-                                       pa.name + "' got " + std::to_string(code) + " over SSL; probe may "
-                                       "have sent Host-less request -> retrying with proper Host: header GET "
-                                       "over SSL", 2);
-                            std::string get_req_ssl = make_get_request("/", ip, args.port, is_ssl);
-                            std::vector<u8> get_payload_ssl(get_req_ssl.begin(), get_req_ssl.end());
-
-                            TlsCertInfo ssl_retry_cert;
-                            std::vector<u8> hr = capture_ssl(ip, args.port, read_to, &get_payload_ssl,
-                                                             args.verbose, &ssl_retry_cert,
-                                                             args.connect_timeout);
-                            if (hr.empty() && !terminate_flag) {
-                                TlsCertInfo ssl_retry_perm_cert;
-                                hr = capture_ssl_permissive(ip, args.port, read_to, &get_payload_ssl,
-                                                            args.verbose, &ssl_retry_perm_cert,
-                                                            args.connect_timeout);
-                            }
-                            if (!hr.empty()) {
-                                int hr_code = extract_status_code(hr);
-                                vlog::ok(g_verbose, "probe #" + std::to_string(attempt_idx) +
-                                         ": SSL Host-header retry got " + std::to_string(hr_code) +
-                                         " (" + std::to_string(hr.size()) + " bytes) -- using this response", 2);
-                                if (is_redirect(hr)) {
-                                    hr = follow_redirects_tcp_fp(ip, args.port, read_to,
-                                                                 args.verbose, std::move(hr),
-                                                                 http_fps);
-                                    method_label = "http-host-retry-ssl-redirect/" + pa.name;
-                                } else {
-                                    http_fps.push_back(
-                                        make_http_fingerprint(hr, "http-host-retry-ssl", true));
-                                    method_label = "http-host-retry-ssl/" + pa.name;
-                                }
-                                response = std::move(hr);
-                                goto capture_done;
-                            }
-                            vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) +
-                                       ": SSL Host-header retry also got no response; keeping original " +
-                                       std::to_string(code), 2);
-                        }
-                    }
-
-                    if (is_redirect(r)) {
-                        if (is_ssl) {
-                            vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": SSL HTTP probe '" +
-                                       pa.name + "' got redirect -> SSL dual FP follow", 2);
-                            r = follow_redirects_ssl_fp(ip, args.port, args.timeout,
-                                                        args.verbose, std::move(r), http_fps);
-                            method_label = "ssl-redirect/" + pa.name;
-                        } else {
-                            vlog::line(g_verbose, "probe #" + std::to_string(attempt_idx) + ": HTTP probe '" +
-                                       pa.name + "' got redirect -> dual FP follow", 2);
-                            r = follow_redirects_tcp_fp(ip, args.port, read_to,
-                                                        args.verbose, std::move(r), http_fps);
-                            method_label = "http-redirect/" + pa.name;
-                        }
-                        response = std::move(r);
-                        goto capture_done;
-                    }
-                }
-
-                vlog::ok(g_verbose, "probe #" + std::to_string(attempt_idx) + " '" + pa.name + "' got " +
-                         std::to_string(r.size()) + " bytes -- using this response", 1);
-                response     = std::move(r);
-                method_label = is_ssl ? "ssl/" + pa.name : pa.name;
-                goto capture_done;
-            }
-            vlog::fail(g_verbose, "probe #" + std::to_string(attempt_idx) + " '" + pa.name + "' -> no response", 1);
-        }
-
-        if (response.empty() && !terminate_flag) {
-            vlog::line(g_verbose, "all probes exhausted, trying fallback chain", 1);
-            response = capture_fallback(ip, args.port, args.timeout, args.verbose,
-                                        method_label, http_fps);
-        }
+        f = s.find(needle, f + needle.size());
     }
+    return false;
+}
 
-    capture_done:
-    if (response.empty()) {
-        fprintf(stdout, "%-7d: No response\n", args.port);
+}
+
+namespace {
+
+int run_ranges(const Options& opts) {
+    const Country* cp = nullptr;
+    CountryMatch::How how = CountryMatch::How::None;
+    if (!pick_country(opts.country, cp, how)) return 1;
+    const Country& country = *cp;
+
+    Job job;
+    job.cc[0] = country.iso2[0];
+    job.cc[1] = country.iso2[1];
+    job.want_v4 = opts.want_v4;
+    job.want_v6 = opts.want_v6;
+    if (!job.want_v4 && !job.want_v6) {
+        std::cerr << "[discover] nothing to do: both IPv4 and IPv6 are disabled\n";
         return 1;
     }
 
-    bool final_ssl = (method_label.rfind("ssl/", 0)          == 0 ||
-                      method_label == "https"                      ||
-                      method_label == "https-redirect"             ||
-                      method_label == "Default TLS"                ||
-                      method_label == "ssl-after-4xx"              ||
-                      method_label.rfind("ssl-after-4xx/", 0) == 0 ||
-                      method_label.rfind("ssl-redirect/", 0)  == 0);
-
-    if (g_verbose) {
-        vlog::section(g_verbose, "Capture summary");
-        vlog::kv(g_verbose, "Bytes",     std::to_string(response.size()));
-        vlog::kv(g_verbose, "Port",      std::to_string(args.port));
-        vlog::kv(g_verbose, "Probe",     method_label);
-        vlog::kv(g_verbose, "Transport", final_ssl ? "TLS/SSL" : "plain TCP");
-        vlog::kv(g_verbose, "HTTP FPs",  std::to_string(http_fps.size()));
-
-        fprintf(stderr, "\n%s%sResponse hex (%zu bytes)%s\n", vlog::GRAY(), vlog::BOLD(),
-                response.size(), vlog::RESET());
-        for (size_t i = 0; i < response.size(); i++) {
-            fprintf(stderr, "%02x", response[i]);
-            if ((i + 1) % 4 == 0) fprintf(stderr, " ");
-            if ((i + 1) % 32 == 0) fprintf(stderr, "\n");
-        }
-        if (response.size() % 32 != 0) fprintf(stderr, "\n");
+    const bool filtering = opts.owner && !opts.owner_name.empty();
+    OwnerMatcher matcher;
+    if (filtering && !make_owner_matcher(opts.owner_name, matcher)) {
+        std::cerr << col(kRed) << "[discover] --owner: '" << opts.owner_name << "' has no searchable words"
+                  << col(kReset) << "\n";
+        return 1;
     }
 
-    if (!args.save_file.empty()) {
-        std::ofstream ofs(args.save_file, std::ios::binary);
-        if (ofs)
-            ofs.write(reinterpret_cast<const char *>(response.data()),
-                      (std::streamsize)response.size());
-        vlog::ok(g_verbose, "saved " + std::to_string(response.size()) + " bytes to " + args.save_file, 1);
+    const std::string cc_lower = [&] {
+        std::string s(country.iso2);
+        for (char& c : s) c = lower_ascii(c);
+        return s;
+    }();
+
+    print_country_line(country, how, opts.country);
+
+    std::vector<std::unique_ptr<Source>> sources;
+    auto add = [&](Kind k, const char* label, std::string url, bool streaming, size_t cap) {
+        auto s = std::make_unique<Source>();
+        s->kind = k;
+        s->label = label;
+        s->url = std::move(url);
+        s->job = &job;
+        s->streaming = streaming;
+        s->cap = cap;
+        sources.push_back(std::move(s));
+    };
+    if (job.want_v4)
+        add(Kind::NwDb, "networksdb", "https://networksdb.io/ip-addresses-of/" + nwdb_slug(country.name), false, kCapPageBytes);
+    add(Kind::ApnicDelegated, "apnic-delegated", "https://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest", true, kCapStreamBytes);
+    if (job.want_v4)
+        add(Kind::RirV4, "rir-list-v4", "https://www-public.telecom-sudparis.eu/~maigron/rir-stats/rir-delegations/ip-lists/ipv4/" + cc_lower + "-ipv4-list.txt", true, kCapStreamBytes);
+    if (job.want_v6)
+        add(Kind::RirV6, "rir-list-v6", "https://www-public.telecom-sudparis.eu/~maigron/rir-stats/rir-delegations/ip-lists/ipv6/" + cc_lower + "-ipv6-list.txt", true, kCapStreamBytes);
+
+    std::vector<Xfer*> xs;
+    xs.reserve(sources.size());
+    for (auto& s : sources) xs.push_back(s.get());
+
+    const int rc = run_transfers(xs, opts, xs.size(), nullptr);
+    if (rc == 130) {
+        std::cerr << "[discover] interrupted - transfers aborted, partial results discarded\n";
+        return 130;
+    }
+    if (rc != 0) {
+        std::cerr << col(kRed) << "[discover] curl_multi_init failed" << col(kReset) << "\n";
+        return 1;
     }
 
-    if (args.verbose) {
-        std::string hex_preview;
-        for (size_t i = 0; i < std::min(response.size(), (size_t)50); ++i) {
-            char buf[4]; snprintf(buf, sizeof(buf), "%02x ", response[i]);
-            hex_preview += buf;
-        }
-        vlog::line(g_verbose, "first 50 bytes (hex): " + hex_preview, 1);
-
-        std::string ascii_preview;
-        for (size_t i = 0; i < std::min(response.size(), (size_t)200); ++i) {
-            unsigned char c = response[i];
-            ascii_preview += (c >= 32 && c < 127) ? (char)c : '.';
-        }
-        vlog::line(g_verbose, "first 200 bytes (ascii): " + ascii_preview, 1);
-    }
-
-    ServiceTunnel tunnel = final_ssl ? ServiceTunnel::SSL : ServiceTunnel::NONE;
-
-    ProbeEngine engine(&probes, args.intensity);
-
-    if (args.port >= 9100 && args.port <= 9107) {
-        std::lock_guard<std::mutex> lk(g_probes_exclude_mu);
-        if (probes.isExcluded((u16)args.port, proto_int)) {
-            auto &ev = probes.excludedPorts.tcp_ports;
-            ev.erase(std::remove_if(ev.begin(), ev.end(),
-                [&](u16 p){ return p >= 9100 && p <= 9107; }), ev.end());
-            vlog::line(g_verbose, "temporarily overriding Exclude for port " + std::to_string(args.port), 1);
+    size_t ok_count = 0;
+    std::vector<V4> all_v4;
+    std::vector<V6> all_v6;
+    for (auto& s : sources) {
+        if (s->ok) {
+            ++ok_count;
+            all_v4.insert(all_v4.end(), s->v4.begin(), s->v4.end());
+            all_v6.insert(all_v6.end(), s->v6.begin(), s->v6.end());
         }
     }
-
-    ScanResult result = engine.matchResponse(
-        (u16)args.port, proto_int, tunnel,
-        response.data(), (int)response.size());
-
-    if (http_fps.empty() && !response.empty()) {
-        HttpFingerprint fp = make_http_fingerprint(response, "final-response", final_ssl);
-        if (!fp.title.empty())
-            vlog::line(args.verbose, "fallback fingerprint title: " + fp.title, 1);
-        http_fps.push_back(fp);
+    if (ok_count == 0) {
+        std::cerr << col(kRed) << "[discover] every source failed - check connectivity / country code" << col(kReset) << "\n";
+        return 1;
     }
-    if (!args.udp && !response.empty()) {
-        auto asset_candidates = extract_asset_paths(response);
-        size_t followed = 0;
-        for (const auto &cand : asset_candidates) {
-             if (followed >= 4 || terminate_flag) break;
-            HttpFingerprint afp = follow_http_asset(ip, args.port, cand,
-                                                    final_ssl, read_to, args.verbose);
-            ++followed;
-            if (!afp.title.empty() || !afp.server.empty()) {
-                vlog::line(args.verbose, "asset-follow " + cand +
-                           " -> title='" + afp.title + "' server='" + afp.server + "'", 1);
-                http_fps.push_back(afp);
+
+    std::string text;
+    size_t out_v4 = 0, out_v6 = 0;
+    std::vector<std::pair<std::string, uint32_t>> v4_samples;
+    std::vector<std::pair<std::string, u128>>     v6_samples;
+    if (job.want_v4) {
+        std::vector<V4> merged = merge_v4(std::move(all_v4));
+        for (const V4& iv : merged) out_v4 += emit_v4(iv, opts.owner ? nullptr : &text, opts.owner ? &v4_samples : nullptr);
+    }
+    if (job.want_v6) {
+        std::vector<V6> merged = merge_v6(std::move(all_v6));
+        for (const V6& iv : merged) out_v6 += emit_v6(iv, opts.owner ? nullptr : &text, opts.owner ? &v6_samples : nullptr);
+    }
+
+    if (out_v4 + out_v6 == 0) {
+        std::cerr << col(kYellow) << "[discover] no ranges found for " << country.name << " (" << country.iso2 << ")" << col(kReset) << "\n";
+        return 1;
+    }
+
+    if (!opts.owner) {
+        write_out(opts, text);
+        return 0;
+    }
+
+    std::vector<std::string> v4_labels, v6_labels;
+    size_t owners_resolved = 0, owners_attempted = 0;
+    resolve_owners(v4_samples, v6_samples, opts, v4_labels, v6_labels, owners_resolved, owners_attempted);
+    (void)owners_resolved;
+    (void)owners_attempted;
+
+    OwnerFilter flt;
+    if (filtering) {
+        apply_owner_filter(matcher, v4_labels, v6_labels, flt);
+        if (flt.best == 0) {
+            std::cerr << col(kYellow) << "[discover] no range owner matched '" << opts.owner_name << "'" << col(kReset) << "\n";
+            if (!flt.nearest.items.empty()) {
+                std::cerr << "[discover] did you mean:\n";
+                for (const auto& it : flt.nearest.items) std::cerr << "             " << it.second << "\n";
             }
+            return 1;
+        }
+        if (flt.best < 3)
+            std::cerr << "[discover] no exact owner match - showing closest (typo-tolerant) matches\n";
+    }
+
+    std::vector<OwnerRow> rows;
+    collect_owner_rows(v4_samples, v4_labels, v6_samples, v6_labels,
+                       filtering ? &flt.keep4 : nullptr, filtering ? &flt.keep6 : nullptr, rows);
+
+    std::string colored, plain;
+    render_owner_table(rows, true, colored);
+    render_owner_table(rows, false, plain);
+    std::cout << colored;
+    std::cout.flush();
+    save_file(opts, plain);
+    return 0;
+}
+
+struct AsnHit {
+    int      score;
+    size_t   page;
+    size_t   idx;
+    AsnRow   row;
+};
+
+struct AsnCollector {
+    const Cleaned*           query = nullptr;
+    std::vector<AsnHit>      hits;
+    std::vector<std::string> names;
+    std::unordered_set<uint64_t> seen;
+    size_t                   total_rows = 0;
+
+    void add(size_t page, std::vector<AsnRow>&& rows) {
+        size_t idx = 0;
+        for (AsnRow& r : rows) {
+            const size_t i = idx++;
+            uint64_t key = 0;
+            for (size_t k = 2; k < r.asn.size(); ++k) key = key * 10 + static_cast<uint64_t>(r.asn[k] - '0');
+            if (!seen.insert(key).second) continue;
+            ++total_rows;
+            if (!query) {
+                hits.push_back({0, page, i, std::move(r)});
+                continue;
+            }
+            const int sc = org_score(*query, clean_name(r.name, true));
+            if (sc > 0) hits.push_back({sc, page, i, std::move(r)});
+            else names.push_back(std::move(r.name));
+        }
+    }
+};
+
+struct AsnPage : Xfer {
+    size_t         index = 0;
+    AsnCollector*  sink = nullptr;
+    AsnRowStream   stream;
+
+    bool on_data(const char* p, size_t n) override {
+        if (stream.feed(std::string_view(p, n))) return true;
+        aborted = true;
+        abort_reason = "malformed page (row too large)";
+        return false;
+    }
+    void on_finish() override {
+        stream.finish();
+        sink->add(index, std::move(stream.rows));
+        stream.reset();
+    }
+    void on_fail() override { body.clear(); stream.reset(); }
+    void on_reset() override { stream.reset(); }
+};
+
+constexpr size_t kScanConcurrency  = 8;
+constexpr size_t kRetryConcurrency = 2;
+
+int run_asn_list(const Options& opts) {
+    const bool filtering = !opts.org.empty();
+    Cleaned query;
+    if (filtering) {
+        query = clean_name(opts.org, false);
+        if (query.tokens.empty()) {
+            std::cerr << col(kRed) << "[discover] --org: '" << opts.org << "' has no searchable words" << col(kReset) << "\n";
+            return 1;
         }
     }
 
-    bool confirmed_websocket = false;
-    for (const auto &fp : http_fps) {
-        if (fp.status_code == 101 || fp.status_code == 501) {
-            confirmed_websocket =
-                confirm_websocket_upgrade(ip, args.port, final_ssl, read_to, args.verbose);
-            break;
+    std::vector<const Country*> targets;
+    if (!opts.country.empty()) {
+        const Country* cp = nullptr;
+        CountryMatch::How how = CountryMatch::How::None;
+        if (!pick_country(opts.country, cp, how)) return 1;
+        print_country_line(*cp, how, opts.country);
+        targets.push_back(cp);
+    } else if (filtering) {
+        targets.reserve(kCountryCount);
+        for (const Country& c : kCountries) targets.push_back(&c);
+        std::cerr << "[discover] --org without --cn: scanning all " << targets.size() << " country pages\n";
+    } else {
+        std::cerr << col(kRed) << "[discover] give --cn <country> and/or --org <name>" << col(kReset) << "\n";
+        return 1;
+    }
+
+    AsnCollector sink;
+    sink.query = filtering ? &query : nullptr;
+
+    std::vector<std::unique_ptr<AsnPage>> pages;
+    pages.reserve(targets.size());
+    std::vector<Xfer*> xs;
+    xs.reserve(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        auto p = std::make_unique<AsnPage>();
+        p->url = std::string("https://ipgeolocation.io/browse/asn/countries/") + targets[i]->iso2;
+        p->cap = kCapAsnPageBytes;
+        p->not_found_ok = true;
+        p->index = i;
+        p->sink = &sink;
+        xs.push_back(p.get());
+        pages.push_back(std::move(p));
+    }
+
+    const bool multi = targets.size() > 1;
+    ProgressFn progress;
+    if (multi) {
+        progress = [](size_t done, size_t total) {
+            if (err_tty()) std::cerr << "\r[discover] country pages " << done << "/" << total << std::flush;
+            else if (done == total || done % 25 == 0) std::cerr << "[discover] country pages " << done << "/" << total << "\n";
+        };
+    }
+
+    int rc = run_transfers(xs, opts, multi ? kScanConcurrency : 1, progress);
+    if (multi && err_tty()) std::cerr << "\n";
+
+    if (rc == 0) {
+        std::vector<Xfer*> failed;
+        for (auto& p : pages)
+            if (!p->ok && !p->aborted) { p->reset(); failed.push_back(p.get()); }
+        if (!failed.empty()) {
+            if (multi) std::cerr << "[discover] retrying " << failed.size() << " failed page(s)\n";
+            Options ropts = opts;
+            ropts.total_timeout_sec = static_cast<int>(std::max<long long>(
+                opts.total_timeout_sec, std::min<long long>(2LL * opts.total_timeout_sec, 600)));
+            rc = run_transfers(failed, ropts, kRetryConcurrency, nullptr);
         }
+    }
+    if (rc == 130) {
+        std::cerr << "[discover] interrupted - partial results discarded\n";
+        return 130;
+    }
+    if (rc != 0) {
+        std::cerr << col(kRed) << "[discover] curl_multi_init failed" << col(kReset) << "\n";
+        return 1;
+    }
+
+    size_t failed_pages = 0;
+    std::string last_note, failed_list;
+    for (size_t i = 0; i < pages.size(); ++i) {
+        if (pages[i]->ok) continue;
+        ++failed_pages;
+        last_note = pages[i]->note;
+        if (failed_pages <= 8) {
+            if (!failed_list.empty()) failed_list += ", ";
+            failed_list += targets[i]->iso2;
+            failed_list += " (" + pages[i]->note + ")";
+        }
+    }
+    if (failed_pages == pages.size()) {
+        std::cerr << col(kRed) << "[discover] every page failed: " << last_note << col(kReset) << "\n";
+        return 1;
+    }
+    if (failed_pages > 0)
+        std::cerr << col(kYellow) << "[discover] " << failed_pages << " page(s) failed: " << failed_list
+                  << (failed_pages > 8 ? ", ..." : "") << " - results may be incomplete" << col(kReset) << "\n";
+
+    if (sink.total_rows == 0) {
+        std::cerr << col(kYellow) << "[discover] no ASN rows found - the page has none for this country or its layout changed"
+                  << col(kReset) << "\n";
+        return 1;
+    }
+
+    std::vector<AsnHit>& hits = sink.hits;
+    if (filtering) {
+        if (hits.empty()) {
+            std::cerr << col(kYellow) << "[discover] no organisation matched '" << opts.org << "'" << col(kReset) << "\n";
+            Nearest nearest;
+            for (const std::string& n : sink.names) {
+                const Cleaned c = clean_name(n, true);
+                const int d = approx_sub(query.compact, c.compact, 4);
+                if (d <= 4) nearest.offer(d, n);
+            }
+            if (!nearest.items.empty()) {
+                std::cerr << "[discover] did you mean:\n";
+                for (const auto& it : nearest.items) std::cerr << "             " << it.second << "\n";
+            }
+            return 1;
+        }
+        std::sort(hits.begin(), hits.end(), [](const AsnHit& a, const AsnHit& b) {
+            if (a.score != b.score) return a.score > b.score;
+            if (a.page != b.page) return a.page < b.page;
+            return a.idx < b.idx;
+        });
+        const int th = keep_threshold(hits.front().score);
+        if (hits.front().score < 3)
+            std::cerr << "[discover] no exact organisation match - showing closest (typo-tolerant) matches\n";
+        hits.erase(std::remove_if(hits.begin(), hits.end(), [th](const AsnHit& h) { return h.score < th; }), hits.end());
+    }
+
+    std::vector<OwnerRow> table;
+    table.reserve(hits.size());
+    for (AsnHit& h : hits) {
+        OwnerRow r;
+        r.asn = h.row.asn;
+        r.org = h.row.name;
+        split_trailing_cc(r.org, r.country);
+        if (r.country.empty()) r.country = "-";
+        table.push_back(std::move(r));
+    }
+    std::string colored, plain;
+    render_owner_table(table, true, colored, false);
+    render_owner_table(table, false, plain, false);
+    std::cout << colored;
+    std::cout.flush();
+    save_file(opts, plain);
+    std::cerr << col(kBold) << "[discover] result  : " << col(kReset) << hits.size() << " ASN(s)";
+    if (filtering) std::cerr << " matching '" << opts.org << "'";
+    std::cerr << "  [from " << sink.total_rows << " ASNs on " << (pages.size() - failed_pages) << "/" << pages.size() << " page(s)]\n";
+    return 0;
+}
+
+int run_reverse(const Options& opts) {
+    std::string query;
+    if (!opts.ip.empty()) {
+        uint32_t host = 0;
+        if (!parse_v4_addr(trim_sv(opts.ip), host)) {
+            std::cerr << col(kRed) << "[discover] --ip: '" << opts.ip << "' is not a valid IPv4 address" << col(kReset) << "\n";
+            return 1;
+        }
+        query = v4_to_string(host);
+    } else {
+        bool adjusted = false;
+        if (!normalize_range24(opts.range, query, adjusted)) {
+            std::cerr << col(kRed) << "[discover] --range: only IPv4 /24 ranges are supported (e.g. 103.48.88.0/24)"
+                      << col(kReset) << "\n";
+            return 1;
+        }
+        if (adjusted) std::cerr << "[discover] --range: host bits cleared, using " << query << "\n";
+    }
+
+    Xfer page;
+    page.url = "https://api.hackertarget.com/reverseiplookup/?q=" + query;
+    page.cap = kCapReplyBytes;
+    std::vector<Xfer*> xs{&page};
+    const int rc = run_transfers(xs, opts, 1, nullptr);
+    if (rc == 130) { std::cerr << "[discover] interrupted\n"; return 130; }
+    if (rc != 0 || !page.ok) {
+        std::cerr << col(kRed) << "[discover] hackertarget request failed: " << (page.note.empty() ? "internal error" : page.note)
+                  << col(kReset) << "\n";
+        return 1;
+    }
+
+    std::vector<std::string> domains;
+    std::string message;
+    if (!parse_reverse_body(page.body, domains, message)) {
+        if (message.find("API count exceeded") != std::string::npos)
+            std::cerr << col(kRed) << "[discover] hackertarget daily quota exceeded - try later or from another IP" << col(kReset) << "\n";
+        else
+            std::cerr << col(kYellow) << "[discover] hackertarget: " << message << col(kReset) << "\n";
+        return 1;
+    }
+    if (domains.empty()) {
+        std::cerr << col(kYellow) << "[discover] no domains found for " << query << col(kReset) << "\n";
+        return 1;
+    }
+    std::string text;
+    for (const std::string& d : domains) { text += d; text += '\n'; }
+    write_out(opts, text);
+    std::cerr << col(kBold) << "[discover] result  : " << col(kReset) << domains.size() << " domain(s) for " << query << "\n";
+    return 0;
+}
+
+int run_asn_routes(const Options& opts) {
+    uint32_t asn = 0;
+    if (!parse_asn_arg(opts.asn, asn)) {
+        std::cerr << col(kRed) << "[discover] --asn: '" << opts.asn << "' is not a valid ASN (use AS45353 or 45353)" << col(kReset) << "\n";
+        return 1;
+    }
+    if (!opts.want_v4 && !opts.want_v6) {
+        std::cerr << "[discover] nothing to do: both IPv4 and IPv6 are disabled\n";
+        return 1;
+    }
+
+    Xfer page;
+    page.url = "https://ip.guide/AS" + std::to_string(asn);
+    page.cap = kCapReplyBytes;
+    std::vector<Xfer*> xs{&page};
+    const int rc = run_transfers(xs, opts, 1, nullptr);
+    if (rc == 130) { std::cerr << "[discover] interrupted\n"; return 130; }
+    if (rc != 0 || !page.ok) {
+        if (page.note == "HTTP 404")
+            std::cerr << col(kRed) << "[discover] AS" << asn << " not found" << col(kReset) << "\n";
+        else
+            std::cerr << col(kRed) << "[discover] ip.guide request failed: " << (page.note.empty() ? "internal error" : page.note)
+                      << col(kReset) << "\n";
+        return 1;
+    }
+
+    const std::string_view b(page.body);
+    const size_t rp = b.find("\"routes\"");
+    if (rp == std::string_view::npos) {
+        std::cerr << col(kRed) << "[discover] unexpected response from ip.guide (no routes object)" << col(kReset) << "\n";
+        return 1;
+    }
+
+    std::vector<std::string> r4, r6;
+    json_string_array(b, rp, "v4", r4);
+    json_string_array(b, rp, "v6", r6);
+
+    std::string name, org, cc;
+    json_find_string(b, "name", name);
+    json_find_string(b, "organization", org);
+    json_find_string(b, "country", cc);
+    sanitize_inplace(name);
+    sanitize_inplace(org);
+    sanitize_inplace(cc);
+    std::string label = name;
+    if (!org.empty() && org != name) label = label.empty() ? org : label + " - " + org;
+    if (label.empty()) label = "-";
+    if (cc.empty()) cc = "-";
+    const std::string asn_s = "AS" + std::to_string(asn);
+
+    std::vector<OwnerRow> rows;
+    std::unordered_set<std::string> seen;
+    size_t n4 = 0, n6 = 0;
+    if (opts.want_v4) {
+        for (const std::string& r : r4) {
+            V4 iv;
+            if (parse_v4_cidr(r, iv) && seen.insert(r).second) { rows.push_back({asn_s, r, cc, label}); ++n4; }
+        }
+    }
+    if (opts.want_v6) {
+        for (const std::string& r : r6) {
+            V6 iv;
+            if (parse_v6_cidr(r, iv) && seen.insert(r).second) { rows.push_back({asn_s, r, cc, label}); ++n6; }
+        }
+    }
+
+    if (n4 + n6 == 0) {
+        std::cerr << col(kYellow) << "[discover] no routes found for AS" << asn << col(kReset) << "\n";
+        return 1;
+    }
+    std::string colored, plain;
+    render_owner_table(rows, true, colored);
+    render_owner_table(rows, false, plain);
+    std::cout << colored;
+    std::cout.flush();
+    save_file(opts, plain);
+    std::cerr << col(kBold) << "[discover] result  : " << col(kReset);
+    if (opts.want_v4) std::cerr << n4 << " IPv4 routes";
+    if (opts.want_v4 && opts.want_v6) std::cerr << ", ";
+    if (opts.want_v6) std::cerr << n6 << " IPv6 routes";
+    std::cerr << "\n";
+    return 0;
+}
+
+}
+
+int run(const Options& opts) {
+    std::cerr << "\nStarting " << col(kBold) << "Shiv" << col(kReset) << " (" << col(kYellow) << "DISCOVERY"
+              << col(kReset) << ") at " << format_time() << "\n";
+    CurlGlobal cg;
+    if (!cg.ok) {
+        std::cerr << col(kRed) << "[discover] curl_global_init failed" << col(kReset) << "\n";
+        return 1;
+    }
+    switch (opts.mode) {
+        case Mode::Ranges:    return run_ranges(opts);
+        case Mode::AsnList:   return run_asn_list(opts);
+        case Mode::ReverseIp: return run_reverse(opts);
+        case Mode::AsnRoutes: return run_asn_routes(opts);
+        case Mode::None:      break;
+    }
+    std::cerr << col(kRed) << "[discover] no discovery mode selected" << col(kReset) << "\n";
+    return 1;
+}
+
+}
+
+#ifdef DISCOVER_SELFTEST
+std::atomic<bool> terminate_flag(false);
+std::vector<std::string> g_dns_servers;
+
+#include <set>
+
+static int g_fail = 0;
+#define CHECK(c) do { if (!(c)) { std::cerr << "FAIL line " << __LINE__ << ": " #c "\n"; ++g_fail; } } while (0)
+
+int main() {
+    using namespace discover;
+    std::set<std::string> i2, i3;
+    for (const Country& c : kCountries) {
+        CHECK(i2.insert(c.iso2).second);
+        CHECK(i3.insert(c.iso3).second);
+        CHECK(std::strlen(c.iso2) == 2 && std::strlen(c.iso3) == 3);
+    }
+    CHECK(country_count() == 199);
+    CHECK(std::strlen("AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty") == 64);
+    CHECK(std::is_sorted(std::begin(kNoise), std::end(kNoise)));
+    for (const Country& c : kCountries) {
+        CHECK(resolve_country(c.iso2).country == &c);
+        CHECK(resolve_country(c.iso3).country == &c);
+        CHECK(resolve_country(c.name).country == &c);
+        std::string_view al(c.aliases);
+        while (!al.empty()) {
+            const size_t bar = al.find('|');
+            std::string one(al.substr(0, bar));
+            CHECK(resolve_country(one).country == &c);
+            if (bar == std::string_view::npos) break;
+            al.remove_prefix(bar + 1);
+        }
+    }
+    auto iso = [](const char* s) {
+        auto m = resolve_country(s);
+        return m.country ? std::string(m.country->iso2) : std::string("??");
+    };
+    CHECK(iso("nepal") == "NP");   CHECK(iso("  NEPAL ") == "NP");  CHECK(iso("np") == "NP");   CHECK(iso("NPL") == "NP");
+    CHECK(iso("United States") == "US"); CHECK(iso("usa") == "US"); CHECK(iso("uk") == "GB");
+    CHECK(iso("South Korea") == "KR");   CHECK(iso("north-korea") == "KP");
+    CHECK(iso("Côte d'Ivoire") == "CI"); CHECK(iso("Türkiye") == "TR"); CHECK(iso("são tomé") == "ST");
+    CHECK(iso("neth") == "NL");
+    CHECK(iso("nepl") == "NP");
+    CHECK(iso("nepla") == "NP");
+    CHECK(iso("germny") == "DE");
+    CHECK(iso("bangaldesh") == "BD");
+    CHECK(iso("kazakstan") == "KZ");
+    CHECK(iso("ind") == "IN");
+    CHECK(iso("guinea") == "GN");  CHECK(iso("niger") == "NE"); CHECK(iso("nigeria") == "NG");
+    CHECK(iso("sudan") == "SD");   CHECK(iso("south sudan") == "SS");
+    CHECK(iso("xx") == "??");      CHECK(iso("") == "??");  CHECK(iso("atlantis") == "??");
+    CHECK(!resolve_country("mal").country && !resolve_country("mal").suggestions.empty());
+    CHECK(!resolve_country("korea").country);
+
+    std::string t;
+    CHECK(emit_v4({0x1B220000u, 0x1B22FFFFu}, &t) == 1 && t == "27.34.0.0/16\n");
+    t.clear(); CHECK(emit_v4({0x0A000000u, 0x0A0002FFu}, &t) == 2 && t == "10.0.0.0/23\n10.0.2.0/24\n");
+    t.clear(); CHECK(emit_v4({0x0A000001u, 0x0A000006u}, &t) == 4);
+    t.clear(); CHECK(emit_v4({0u, 0xFFFFFFFFu}, &t) == 1 && t == "0.0.0.0/0\n");
+    CHECK(emit_v4({0x0A000000u, 0x0A0000FFu}, nullptr) == 1);
+    std::vector<V4> v = {{10, 20}, {21, 30}, {5, 12}, {100, 200}};
+    auto mv = merge_v4(v);
+    CHECK(mv.size() == 2 && mv[0] == V4(5, 30) && mv[1] == V4(100, 200));
+    V6 a, b;
+    CHECK(parse_v6_cidr("2405:d000::/32", a) && parse_v6_cidr("2405:d001::/32", b));
+    auto m6 = merge_v6({b, a});
+    CHECK(m6.size() == 1);
+    t.clear(); CHECK(emit_v6(m6[0], &t) == 1 && t == "2405:d000::/31\n");
+    V6 all;
+    CHECK(parse_v6_cidr("::/1", all));
+
+    Job job;
+    job.cc[0] = 'N';
+    job.cc[1] = 'P';
+    const std::string body =
+        "2|apnic|20260919|9999|19830613|20260918|+1000\n"
+        "apnic|*|ipv4|*|9999|summary\n"
+        "apnic|NP|ipv4|27.34.0.0|32768|20100322|allocated\n"
+        "apnic|IN|ipv4|1.6.0.0|65536|20100322|allocated\n"
+        "apnic|NP|ipv4|103.1.92.0|1024|20110316|assigned\r\n"
+        "apnic|NP|ipv4|202.79.32.0|8192|20100629|reserved\n"
+        "apnic|NP|ipv6|2405:8d40::|32|20120523|allocated\n"
+        "apnic|NP|ipv4|202.166.192.0|4096|20100629|allocated";
+    for (size_t cut = 0; cut <= body.size(); ++cut) {
+        Source s;
+        s.kind = Kind::ApnicDelegated;
+        s.job = &job;
+        CHECK(s.ingest(body.data(), cut) && s.ingest(body.data() + cut, body.size() - cut));
+        s.on_finish();
+        CHECK(s.v4.size() == 3 && s.v6.size() == 1);
+        CHECK(s.v4[0] == V4(0x1B220000u, 0x1B227FFFu));
+        CHECK(s.v4[1] == V4(0x67015C00u, 0x67015FFFu));
+    }
+    {
+        Source s;
+        s.kind = Kind::ApnicDelegated;
+        s.job = &job;
+        for (char ch : body) CHECK(s.ingest(&ch, 1));
+        s.on_finish();
+        CHECK(s.v4.size() == 3 && s.v6.size() == 1);
+    }
+    {
+        Job j4 = job;
+        j4.want_v6 = false;
+        Source s;
+        s.kind = Kind::ApnicDelegated;
+        s.job = &j4;
+        s.ingest(body.data(), body.size());
+        s.on_finish();
+        CHECK(s.v6.empty() && s.v4.size() == 3);
+    }
+    {
+        Source s;
+        s.kind = Kind::RirV4;
+        s.job = &job;
+        const std::string l = "# generated\n27.34.0.0/17\n\n bad line\n103.1.92.0/22\n";
+        s.ingest(l.data(), l.size());
+        s.on_finish();
+        CHECK(s.v4.size() == 2 && s.v4[0] == V4(0x1B220000u, 0x1B227FFFu));
+    }
+    {
+        Source s;
+        s.kind = Kind::RirV4;
+        s.job = &job;
+        s.cap = 8;
+        const std::string l = "27.34.0.0/17\n27.34.0.0/17\n";
+        CHECK(!s.ingest(l.data(), l.size()) && s.aborted);
+    }
+    {
+        const std::string html = "<a href=\"/country/NP\">Nepal</a><span>CIDR:</span> 14.137.53.0/24 <span>CIDR:</span> 102.38.241.0/24 <span>CIDR:</span> 14.137.51.128/25";
+        Source s;
+        s.kind = Kind::NwDb;
+        s.job = &job;
+        s.streaming = false;
+        s.ingest(html.data(), html.size());
+        s.on_finish();
+        CHECK(s.note.empty() && s.v4.size() == 3 && s.v4[2] == V4(0x0E893380u, 0x0E8933FFu));
+        Source s2;
+        s2.kind = Kind::NwDb;
+        s2.job = &job;
+        s2.streaming = false;
+        const std::string other = "<a href=\"/country/US\">x</a> <span>CIDR:</span> 1.2.3.0/24";
+        s2.ingest(other.data(), other.size());
+        s2.on_finish();
+        CHECK(!s2.note.empty() && s2.v4.empty());
+    }
+    CHECK(nwdb_slug("Nepal") == "nepal");
+    CHECK(nwdb_slug("United States") == "united-states");
+    CHECK(nwdb_slug("Cote d'Ivoire") == "cote-divoire");
+
+    CHECK(edit_distance("nepla", "nepal", 1) == 1);
+    CHECK(edit_distance("kitten", "sitting", 3) == 3);
+    CHECK(edit_distance("abc", "abc", 0) == 0);
+    CHECK(edit_distance("abcdef", "uvwxyz", 2) == 3);
+    CHECK(approx_sub("wolrdlink", "worldlinkcommunications", 2) == 2);
+    CHECK(approx_sub("link", "worldlink", 1) == 0);
+
+    auto score = [](const char* q, const char* name) {
+        return org_score(clean_name(q, false), clean_name(name, true));
+    };
+    CHECK(score("sky broadband", "Sky Broadband Pvt. Ltd, NP") == 5);
+    CHECK(score("SKY-BROADBAND", "Sky Broadband Pvt. Ltd, NP") == 5);
+    CHECK(score("skybroadband", "Sky Broadband Pvt. Ltd, NP") == 4);
+    CHECK(score("broadband", "Sky Broadband Pvt. Ltd, NP") == 4);
+    CHECK(score("broadband sky", "Sky Broadband Pvt. Ltd, NP") == 3);
+    CHECK(score("sky brodaband", "Sky Broadband Pvt. Ltd, NP") == 2);
+    CHECK(score("sky broadbnad", "Sky Broadband Pvt. Ltd, NP") == 2);
+    CHECK(score("mercantile ofice", "Mercantile Office Systems, NP") == 2);
+    CHECK(score("worldl", "WorldLink Communications Pvt Ltd") == 4);
+    CHECK(score("wolrd link", "WorldLink Communications Pvt Ltd") == 1);
+    CHECK(score("nitc", "NITC: IT Agency of Government of Nepal") == 4);
+    CHECK(score("net", "Nepal Electricity Authority, NP") == 0);
+    CHECK(score("net", "Internet Ltd") == 0);
+    CHECK(score("nepal telecom", "Sky Broadband Pvt. Ltd, NP") == 0);
+    CHECK(score("np", "Sky Broadband Pvt. Ltd, NP") == 0);
+    CHECK(score("kacific", "KBSPL-AS-AP - Kacific Broadband Satellites Pte Ltd, SG (AS135409)") == 4);
+    CHECK(clean_name("Pvt. Ltd.", false).tokens.empty());
+    CHECK(!clean_name("Pvt. Ltd.", true).tokens.empty());
+    {
+        const Cleaned c = clean_name("Kacific Broadband Satellites Pte Ltd, SG (AS135409)", true);
+        CHECK(c.tokens.size() == 3 && c.compact == "kacificbroadbandsatellites");
+    }
+    CHECK(label_asn("MOS-NP - Mercantile Office Systems, NP (AS4613)") == 4613);
+    CHECK(label_asn("no asn here") == 0);
+    CHECK(label_asn("x (AS)") == 0);
+    {
+        OwnerMatcher m1, m2, m3;
+        CHECK(make_owner_matcher("AS4613", m1) && m1.asn == 4613);
+        CHECK(make_owner_matcher("4613", m2) && m2.asn == 4613);
+        CHECK(make_owner_matcher("mercantile office", m3) && m3.asn == 0);
+        CHECK(m1.score("MOS-NP - Mercantile Office Systems, NP (AS4613)") == 5);
+        CHECK(m1.score("X (AS4614)") == 0);
+        CHECK(m3.score("MOS-NP - Mercantile Office Systems, NP (AS4613)") == 4);
+        CHECK(!make_owner_matcher("pvt ltd", m3));
+        std::vector<std::string> l4 = {"MOS-NP - Mercantile Office Systems, NP (AS4613)", "", "WLINK-NEPAL-AS-AP - WorldLink Communications Pvt Ltd, NP (AS17501)"};
+        std::vector<std::string> l6 = {"WLINK-NEPAL-AS-AP - WorldLink Communications Pvt Ltd, NP (AS17501)"};
+        OwnerFilter f;
+        OwnerMatcher wl;
+        CHECK(make_owner_matcher("worldlnk", wl));
+        apply_owner_filter(wl, l4, l6, f);
+        CHECK(f.best == 2 && f.keep4[2] && !f.keep4[0] && !f.keep4[1] && f.keep6[0] && f.kept_orgs == 1);
+        OwnerFilter g;
+        OwnerMatcher none;
+        CHECK(make_owner_matcher("zzzzzz", none));
+        apply_owner_filter(none, l4, l6, g);
+        CHECK(g.best == 0 && !g.keep4[0]);
+    }
+    CHECK(v4_cidr_size("10.0.0.0/24") == 256);
+    CHECK(v4_cidr_size("10.0.0.0/32") == 1);
+    {
+        Nearest n;
+        n.offer(3, "c"); n.offer(1, "a"); n.offer(2, "b"); n.offer(1, "a");
+        n.offer(4, "d"); n.offer(5, "e"); n.offer(6, "f"); n.offer(0, "z");
+        CHECK(n.items.size() == 5 && n.items[0].second == "z" && n.items[1].second == "a" && n.items[4].second == "d");
     }
 
     {
-        std::lock_guard<std::mutex> lk(g_stdout_mu);
-        std::cout << std::left << std::setw(7) << target_port << ": ";
-        print_result(result, method_label, http_fps, confirmed_websocket);
+        const std::string html =
+            "<html><table><thead><tr><th>ASN</th><th>Org</th></tr></thead><tbody>"
+            "<tr><td><span>AS135303</span></td><td><span>NETTV Pvt. Ltd., NP</span></td><td><span>1</span></td><td><span>0</span></td></tr>\n"
+            "<TR class=\"x\">\n<TD><span>AS58504</span></TD>\n<TD><span>TECHMINDS &amp; NETWORKS\n PVT. LTD., NP</span></TD><TD><span>16</span></TD><TD><span>20</span></TD></TR>"
+            "<tr><td><span>bogus</span></td><td><span>skip me</span></td></tr>"
+            "<tr><td><span>AS4613</span></td><td><span>Mercantile&nbsp;Office Systems, NP</span></td><td><span>32</span></td><td><span>0</span></td></tr>"
+            "<tr><td><span>AS9</span></td><td><span>bad\x1b[31m</span></td></tr>"
+            "</tbody></table></html>";
+        std::vector<AsnRow> rows;
+        parse_asn_rows(html, rows);
+        CHECK(rows.size() == 4);
+        CHECK(rows[0].asn == "AS135303" && rows[0].name == "NETTV Pvt. Ltd., NP" && rows[0].c3 == "1" && rows[0].c4 == "0");
+        CHECK(rows[1].asn == "AS58504" && rows[1].name == "TECHMINDS & NETWORKS PVT. LTD., NP" && rows[1].c3 == "16" && rows[1].c4 == "20");
+        CHECK(rows[2].name == "Mercantile Office Systems, NP");
+        CHECK(rows[3].name == "bad[31m");
+        std::vector<AsnRow> none;
+        parse_asn_rows("<html>nothing</html>", none);
+        CHECK(none.empty());
+        AsnCollector sink;
+        const Cleaned q = clean_name("mercantile", false);
+        sink.query = &q;
+        sink.add(0, std::move(rows));
+        CHECK(sink.total_rows == 4 && sink.hits.size() == 1 && sink.hits[0].row.asn == "AS4613" && sink.names.size() == 3);
     }
-    return 0;
+    CHECK(html_text("  a &lt;b&gt; &#65;&#x42; <i>c</i>\n\t d &bogus; ") == "a <b> AB c d &bogus;");
+
+    {
+        std::vector<std::string> d;
+        std::string msg;
+        CHECK(parse_reverse_body("a.example.com\r\nb.example.org\na.example.com\n\nc-d.example.net\n", d, msg));
+        CHECK(d.size() == 3 && d[0] == "a.example.com" && d[2] == "c-d.example.net");
+        d.clear();
+        CHECK(!parse_reverse_body("API count exceeded - Increase Quota with Membership", d, msg));
+        CHECK(msg.find("API count exceeded") != std::string::npos && d.empty());
+        d.clear();
+        CHECK(!parse_reverse_body("error check your search parameter\x1b[2J", d, msg));
+        CHECK(msg.find('\x1b') == std::string::npos);
+        d.clear();
+        CHECK(!parse_reverse_body("No DNS A records found for 1.2.3.4", d, msg));
+        d.clear();
+        CHECK(!parse_reverse_body("error", d, msg));
+        d.clear();
+        CHECK(parse_reverse_body("ok.example.com\nsome junk line\nfine.example.com\n", d, msg) && d.size() == 2);
+        d.clear();
+        CHECK(parse_reverse_body("", d, msg) && d.empty());
+    }
+    CHECK(is_domain_line("*.example.com") && is_domain_line("a_b.example.com,1.2.3.4"));
+    CHECK(!is_domain_line("nodots") && !is_domain_line("has space.com") && !is_domain_line("a.com;rm"));
+    {
+        std::string out;
+        bool adj = false;
+        CHECK(normalize_range24("103.48.88.0/24", out, adj) && out == "103.48.88.0/24" && !adj);
+        CHECK(normalize_range24(" 103.48.88.33/24 ", out, adj) && out == "103.48.88.0/24" && adj);
+        CHECK(!normalize_range24("103.48.88.0/23", out, adj));
+        CHECK(!normalize_range24("103.48.88.0/25", out, adj));
+        CHECK(!normalize_range24("103.48.88.0", out, adj));
+        CHECK(!normalize_range24("2001:db8::/24", out, adj));
+        CHECK(!normalize_range24("103.48.88.0/024x", out, adj));
+    }
+    {
+        uint32_t asn = 0;
+        CHECK(parse_asn_arg("AS45353", asn) && asn == 45353);
+        CHECK(parse_asn_arg("as45353", asn) && asn == 45353);
+        CHECK(parse_asn_arg(" 45353 ", asn) && asn == 45353);
+        CHECK(parse_asn_arg("4294967295", asn) && asn == 4294967295u);
+        CHECK(!parse_asn_arg("4294967296", asn));
+        CHECK(!parse_asn_arg("AS", asn) && !parse_asn_arg("AS0", asn) && !parse_asn_arg("", asn));
+        CHECK(!parse_asn_arg("AS45x", asn) && !parse_asn_arg("AS-1", asn) && !parse_asn_arg("12345678901", asn));
+    }
+    {
+        const std::string js =
+            "{\n  \"asn\": 45353,\n  \"name\": \"NITC-AS-AP - NITC: IT Agency \\u00e9 \\\"Nepal\\\" \\ud83d\\ude00\",\n"
+            "  \"organization\": \"NITC\",\n  \"country\": \"NP\",\n  \"rir\": \"APNIC\",\n"
+            "  \"routes\": {\n    \"v4\": [\n      \"103.69.124.0/24\",\n      \"202.45.144.0/22\"\n    ],\n    \"v6\": []\n  }\n}";
+        std::string name, rir;
+        CHECK(json_find_string(js, "name", name) && name == "NITC-AS-AP - NITC: IT Agency \xC3\xA9 \"Nepal\" \xF0\x9F\x98\x80");
+        CHECK(json_find_string(js, "rir", rir) && rir == "APNIC");
+        CHECK(!json_find_string(js, "missing", rir));
+        const size_t rp = js.find("\"routes\"");
+        std::vector<std::string> r4, r6;
+        CHECK(json_string_array(js, rp, "v4", r4) && r4.size() == 2 && r4[1] == "202.45.144.0/22");
+        CHECK(json_string_array(js, rp, "v6", r6) && r6.empty());
+        std::vector<std::string> bad;
+        CHECK(!json_string_array("{\"v4\": [1, 2]}", 0, "v4", bad));
+        CHECK(!json_string_array("{\"v4\": [\"a\"", 0, "v4", bad));
+        std::string s;
+        CHECK(!json_find_string("{\"k\": \"bad\\q\"}", "k", s));
+        CHECK(!json_find_string("{\"k\": \"unterminated", "k", s));
+        CHECK(json_find_string("{\"k\": \"\\ud800x\"}", "k", s) && s == "?x");
+    }
+
+
+    {
+        const std::string html =
+            "<html><table><thead><tr><th>ASN</th><th>Org</th></tr></thead><tbody class=\"x\">"
+            "<tr><td><span>AS135303</span></td><td><span>NETTV Pvt. Ltd., NP</span></td><td><span>1</span></td><td><span>0</span></td></tr>\n"
+            "<TR class=\"x\">\n<TD><span>AS58504</span></TD>\n<TD><span>TECHMINDS &amp; NETWORKS\n PVT. LTD., NP</span></TD><TD><span>16</span></TD><TD><span>20</span></TD></TR>"
+            "<tr><td><span>bogus</span></td><td><span>skip me</span></td></tr>"
+            "<tr><td><span>AS4613</span></td><td><span>Mercantile&nbsp;Office Systems, NP</span></td><td><span>32</span></td><td><span>0</span></td></tr>"
+            "</tbody></table><table><tbody><tr><td>AS1</td><td>after tbody</td></tr></tbody></table></html>";
+        std::vector<AsnRow> ref;
+        parse_asn_rows(html, ref);
+        CHECK(ref.size() == 3);
+        const size_t chunks[] = {1, 2, 3, 5, 7, 16, 64, 1000, 100000};
+        for (size_t cs : chunks) {
+            AsnRowStream st;
+            bool ok = true;
+            for (size_t i = 0; i < html.size(); i += cs)
+                ok = st.feed(std::string_view(html).substr(i, cs)) && ok;
+            st.finish();
+            CHECK(ok);
+            CHECK(st.rows.size() == ref.size());
+            for (size_t i = 0; i < ref.size() && i < st.rows.size(); ++i)
+                CHECK(st.rows[i].asn == ref[i].asn && st.rows[i].name == ref[i].name &&
+                      st.rows[i].c3 == ref[i].c3 && st.rows[i].c4 == ref[i].c4);
+        }
+        const std::string nobody =
+            "<table><tr><td>AS7</td><td>No Tbody Net, US</td></tr><tr><td>AS8</td><td>Second, US</td></tr></table>";
+        AsnRowStream st2;
+        for (size_t i = 0; i < nobody.size(); i += 4) st2.feed(std::string_view(nobody).substr(i, 4));
+        st2.finish();
+        CHECK(st2.rows.size() == 2 && st2.rows[1].asn == "AS8");
+        AsnRowStream st3;
+        st3.feed("<tbody><tr><td>AS9</td><td>trunc");
+        st3.finish();
+        CHECK(st3.rows.size() == 1 && st3.rows[0].name == "trunc");
+        AsnRowStream st4;
+        st4.feed("<tbody><tr>");
+        CHECK(!st4.feed(std::string(kMaxAsnRowBytes + 10, 'x')));
+        AsnRowStream big;
+        std::string many = "<tbody>";
+        for (int i = 0; i < 5000; ++i)
+            many += "<tr><td>AS" + std::to_string(100 + i) + "</td><td>Org " + std::to_string(i) + ", NP</td></tr>";
+        many += "</tbody>";
+        for (size_t i = 0; i < many.size(); i += 4096) big.feed(std::string_view(many).substr(i, 4096));
+        big.finish();
+        CHECK(big.rows.size() == 5000 && big.carry.empty());
+        big.reset();
+        CHECK(big.rows.empty());
+    }
+
+    {
+        std::string n = "WorldLink Communications, NP", cc;
+        split_trailing_cc(n, cc);
+        CHECK(n == "WorldLink Communications" && cc == "NP");
+        n = "Acme, LLC"; split_trailing_cc(n, cc);
+        CHECK(n == "Acme, LLC" && cc.empty());
+        n = "Foo Ltd,BD"; split_trailing_cc(n, cc);
+        CHECK(n == "Foo Ltd" && cc == "BD");
+        n = "NP"; split_trailing_cc(n, cc);
+        CHECK(n == "NP" && cc.empty());
+
+        std::vector<OwnerRow> rows{{"AS141219", "103.156.108.0/23", "BD", "WORLDLINK-AS-AP - World Link"}};
+        std::string plain;
+        render_owner_table(rows, false, plain);
+        CHECK(plain.rfind("ASN", 0) == 0 && plain.find("RANGE") != std::string::npos &&
+              plain.find("103.156.108.0/23") != std::string::npos && plain.find('\033') == std::string::npos);
+        std::string plain3;
+        render_owner_table(rows, false, plain3, false);
+        CHECK(plain3.find("RANGE") == std::string::npos && plain3.find("COUNTRY") != std::string::npos);
+
+        std::string s = std::string("a\x1b[31mb") + "\xC2\x9B" + "c" + "\xE2\x80\xAE" + "d\xC3\xA9";
+        sanitize_inplace(s);
+        CHECK(s == "a[31mbcd\xC3\xA9");
+    }
+
+    std::cerr << (g_fail ? "SELFTEST FAILED\n" : "SELFTEST OK\n");
+    return g_fail ? 1 : 0;
 }
+#endif
