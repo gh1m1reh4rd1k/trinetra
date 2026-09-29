@@ -1,15 +1,13 @@
 #include "discover.hpp"
-
 #include <curl/curl.h>
-
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -17,11 +15,14 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -250,55 +251,129 @@ inline bool is_alnum_ascii(unsigned char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 inline char lower_ascii(char c) { return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c; }
-std::string normalize(std::string_view in) {
-    static constexpr char kLatin1[65] =
-        "AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTs"
-        "aaaaaaaceeeeiiiidnooooo/ouuuuyty";
-    std::string out;
-    out.reserve(in.size());
+
+constexpr char kLatin1[65] =
+    "AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTs"
+    "aaaaaaaceeeeiiiidnooooo/ouuuuyty";
+
+char latin1_base(unsigned char second) {
+    if (second < 0x80 || second > 0xBF) return 0;
+    const char m = kLatin1[second - 0x80];
+    return is_alnum_ascii(static_cast<unsigned char>(m)) ? lower_ascii(m) : 0;
+}
+
+template <class F>
+void scan_alnum(std::string_view in, F&& emit) {
     for (size_t i = 0; i < in.size(); ++i) {
-        unsigned char c = static_cast<unsigned char>(in[i]);
+        const unsigned char c = static_cast<unsigned char>(in[i]);
         if (c < 0x80) {
-            if (is_alnum_ascii(c)) out.push_back(lower_ascii(static_cast<char>(c)));
-        } else if (c == 0xC3 && i + 1 < in.size()) {
-            unsigned char d = static_cast<unsigned char>(in[i + 1]);
-            if (d >= 0x80 && d <= 0xBF) {
-                char m = kLatin1[d - 0x80];
-                if (is_alnum_ascii(static_cast<unsigned char>(m))) out.push_back(lower_ascii(m));
-                ++i;
-            }
+            emit(is_alnum_ascii(c) ? lower_ascii(static_cast<char>(c)) : '\0');
+        } else if (c == 0xC3 && i + 1 < in.size() && static_cast<unsigned char>(in[i + 1]) >= 0x80 &&
+                   static_cast<unsigned char>(in[i + 1]) <= 0xBF) {
+            emit(latin1_base(static_cast<unsigned char>(in[i + 1])));
+            ++i;
+        } else {
+            emit('\0');
         }
     }
+}
+
+std::string normalize(std::string_view in) {
+    std::string out;
+    out.reserve(in.size());
+    scan_alnum(in, [&](char c) { if (c) out.push_back(c); });
     return out;
 }
 
+void tokenize(std::string_view in, std::vector<std::string>& out) {
+    std::string cur;
+    scan_alnum(in, [&](char c) {
+        if (c) {
+            cur.push_back(c);
+        } else if (!cur.empty()) {
+            out.push_back(std::move(cur));
+            cur.clear();
+        }
+    });
+    if (!cur.empty()) out.push_back(std::move(cur));
+}
+
+void sanitize_inplace(std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x20 || c == 0x7F) { ++i; continue; }
+        if (c == 0xC2 && i + 1 < s.size()) {
+            const unsigned char d = static_cast<unsigned char>(s[i + 1]);
+            if (d >= 0x80 && d <= 0x9F) { i += 2; continue; }
+        }
+        if (c == 0xE2 && i + 2 < s.size()) {
+            const unsigned char d = static_cast<unsigned char>(s[i + 1]);
+            const unsigned char e = static_cast<unsigned char>(s[i + 2]);
+            if ((d == 0x80 && e >= 0xAA && e <= 0xAE) || (d == 0x81 && e >= 0xA6 && e <= 0xA9)) { i += 3; continue; }
+        }
+        out.push_back(s[i]);
+        ++i;
+    }
+    s.swap(out);
+}
+
+constexpr int kEditMax = 64;
+
 int edit_distance(std::string_view a, std::string_view b, int limit) {
     const int la = static_cast<int>(a.size()), lb = static_cast<int>(b.size());
-    if (std::abs(la - lb) > limit) return limit + 1;
-    std::vector<int> prev(lb + 1), cur(lb + 1);
-    for (int j = 0; j <= lb; ++j) prev[j] = j;
+    if (std::abs(la - lb) > limit || la > kEditMax || lb > kEditMax) return limit + 1;
+    int r0[kEditMax + 1], r1[kEditMax + 1], r2[kEditMax + 1];
+    int* pp = r0;
+    int* p = r1;
+    int* c = r2;
+    for (int j = 0; j <= lb; ++j) p[j] = j;
     for (int i = 1; i <= la; ++i) {
-        cur[0] = i;
-        int row_min = cur[0];
+        c[0] = i;
+        int row_min = c[0];
         for (int j = 1; j <= lb; ++j) {
-            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
-            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
-            row_min = std::min(row_min, cur[j]);
+            const int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            int v = std::min({p[j] + 1, c[j - 1] + 1, p[j - 1] + cost});
+            if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) v = std::min(v, pp[j - 2] + 1);
+            c[j] = v;
+            row_min = std::min(row_min, v);
         }
         if (row_min > limit) return limit + 1;
-        std::swap(prev, cur);
+        int* t = pp;
+        pp = p;
+        p = c;
+        c = t;
     }
-    return prev[lb];
+    return p[lb];
+}
+
+int approx_sub(std::string_view pat, std::string_view text, int limit) {
+    const int m = static_cast<int>(pat.size());
+    if (m == 0 || m > kEditMax) return limit + 1;
+    int prev[kEditMax + 1], cur[kEditMax + 1];
+    for (int i = 0; i <= m; ++i) prev[i] = i;
+    int best = prev[m];
+    for (size_t j = 0; j < text.size() && best > 0; ++j) {
+        cur[0] = 0;
+        for (int i = 1; i <= m; ++i) {
+            const int cost = (pat[i - 1] == text[j]) ? 0 : 1;
+            cur[i] = std::min({prev[i] + 1, cur[i - 1] + 1, prev[i - 1] + cost});
+        }
+        best = std::min(best, cur[m]);
+        std::memcpy(prev, cur, sizeof(int) * static_cast<size_t>(m + 1));
+    }
+    return best;
 }
 
 struct Index {
-    std::unordered_map<std::string, const Country*>              exact;   
-    std::vector<std::pair<std::string, const Country*>>         names;  
+    std::unordered_map<std::string, const Country*>              exact;
+    std::vector<std::pair<std::string, const Country*>>         names;
     const Country*                                              by_iso2[26][26] = {};
 
     void add(const std::string& key, const Country* c, bool is_name) {
         if (key.empty()) return;
-        exact.emplace(key, c);                       
+        exact.emplace(key, c);
         if (is_name) names.emplace_back(key, c);
     }
 
@@ -323,7 +398,7 @@ struct Index {
 };
 
 const Index& index() {
-    static const Index idx;    
+    static const Index idx;
     return idx;
 }
 
@@ -337,7 +412,7 @@ void push_unique(std::vector<const Country*>& v, const Country* c) {
     if (std::find(v.begin(), v.end(), c) == v.end()) v.push_back(c);
 }
 
-} 
+}
 
 CountryMatch resolve_country(const std::string& input) {
     CountryMatch r;
@@ -401,8 +476,8 @@ namespace {
 
 __extension__ typedef unsigned __int128 u128;
 
-using V4 = std::pair<uint32_t, uint32_t>;         
-struct V6 { u128 lo, hi; };                       
+using V4 = std::pair<uint32_t, uint32_t>;
+struct V6 { u128 lo, hi; };
 
 bool parse_u64(std::string_view s, uint64_t& out) {
     if (s.empty()) return false;
@@ -434,13 +509,13 @@ bool parse_v6_addr(std::string_view s, u128& host) {
     return true;
 }
 
-V4 v4_from_prefix(uint32_t base, unsigned len) {                  
+V4 v4_from_prefix(uint32_t base, unsigned len) {
     uint32_t mask = 0xFFFFFFFFu << (32 - len);
     uint32_t lo = base & mask;
     return {lo, lo | ~mask};
 }
 
-V6 v6_from_prefix(u128 base, unsigned len) {                      
+V6 v6_from_prefix(u128 base, unsigned len) {
     u128 host_mask = (static_cast<u128>(1) << (128 - len)) - 1;
     u128 lo = base & ~host_mask;
     return {lo, lo | host_mask};
@@ -468,11 +543,11 @@ bool parse_v6_cidr(std::string_view s, V6& out) {
     return true;
 }
 
-int ctz128(u128 x) {                                   
+int ctz128(u128 x) {
     uint64_t lo = static_cast<uint64_t>(x);
     return lo ? __builtin_ctzll(lo) : 64 + __builtin_ctzll(static_cast<uint64_t>(x >> 64));
 }
-int floor_log2_128(u128 x) {                           
+int floor_log2_128(u128 x) {
     uint64_t hi = static_cast<uint64_t>(x >> 64);
     return hi ? 127 - __builtin_clzll(hi) : 63 - __builtin_clzll(static_cast<uint64_t>(x));
 }
@@ -503,25 +578,28 @@ std::vector<V6> merge_v6(std::vector<V6> v) {
     }
     return out;
 }
-size_t emit_v4(V4 iv, std::string& out, std::vector<std::pair<std::string, uint32_t>>* samples = nullptr) {
+
+size_t emit_v4(V4 iv, std::string* out, std::vector<std::pair<std::string, uint32_t>>* samples = nullptr) {
     size_t lines = 0;
     uint64_t cur = iv.first, end = iv.second;
     char ip[INET_ADDRSTRLEN];
     while (cur <= end) {
-        uint64_t remaining = end - cur + 1;
-        uint64_t align = cur ? (cur & (~cur + 1)) : (1ULL << 32);
-        uint64_t fit   = 1ULL << (63 - __builtin_clzll(remaining));
-        uint64_t size  = std::min(align, fit);
-        unsigned prefix = 32 - static_cast<unsigned>(__builtin_ctzll(size));
+        const uint64_t remaining = end - cur + 1;
+        const uint64_t align = cur ? (cur & (~cur + 1)) : (1ULL << 32);
+        const uint64_t fit   = 1ULL << (63 - __builtin_clzll(remaining));
+        const uint64_t size  = std::min(align, fit);
+        const unsigned prefix = 32 - static_cast<unsigned>(__builtin_ctzll(size));
         in_addr a{};
         a.s_addr = htonl(static_cast<uint32_t>(cur));
         inet_ntop(AF_INET, &a, ip, sizeof(ip));
-        out += ip;
-        out += '/';
-        out += std::to_string(prefix);
-        out += '\n';
+        if (out) {
+            *out += ip;
+            *out += '/';
+            *out += std::to_string(prefix);
+            *out += '\n';
+        }
         if (samples) {
-            uint32_t sample = static_cast<uint32_t>(cur + (size > 1 ? 1 : 0));
+            const uint32_t sample = static_cast<uint32_t>(cur + (size > 1 ? 1 : 0));
             samples->emplace_back(std::string(ip) + "/" + std::to_string(prefix), sample);
         }
         ++lines;
@@ -530,7 +608,7 @@ size_t emit_v4(V4 iv, std::string& out, std::vector<std::pair<std::string, uint3
     return lines;
 }
 
-size_t emit_v6(V6 iv, std::string& out, std::vector<std::pair<std::string, u128>>* samples = nullptr) {
+size_t emit_v6(V6 iv, std::string* out, std::vector<std::pair<std::string, u128>>* samples = nullptr) {
     size_t lines = 0;
     char ip[INET6_ADDRSTRLEN];
     const u128 kMax = ~static_cast<u128>(0);
@@ -541,33 +619,35 @@ size_t emit_v6(V6 iv, std::string& out, std::vector<std::pair<std::string, u128>
         if (cur == 0 && end == kMax) {
             take = 128;
         } else {
-            u128 remaining = end - cur + 1;
-            int align = (cur == 0) ? 128 : ctz128(cur);
-            int fit   = floor_log2_128(remaining);
+            const u128 remaining = end - cur + 1;
+            const int align = (cur == 0) ? 128 : ctz128(cur);
+            const int fit   = floor_log2_128(remaining);
             take = std::min(align, fit);
         }
         in6_addr a{};
         for (int i = 0; i < 16; ++i) a.s6_addr[i] = static_cast<uint8_t>(cur >> (8 * (15 - i)));
         inet_ntop(AF_INET6, &a, ip, sizeof(ip));
-        out += ip;
-        out += '/';
-        out += std::to_string(128 - take);
-        out += '\n';
+        if (out) {
+            *out += ip;
+            *out += '/';
+            *out += std::to_string(128 - take);
+            *out += '\n';
+        }
         if (samples) {
-            u128 sample = cur + (take > 0 ? static_cast<u128>(1) : static_cast<u128>(0));
+            const u128 sample = cur + (take > 0 ? static_cast<u128>(1) : static_cast<u128>(0));
             samples->emplace_back(std::string(ip) + "/" + std::to_string(128 - take), sample);
         }
         ++lines;
         if (take >= 128) break;
-        u128 step = static_cast<u128>(1) << take;
-        if (end - cur < step) break;                 
+        const u128 step = static_cast<u128>(1) << take;
+        if (end - cur < step) break;
         cur += step;
         if (cur > end || cur == 0) break;
     }
     return lines;
 }
 
-}  
+}
 
 namespace {
 
@@ -697,15 +777,37 @@ bool parse_dns_answer(const uint8_t* buf, size_t len, uint16_t want_type,
     return false;
 }
 
+uint16_t next_dns_id() {
+    thread_local std::mt19937 gen{std::random_device{}()};
+    return static_cast<uint16_t>(gen());
+}
+
 bool udp_dns_query_one(const std::string& server, const std::string& qname, uint16_t qtype,
                         int timeout_ms, std::string& out) {
-    in_addr a4{}; in6_addr a6{};
+    sockaddr_storage ss{};
+    socklen_t sl = 0;
     int fam = 0;
-    if (inet_pton(AF_INET, server.c_str(), &a4) == 1) fam = AF_INET;
-    else if (inet_pton(AF_INET6, server.c_str(), &a6) == 1) fam = AF_INET6;
-    else return false;
+    in_addr a4{};
+    in6_addr a6{};
+    if (inet_pton(AF_INET, server.c_str(), &a4) == 1) {
+        auto* sa = reinterpret_cast<sockaddr_in*>(&ss);
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons(53);
+        sa->sin_addr = a4;
+        sl = sizeof(sockaddr_in);
+        fam = AF_INET;
+    } else if (inet_pton(AF_INET6, server.c_str(), &a6) == 1) {
+        auto* sa = reinterpret_cast<sockaddr_in6*>(&ss);
+        sa->sin6_family = AF_INET6;
+        sa->sin6_port = htons(53);
+        sa->sin6_addr = a6;
+        sl = sizeof(sockaddr_in6);
+        fam = AF_INET6;
+    } else {
+        return false;
+    }
 
-    uint16_t id = static_cast<uint16_t>(std::random_device{}());
+    const uint16_t id = next_dns_id();
     std::vector<uint8_t> pkt = build_dns_query(id, qname, qtype);
     if (pkt.empty()) return false;
 
@@ -715,29 +817,30 @@ bool udp_dns_query_one(const std::string& server, const std::string& qname, uint
     timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    bool sent;
-    if (fam == AF_INET) {
-        sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons(53); sa.sin_addr = a4;
-        sent = sendto(fd, pkt.data(), pkt.size(), 0, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == static_cast<ssize_t>(pkt.size());
-    } else {
-        sockaddr_in6 sa{}; sa.sin6_family = AF_INET6; sa.sin6_port = htons(53); sa.sin6_addr = a6;
-        sent = sendto(fd, pkt.data(), pkt.size(), 0, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == static_cast<ssize_t>(pkt.size());
+    if (connect(fd, reinterpret_cast<sockaddr*>(&ss), sl) != 0 ||
+        send(fd, pkt.data(), pkt.size(), 0) != static_cast<ssize_t>(pkt.size())) {
+        close(fd);
+        return false;
     }
-    if (!sent) { close(fd); return false; }
 
     uint8_t buf[2048];
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    const ssize_t n = recv(fd, buf, sizeof(buf), 0);
     close(fd);
     if (n < 12) return false;
     const size_t len = static_cast<size_t>(n);
 
-    uint16_t rid; memcpy(&rid, buf, 2);
+    uint16_t rid;
+    std::memcpy(&rid, buf, 2);
     if (ntohs(rid) != id) return false;
-    uint16_t rflags; memcpy(&rflags, buf + 2, 2); rflags = ntohs(rflags);
+    uint16_t rflags;
+    std::memcpy(&rflags, buf + 2, 2);
+    rflags = ntohs(rflags);
     if ((rflags & 0x000F) != 0) return false;
     uint16_t qdc, anc;
-    memcpy(&qdc, buf + 4, 2); qdc = ntohs(qdc);
-    memcpy(&anc, buf + 6, 2); anc = ntohs(anc);
+    std::memcpy(&qdc, buf + 4, 2);
+    qdc = ntohs(qdc);
+    std::memcpy(&anc, buf + 6, 2);
+    anc = ntohs(anc);
     if (anc == 0) return false;
 
     size_t pos = 12;
@@ -828,6 +931,9 @@ int connect_with_timeout(const char* host, int port, int timeout_ms) {
     return fd;
 }
 
+constexpr size_t kMaxWhoisResponse = 8u * 1024 * 1024;
+constexpr int    kWhoisDeadlineSec = 30;
+
 bool bulk_cymru_query(const std::vector<std::string>& ip_strings, int timeout_ms,
                        std::unordered_map<std::string, std::string>& out_labels) {
     int fd = connect_with_timeout("whois.cymru.com", kCymruWhoisPort, timeout_ms);
@@ -840,16 +946,18 @@ bool bulk_cymru_query(const std::vector<std::string>& ip_strings, int timeout_ms
     size_t sent = 0;
     while (sent < req.size()) {
         if (terminate_flag.load(std::memory_order_relaxed)) { close(fd); return false; }
-        ssize_t n = send(fd, req.data() + sent, req.size() - sent, 0);
+        const ssize_t n = send(fd, req.data() + sent, req.size() - sent, MSG_NOSIGNAL);
         if (n <= 0) { close(fd); return false; }
         sent += static_cast<size_t>(n);
     }
 
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kWhoisDeadlineSec);
     std::string resp;
     char buf[16384];
     for (;;) {
         if (terminate_flag.load(std::memory_order_relaxed)) break;
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (resp.size() > kMaxWhoisResponse || std::chrono::steady_clock::now() > deadline) break;
+        const ssize_t n = recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) break;
         resp.append(buf, static_cast<size_t>(n));
     }
@@ -859,7 +967,7 @@ bool bulk_cymru_query(const std::vector<std::string>& ip_strings, int timeout_ms
     size_t pos = 0;
     bool first = true;
     while (pos < resp.size()) {
-        size_t nl = resp.find('\n', pos);
+        const size_t nl = resp.find('\n', pos);
         std::string line = resp.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
         pos = (nl == std::string::npos) ? resp.size() : nl + 1;
         if (first) { first = false; continue; }
@@ -867,10 +975,10 @@ bool bulk_cymru_query(const std::vector<std::string>& ip_strings, int timeout_ms
         std::vector<std::string> f = split_pipe(line);
         if (f.size() < 7) continue;
         const std::string& asn = f[0];
-        const std::string& ip  = f[1];
-        const std::string& name = f[6];
         if (asn.empty() || asn == "NA") continue;
-        out_labels[ip] = name.empty() ? ("AS" + asn) : (name + " (AS" + asn + ")");
+        std::string name = f[6];
+        sanitize_inplace(name);
+        out_labels[f[1]] = name.empty() ? ("AS" + asn) : (name + " (AS" + asn + ")");
     }
     return true;
 }
@@ -974,42 +1082,78 @@ void resolve_owners(const std::vector<std::pair<std::string, uint32_t>>& v4_samp
     }
 }
 
-} 
+}
 
 namespace {
 
 enum class Kind { NwDb, ApnicDelegated, RirV4, RirV6 };
 
 struct Job {
-    char cc[3] = {0, 0, 0};       
+    char cc[3] = {0, 0, 0};
     bool want_v4 = true;
     bool want_v6 = true;
 };
 
-constexpr size_t kMaxLine        = 8 * 1024;             
-constexpr size_t kCapStreamBytes = 128u * 1024 * 1024;   
-constexpr size_t kCapPageBytes   = 4u * 1024 * 1024;     
+constexpr size_t kMaxLine         = 8 * 1024;
+constexpr size_t kCapStreamBytes  = 128u * 1024 * 1024;
+constexpr size_t kCapPageBytes    = 4u * 1024 * 1024;
+constexpr size_t kCapAsnPageBytes = 256u * 1024 * 1024;
+constexpr size_t kCapReplyBytes   = 8u * 1024 * 1024;
 
-struct Source {
-    Kind        kind;
-    const char* label;
+struct Xfer {
     std::string url;
-    const Job*  job = nullptr;
-    bool        streaming = true;
-    size_t      cap = kCapStreamBytes;
-
+    size_t      cap = kCapPageBytes;
+    bool        not_found_ok = false;
     CURL*       easy = nullptr;
-    std::string buf;                        
     size_t      total_bytes = 0;
+    long        http = 0;
+    double      secs = 0.0;
     bool        aborted = false;
     const char* abort_reason = nullptr;
-
-    std::vector<V4> v4;
-    std::vector<V6> v6;
     bool        done = false;
     bool        ok = false;
-    double      secs = 0.0;
-    std::string note;                       
+    std::string note;
+    std::string body;
+
+    virtual ~Xfer() = default;
+    virtual bool on_data(const char* p, size_t n) { body.append(p, n); return true; }
+    virtual void on_finish() {}
+    virtual void on_fail() { body.clear(); }
+    virtual void on_reset() {}
+
+    bool ingest(const char* p, size_t n) {
+        total_bytes += n;
+        if (total_bytes > cap) { aborted = true; abort_reason = "response too large"; return false; }
+        return on_data(p, n);
+    }
+
+    void reset() {
+        easy = nullptr;
+        total_bytes = 0;
+        http = 0;
+        secs = 0.0;
+        aborted = false;
+        abort_reason = nullptr;
+        done = false;
+        ok = false;
+        note.clear();
+        body.clear();
+        on_reset();
+    }
+};
+
+struct Source : Xfer {
+    Kind        kind = Kind::NwDb;
+    const char* label = "";
+    const Job*  job = nullptr;
+    bool        streaming = true;
+    std::string buf;
+    std::vector<V4> v4;
+    std::vector<V6> v6;
+
+    bool on_data(const char* p, size_t n) override;
+    void on_finish() override;
+    void on_fail() override { v4.clear(); v6.clear(); buf.clear(); }
 };
 
 size_t split_pipe(std::string_view line, std::string_view* f, size_t max) {
@@ -1028,7 +1172,7 @@ void apnic_line(Source& s, std::string_view line) {
     if (line[0] == '#') return;
     const size_t p1 = line.find('|');
     if (p1 == std::string_view::npos || p1 + 3 >= line.size()) return;
-    if (line[p1 + 3] != '|' || line[p1 + 1] != s.job->cc[0] || line[p1 + 2] != s.job->cc[1]) return;  
+    if (line[p1 + 3] != '|' || line[p1 + 1] != s.job->cc[0] || line[p1 + 2] != s.job->cc[1]) return;
 
     std::string_view f[8];
     if (split_pipe(line, f, 8) < 7) return;
@@ -1071,9 +1215,6 @@ void handle_line(Source& s, std::string_view line) {
 }
 
 bool feed(Source& s, const char* p, size_t len) {
-    s.total_bytes += len;
-    if (s.total_bytes > s.cap) { s.aborted = true; s.abort_reason = "response too large"; return false; }
-
     if (!s.streaming) { s.buf.append(p, len); return true; }
 
     size_t pos = 0;
@@ -1142,20 +1283,8 @@ void finish(Source& s) {
     s.buf.shrink_to_fit();
 }
 
-} 
-
-namespace {
-
-size_t write_cb(char* p, size_t sz, size_t nm, void* ud) {
-    auto* s = static_cast<Source*>(ud);
-    if (terminate_flag.load(std::memory_order_relaxed)) {
-        s->aborted = true;
-        s->abort_reason = "interrupted";
-        return 0;                                   
-    }
-    const size_t len = sz * nm;
-    return feed(*s, p, len) ? len : 0;
-}
+bool Source::on_data(const char* p, size_t n) { return feed(*this, p, n); }
+void Source::on_finish() { finish(*this); }
 
 #if LIBCURL_VERSION_NUM >= 0x074700
 const std::string* cached_ca_bundle() {
@@ -1180,22 +1309,33 @@ const std::string* cached_ca_bundle() {
 }
 #endif
 
-void setup_easy(Source& s, const Options& o, CURLSH* share) {
-    CURL* h = s.easy;
-    curl_easy_setopt(h, CURLOPT_URL, s.url.c_str());
-    curl_easy_setopt(h, CURLOPT_PRIVATE, &s);
-    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(h, CURLOPT_WRITEDATA, &s);
+size_t write_cb(char* p, size_t sz, size_t nm, void* ud) {
+    auto* x = static_cast<Xfer*>(ud);
+    if (terminate_flag.load(std::memory_order_relaxed)) {
+        x->aborted = true;
+        x->abort_reason = "interrupted";
+        return 0;
+    }
+    const size_t len = sz * nm;
+    return x->ingest(p, len) ? len : 0;
+}
 
-    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);                  
-    curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);               
-    curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");           
+void configure_easy(Xfer& x, const Options& o, CURLSH* share) {
+    CURL* h = x.easy;
+    curl_easy_setopt(h, CURLOPT_URL, x.url.c_str());
+    curl_easy_setopt(h, CURLOPT_PRIVATE, &x);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &x);
+
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(h, CURLOPT_BUFFERSIZE, 262144L);
     curl_easy_setopt(h, CURLOPT_USERAGENT, "Shiv-discover/1.0");
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, static_cast<long>(o.connect_timeout_sec));
     curl_easy_setopt(h, CURLOPT_TIMEOUT, static_cast<long>(o.total_timeout_sec));
-    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1024L);        
-    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, 20L);           
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, 20L);
     curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
@@ -1207,7 +1347,7 @@ void setup_easy(Source& s, const Options& o, CURLSH* share) {
         curl_easy_setopt(h, CURLOPT_CAINFO_BLOB, &blob);
     }
 #endif
-#if LIBCURL_VERSION_NUM >= 0x075500          
+#if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "https");
     curl_easy_setopt(h, CURLOPT_REDIR_PROTOCOLS_STR, "https");
 #else
@@ -1217,13 +1357,12 @@ void setup_easy(Source& s, const Options& o, CURLSH* share) {
 }
 
 CURLMcode wait_multi(CURLM* m, int ms, int* nfds) {
-#if LIBCURL_VERSION_NUM >= 0x074200          
+#if LIBCURL_VERSION_NUM >= 0x074200
     return curl_multi_poll(m, nullptr, 0, ms, nfds);
 #else
     return curl_multi_wait(m, nullptr, 0, ms, nfds);
 #endif
 }
-
 std::string nwdb_slug(const char* name) {
     std::string out;
     for (const char* p = name; *p; ++p) {
@@ -1234,60 +1373,146 @@ std::string nwdb_slug(const char* name) {
     while (!out.empty() && out.back() == '-') out.pop_back();
     return out;
 }
-
 bool err_tty() { static const bool t = isatty(STDERR_FILENO) != 0; return t; }
+bool out_tty() { static const bool t = isatty(STDOUT_FILENO) != 0; return t; }
 const char* col(const char* c) { return err_tty() ? c : ""; }
+const char* colo(const char* c) { return out_tty() ? c : ""; }
 constexpr const char* kReset = "\033[0m";
 constexpr const char* kGreen = "\033[32m";
 constexpr const char* kYellow = "\033[93m";
 constexpr const char* kRed = "\033[91m";
+constexpr const char* kBlue = "\033[94m";
 constexpr const char* kBold = "\033[1m";
 
-std::string human_bytes(size_t b) {
-    char buf[32];
-    if (b >= 1024u * 1024u) std::snprintf(buf, sizeof(buf), "%.1f MB", b / (1024.0 * 1024.0));
-    else if (b >= 1024u)    std::snprintf(buf, sizeof(buf), "%.1f KB", b / 1024.0);
-    else                    std::snprintf(buf, sizeof(buf), "%zu B", b);
-    return buf;
+std::string format_time() {
+    const std::time_t t = std::time(nullptr);
+    std::string s(std::ctime(&t));
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    return s;
 }
 
-void reap(CURLM* multi, size_t& finished) {
-    int left = 0;
-    while (CURLMsg* m = curl_multi_info_read(multi, &left)) {
-        if (m->msg != CURLMSG_DONE) continue;
-        char* priv = nullptr;
-        curl_easy_getinfo(m->easy_handle, CURLINFO_PRIVATE, &priv);
-        Source* s = reinterpret_cast<Source*>(priv);
-        curl_multi_remove_handle(multi, m->easy_handle);
-        if (!s) continue;
+using ProgressFn = std::function<void(size_t, size_t)>;
 
-        const CURLcode rc = m->data.result;
-        long http = 0;
-        curl_easy_getinfo(m->easy_handle, CURLINFO_RESPONSE_CODE, &http);
-        curl_easy_getinfo(m->easy_handle, CURLINFO_TOTAL_TIME, &s->secs);
+int run_transfers(const std::vector<Xfer*>& xs, const Options& o, size_t concurrency, const ProgressFn& progress) {
+    if (xs.empty()) return 0;
+    CURLM* multi = curl_multi_init();
+    if (!multi) return 1;
+    CURLSH* share = curl_share_init();
+    if (share) {
+        curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    }
+    if (concurrency == 0) concurrency = 1;
+    curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, static_cast<long>(concurrency));
 
-        s->done = true;
-        ++finished;
-        if (rc == CURLE_OK) {
-            finish(*s);
-            s->ok = s->note.empty();
-        } else {
-            s->ok = false;
-            if (s->aborted && s->abort_reason)      s->note = s->abort_reason;
-            else if (rc == CURLE_HTTP_RETURNED_ERROR) s->note = "HTTP " + std::to_string(http);
-            else                                     s->note = curl_easy_strerror(rc);
-            s->v4.clear();                                   
-            s->v6.clear();
+    size_t next = 0, active = 0, finished = 0;
+
+    auto launch = [&]() {
+        while (next < xs.size() && active < concurrency) {
+            Xfer* x = xs[next++];
+            x->easy = curl_easy_init();
+            if (!x->easy) {
+                x->done = true;
+                x->ok = false;
+                x->note = "curl_easy_init failed";
+                ++finished;
+                if (progress) progress(finished, xs.size());
+                continue;
+            }
+            configure_easy(*x, o, share);
+            curl_multi_add_handle(multi, x->easy);
+            ++active;
+            if (o.verbose) std::cerr << "[discover]   GET " << x->url << "\n";
+        }
+    };
+
+    auto reap = [&]() {
+        int left = 0;
+        while (CURLMsg* m = curl_multi_info_read(multi, &left)) {
+            if (m->msg != CURLMSG_DONE) continue;
+            CURL* h = m->easy_handle;
+            char* priv = nullptr;
+            curl_easy_getinfo(h, CURLINFO_PRIVATE, &priv);
+            Xfer* x = reinterpret_cast<Xfer*>(priv);
+            const CURLcode rc = m->data.result;
+            curl_multi_remove_handle(multi, h);
+            if (active > 0) --active;
+            ++finished;
+            if (x) {
+                long http = 0;
+                curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &http);
+                curl_easy_getinfo(h, CURLINFO_TOTAL_TIME, &x->secs);
+                x->http = http;
+                x->done = true;
+                x->easy = nullptr;
+                if (rc == CURLE_OK || (rc == CURLE_HTTP_RETURNED_ERROR && http == 404 && x->not_found_ok)) {
+                    x->on_finish();
+                    x->ok = x->note.empty();
+                } else {
+                    x->ok = false;
+                    if (x->aborted && x->abort_reason)        x->note = x->abort_reason;
+                    else if (rc == CURLE_HTTP_RETURNED_ERROR) x->note = "HTTP " + std::to_string(http);
+                    else                                       x->note = curl_easy_strerror(rc);
+                    x->on_fail();
+                }
+            }
+            curl_easy_cleanup(h);
+            if (progress) progress(finished, xs.size());
+        }
+    };
+
+    int running = 0;
+    while (!terminate_flag.load(std::memory_order_relaxed)) {
+        launch();
+        curl_multi_perform(multi, &running);
+        reap();
+        if (active == 0 && next >= xs.size()) break;
+        if (next < xs.size() && active < concurrency) continue;
+        int nfds = 0;
+        if (wait_multi(multi, 200, &nfds) != CURLM_OK) break;
+    }
+
+    for (Xfer* x : xs) {
+        if (x->easy) {
+            curl_multi_remove_handle(multi, x->easy);
+            curl_easy_cleanup(x->easy);
+            x->easy = nullptr;
         }
     }
+    curl_multi_cleanup(multi);
+    if (share) curl_share_cleanup(share);
+    return terminate_flag.load(std::memory_order_relaxed) ? 130 : 0;
 }
 
-}  
+struct CurlGlobal {
+    bool ok;
+    CurlGlobal() : ok(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK) {}
+    ~CurlGlobal() { if (ok) curl_global_cleanup(); }
+    CurlGlobal(const CurlGlobal&) = delete;
+    CurlGlobal& operator=(const CurlGlobal&) = delete;
+};
 
-int run(const Options& opts) {
-    CountryMatch m = resolve_country(opts.country);
+void save_file(const Options& o, const std::string& text) {
+    if (o.output_file.empty()) return;
+    std::ofstream f(o.output_file, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        std::cerr << col(kRed) << "[discover] cannot write '" << o.output_file << "'" << col(kReset) << "\n";
+        return;
+    }
+    f.write(text.data(), static_cast<std::streamsize>(text.size()));
+    std::cerr << "[discover] saved  : " << o.output_file << "\n";
+}
+
+void write_out(const Options& o, const std::string& text) {
+    std::cout.write(text.data(), static_cast<std::streamsize>(text.size()));
+    std::cout.flush();
+    save_file(o, text);
+}
+
+bool pick_country(const std::string& input, const Country*& out, CountryMatch::How& how) {
+    CountryMatch m = resolve_country(input);
     if (!m.country) {
-        std::cerr << col(kRed) << "[discover] unknown country '" << opts.country << "'" << col(kReset) << "\n";
+        std::cerr << col(kRed) << "[discover] unknown country '" << input << "'" << col(kReset) << "\n";
         if (!m.suggestions.empty()) {
             std::cerr << "[discover] did you mean:\n";
             for (const Country* c : m.suggestions)
@@ -1295,9 +1520,729 @@ int run(const Options& opts) {
         } else {
             std::cerr << "[discover] use a country name (\"nepal\", \"south korea\") or an ISO code (NP, NPL).\n";
         }
-        return 1;
+        return false;
     }
-    const Country& country = *m.country;
+    out = m.country;
+    how = m.how;
+    return true;
+}
+
+void print_country_line(const Country& country, CountryMatch::How how, const std::string& input) {
+    std::cerr << col(kBold) << "[discover] country : " << country.name << " (" << country.iso2 << ")" << col(kReset);
+    if (how == CountryMatch::How::Prefix) std::cerr << "   <- '" << input << "' matched by prefix";
+    if (how == CountryMatch::How::Fuzzy)  std::cerr << "   <- '" << input << "' corrected to closest name";
+    std::cerr << "\n";
+}
+
+std::string pad_right(const std::string& s, size_t w) {
+    std::string out = s;
+    if (out.size() < w) out.append(w - out.size(), ' ');
+    return out;
+}
+
+}
+
+namespace {
+
+struct Cleaned {
+    std::vector<std::string> tokens;
+    std::string compact;
+};
+
+constexpr std::string_view kNoise[] = {
+    "ag", "and", "bhd", "bv", "co", "company", "corp", "corporation", "gmbh", "inc", "incorporated",
+    "limited", "llc", "llp", "ltd", "of", "plc", "private", "pte", "pty", "pvt", "sa", "sdn", "the"
+};
+
+bool is_noise(std::string_view t) {
+    return std::binary_search(std::begin(kNoise), std::end(kNoise), t);
+}
+
+bool all_digits(std::string_view s) {
+    return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+std::string_view strip_owner_suffixes(std::string_view s) {
+    s = trim_sv(s);
+    if (!s.empty() && s.back() == ')') {
+        const size_t p = s.rfind("(AS");
+        if (p != std::string_view::npos && s.size() >= p + 4 && all_digits(s.substr(p + 3, s.size() - p - 4)))
+            s = trim_sv(s.substr(0, p));
+    }
+    const size_t comma = s.rfind(',');
+    if (comma != std::string_view::npos) {
+        const std::string_view cc = trim_sv(s.substr(comma + 1));
+        if (cc.size() == 2 && cc[0] >= 'A' && cc[0] <= 'Z' && cc[1] >= 'A' && cc[1] <= 'Z')
+            s = s.substr(0, comma);
+    }
+    return s;
+}
+
+struct OwnerLabelParts {
+    std::string_view org;
+    std::string_view country;
+    std::string_view asn_digits;
+};
+
+OwnerLabelParts split_owner_label(std::string_view s) {
+    OwnerLabelParts out;
+    s = trim_sv(s);
+    if (!s.empty() && s.back() == ')') {
+        const size_t p = s.rfind("(AS");
+        if (p != std::string_view::npos && s.size() >= p + 4 && all_digits(s.substr(p + 3, s.size() - p - 4))) {
+            out.asn_digits = s.substr(p + 3, s.size() - p - 4);
+            s = trim_sv(s.substr(0, p));
+        }
+    }
+    const size_t comma = s.rfind(',');
+    if (comma != std::string_view::npos) {
+        const std::string_view cc = trim_sv(s.substr(comma + 1));
+        if (cc.size() == 2 && cc[0] >= 'A' && cc[0] <= 'Z' && cc[1] >= 'A' && cc[1] <= 'Z') {
+            out.country = cc;
+            s = trim_sv(s.substr(0, comma));
+        }
+    }
+    out.org = s;
+    return out;
+}
+
+struct OwnerRow {
+    std::string asn, range, country, org;
+};
+
+void collect_owner_rows(const std::vector<std::pair<std::string, uint32_t>>& v4_samples,
+                        const std::vector<std::string>& v4_labels,
+                        const std::vector<std::pair<std::string, u128>>& v6_samples,
+                        const std::vector<std::string>& v6_labels,
+                        const std::vector<char>* keep4, const std::vector<char>* keep6,
+                        std::vector<OwnerRow>& rows) {
+    auto add = [&](const std::string& range, const std::string& label) {
+        OwnerRow r;
+        r.range = range;
+        if (!label.empty()) {
+            const OwnerLabelParts p = split_owner_label(label);
+            r.org = std::string(p.org);
+            r.country = std::string(p.country);
+            if (!p.asn_digits.empty()) r.asn = "(AS" + std::string(p.asn_digits) + ")";
+        }
+        rows.push_back(std::move(r));
+    };
+    for (size_t i = 0; i < v4_samples.size(); ++i) {
+        if (keep4 && !(*keep4)[i]) continue;
+        add(v4_samples[i].first, v4_labels[i]);
+    }
+    for (size_t i = 0; i < v6_samples.size(); ++i) {
+        if (keep6 && !(*keep6)[i]) continue;
+        add(v6_samples[i].first, v6_labels[i]);
+    }
+}
+
+constexpr size_t kAsnColMin = 16, kRangeColMin = 28, kCountryColMin = 16;
+
+void render_owner_table(const std::vector<OwnerRow>& rows, bool color, std::string& out, bool with_range = true) {
+    size_t w1 = kAsnColMin, w2 = kRangeColMin, w3 = kCountryColMin;
+    for (const OwnerRow& r : rows) {
+        w1 = std::max(w1, r.asn.size() + 2);
+        if (with_range) w2 = std::max(w2, r.range.size() + 2);
+        w3 = std::max(w3, r.country.size() + 2);
+    }
+    if (color) out += colo(kGreen);
+    out += pad_right("ASN", w1);
+    if (with_range) out += pad_right("RANGE", w2);
+    out += pad_right("COUNTRY", w3);
+    out += "ORGANIZATION";
+    if (color) out += colo(kReset);
+    out += "\n\n";
+    for (const OwnerRow& r : rows) {
+        if (color) out += colo(kBlue);
+        out += pad_right(r.asn, w1);
+        if (color) out += colo(kReset);
+        if (with_range) out += pad_right(r.range, w2);
+        out += pad_right(r.country, w3);
+        if (color) out += colo(kYellow);
+        out += r.org;
+        if (color) out += colo(kReset);
+        out += "\n";
+    }
+}
+
+bool is_iso2(std::string_view s) {
+    if (s.size() != 2) return false;
+    for (const Country& c : kCountries)
+        if (c.iso2[0] == s[0] && c.iso2[1] == s[1]) return true;
+    return false;
+}
+
+void split_trailing_cc(std::string& name, std::string& cc) {
+    cc.clear();
+    const size_t n = name.size();
+    if (n < 4 || !is_iso2(std::string_view(name).substr(n - 2))) return;
+    size_t cut;
+    if (name[n - 3] == ',') cut = n - 3;
+    else if (n >= 5 && name[n - 3] == ' ' && name[n - 4] == ',') cut = n - 4;
+    else return;
+    cc = name.substr(n - 2);
+    name.resize(cut);
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+}
+
+Cleaned clean_name(std::string_view in, bool fallback_all) {
+    std::vector<std::string> raw;
+    tokenize(strip_owner_suffixes(in), raw);
+    Cleaned out;
+    out.tokens.reserve(raw.size());
+    for (const std::string& t : raw)
+        if (!is_noise(t)) out.tokens.push_back(t);
+    if (out.tokens.empty() && fallback_all) out.tokens = raw;
+    size_t n = 0;
+    for (const std::string& t : out.tokens) n += t.size();
+    out.compact.reserve(n);
+    for (const std::string& t : out.tokens) out.compact += t;
+    return out;
+}
+
+int tol_for(size_t len) { return len <= 3 ? 0 : (len <= 7 ? 1 : 2); }
+
+bool token_matches(const std::string& q, const std::string& t, bool fuzzy) {
+    if (q == t) return true;
+    if (!fuzzy) return q.size() >= 3 && t.size() > q.size() && t.compare(0, q.size(), q) == 0;
+    const int tol = tol_for(q.size());
+    return tol > 0 && edit_distance(q, t, tol) <= tol;
+}
+
+bool all_tokens_match(const Cleaned& q, const Cleaned& o, bool fuzzy) {
+    for (const std::string& qt : q.tokens) {
+        bool hit = false;
+        for (const std::string& ot : o.tokens) {
+            if (token_matches(qt, ot, fuzzy)) { hit = true; break; }
+        }
+        if (!hit) return false;
+    }
+    return true;
+}
+
+int org_score(const Cleaned& q, const Cleaned& o) {
+    if (q.tokens.empty() || o.tokens.empty()) return 0;
+    if (q.tokens == o.tokens) return 5;
+    if (q.compact.size() >= 4 && o.compact.find(q.compact) != std::string::npos) return 4;
+    if (all_tokens_match(q, o, false)) return 3;
+    if (all_tokens_match(q, o, true)) return 2;
+    if (q.compact.size() >= 5) {
+        const int tol = tol_for(q.compact.size());
+        if (approx_sub(q.compact, o.compact, tol) <= tol) return 1;
+    }
+    return 0;
+}
+
+int keep_threshold(int best) { return best >= 3 ? 3 : 1; }
+
+struct Nearest {
+    static constexpr size_t kMax = 5;
+    std::vector<std::pair<int, std::string>> items;
+
+    void offer(int d, const std::string& s) {
+        if (items.size() == kMax && d >= items.back().first) return;
+        for (const auto& it : items)
+            if (it.second == s) return;
+        auto pos = std::upper_bound(items.begin(), items.end(), d,
+                                    [](int v, const std::pair<int, std::string>& p) { return v < p.first; });
+        items.insert(pos, {d, s});
+        if (items.size() > kMax) items.pop_back();
+    }
+};
+
+uint32_t label_asn(std::string_view label) {
+    const size_t p = label.rfind("(AS");
+    if (p == std::string_view::npos || label.empty() || label.back() != ')' || label.size() < p + 4) return 0;
+    uint64_t v = 0;
+    if (!parse_u64(label.substr(p + 3, label.size() - p - 4), v) || v == 0 || v > 0xFFFFFFFFull) return 0;
+    return static_cast<uint32_t>(v);
+}
+
+bool parse_asn_arg(std::string_view in, uint32_t& asn) {
+    in = trim_sv(in);
+    if (in.size() >= 2 && lower_ascii(in[0]) == 'a' && lower_ascii(in[1]) == 's') in.remove_prefix(2);
+    uint64_t v = 0;
+    if (in.size() > 10 || !parse_u64(in, v) || v == 0 || v > 0xFFFFFFFFull) return false;
+    asn = static_cast<uint32_t>(v);
+    return true;
+}
+
+struct OwnerMatcher {
+    Cleaned  q;
+    uint32_t asn = 0;
+
+    int score(const std::string& label) const {
+        if (asn) return label_asn(label) == asn ? 5 : 0;
+        return org_score(q, clean_name(label, true));
+    }
+};
+
+bool make_owner_matcher(const std::string& name, OwnerMatcher& m) {
+    uint32_t asn = 0;
+    if (parse_asn_arg(name, asn)) { m.asn = asn; return true; }
+    m.q = clean_name(name, false);
+    return !m.q.tokens.empty();
+}
+
+struct OwnerFilter {
+    std::vector<char> keep4, keep6;
+    size_t kept_orgs = 0;
+    int    best = 0;
+    Nearest nearest;
+};
+
+void apply_owner_filter(const OwnerMatcher& m, const std::vector<std::string>& l4,
+                        const std::vector<std::string>& l6, OwnerFilter& f) {
+    std::unordered_map<std::string, int> cache;
+    auto score_of = [&](const std::string& label) -> int {
+        if (label.empty()) return 0;
+        auto it = cache.find(label);
+        if (it != cache.end()) return it->second;
+        const int s = m.score(label);
+        cache.emplace(label, s);
+        return s;
+    };
+    for (const auto& l : l4) f.best = std::max(f.best, score_of(l));
+    for (const auto& l : l6) f.best = std::max(f.best, score_of(l));
+    f.keep4.assign(l4.size(), 0);
+    f.keep6.assign(l6.size(), 0);
+    if (f.best == 0) {
+        if (m.asn == 0) {
+            for (const auto& kv : cache) {
+                const Cleaned c = clean_name(kv.first, true);
+                const int d = approx_sub(m.q.compact, c.compact, 4);
+                if (d <= 4) f.nearest.offer(d, kv.first);
+            }
+        }
+        return;
+    }
+    const int th = keep_threshold(f.best);
+    std::unordered_set<std::string> orgs;
+    for (size_t i = 0; i < l4.size(); ++i)
+        if (score_of(l4[i]) >= th) { f.keep4[i] = 1; orgs.insert(l4[i]); }
+    for (size_t i = 0; i < l6.size(); ++i)
+        if (score_of(l6[i]) >= th) { f.keep6[i] = 1; orgs.insert(l6[i]); }
+    f.kept_orgs = orgs.size();
+}
+
+[[maybe_unused]] uint64_t v4_cidr_size(const std::string& cidr) {
+    const size_t slash = cidr.find('/');
+    uint64_t p = 32;
+    if (slash != std::string::npos) parse_u64(std::string_view(cidr).substr(slash + 1), p);
+    return p > 32 ? 0 : (1ULL << (32 - p));
+}
+
+}
+
+namespace {
+
+struct AsnRow {
+    std::string asn, name, c3, c4;
+};
+
+void append_utf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0x10FFFF) {
+        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+bool ci_starts(std::string_view s, size_t pos, std::string_view lit) {
+    if (pos + lit.size() > s.size()) return false;
+    for (size_t i = 0; i < lit.size(); ++i)
+        if (lower_ascii(s[pos + i]) != lit[i]) return false;
+    return true;
+}
+
+bool tag_boundary(char c) {
+    return c == '>' || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '/';
+}
+
+size_t find_open_tag(std::string_view s, std::string_view name, size_t from) {
+    for (;;) {
+        const size_t p = s.find('<', from);
+        if (p == std::string_view::npos) return p;
+        if (ci_starts(s, p + 1, name)) {
+            const size_t after = p + 1 + name.size();
+            if (after >= s.size()) return std::string_view::npos;
+            if (tag_boundary(s[after])) return p;
+        }
+        from = p + 1;
+    }
+}
+
+size_t find_close_tag(std::string_view s, std::string_view name, size_t from) {
+    for (;;) {
+        const size_t p = s.find("</", from);
+        if (p == std::string_view::npos) return p;
+        if (ci_starts(s, p + 2, name)) {
+            const size_t after = p + 2 + name.size();
+            if (after >= s.size() || tag_boundary(s[after])) return p;
+        }
+        from = p + 2;
+    }
+}
+
+bool decode_entity(std::string_view ent, uint32_t& cp) {
+    if (ent == "amp") { cp = '&'; return true; }
+    if (ent == "lt") { cp = '<'; return true; }
+    if (ent == "gt") { cp = '>'; return true; }
+    if (ent == "quot") { cp = '"'; return true; }
+    if (ent == "apos") { cp = '\''; return true; }
+    if (ent == "nbsp") { cp = ' '; return true; }
+    if (ent.size() >= 2 && ent[0] == '#') {
+        uint64_t v = 0;
+        std::string_view digits = ent.substr(1);
+        int base = 10;
+        if (!digits.empty() && (digits[0] == 'x' || digits[0] == 'X')) { base = 16; digits.remove_prefix(1); }
+        if (digits.empty() || digits.size() > 7) return false;
+        auto r = std::from_chars(digits.data(), digits.data() + digits.size(), v, base);
+        if (r.ec != std::errc() || r.ptr != digits.data() + digits.size() || v > 0x10FFFF) return false;
+        cp = static_cast<uint32_t>(v);
+        return true;
+    }
+    return false;
+}
+
+std::string html_text(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    bool pending_space = false;
+    auto put = [&](char c) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { pending_space = !out.empty(); return; }
+        if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) return;
+        if (pending_space) { out.push_back(' '); pending_space = false; }
+        out.push_back(c);
+    };
+    for (size_t i = 0; i < s.size();) {
+        const char c = s[i];
+        if (c == '<') {
+            const size_t e = s.find('>', i);
+            if (e == std::string_view::npos) break;
+            i = e + 1;
+            continue;
+        }
+        if (c == '&') {
+            const size_t semi = s.find(';', i);
+            uint32_t cp = 0;
+            if (semi != std::string_view::npos && semi - i <= 10 && decode_entity(s.substr(i + 1, semi - i - 1), cp)) {
+                std::string tmp;
+                append_utf8(tmp, cp == 0xA0 ? ' ' : cp);
+                for (char t : tmp) put(t);
+                i = semi + 1;
+                continue;
+            }
+        }
+        put(c);
+        ++i;
+    }
+    return out;
+}
+
+bool valid_asn_cell(const std::string& s) {
+    return s.size() >= 3 && s.size() <= 12 && lower_ascii(s[0]) == 'a' && lower_ascii(s[1]) == 's' &&
+           all_digits(std::string_view(s).substr(2));
+}
+
+constexpr size_t kMaxRowsPerPage = 200000;
+constexpr size_t kMaxAsnRowBytes = 256u * 1024;
+constexpr size_t kStreamTail     = 16;
+
+bool parse_asn_row(std::string_view row, AsnRow& out) {
+    std::string cells[4];
+    size_t n = 0, cp = 0;
+    while (n < 4 && (cp = find_open_tag(row, "td", cp)) != std::string_view::npos) {
+        const size_t gt = row.find('>', cp);
+        if (gt == std::string_view::npos) break;
+        const size_t ce = find_close_tag(row, "td", gt);
+        cells[n++] = html_text(row.substr(gt + 1, ce == std::string_view::npos ? std::string_view::npos : ce - gt - 1));
+        cp = (ce == std::string_view::npos) ? row.size() : ce + 4;
+    }
+    if (n < 2 || !valid_asn_cell(cells[0]) || cells[1].empty()) return false;
+    sanitize_inplace(cells[1]);
+    if (cells[1].empty()) return false;
+    AsnRow r;
+    r.asn = std::move(cells[0]);
+    r.asn[0] = 'A';
+    r.asn[1] = 'S';
+    r.name = std::move(cells[1]);
+    if (all_digits(cells[2]) && cells[2].size() <= 10) r.c3 = std::move(cells[2]);
+    if (all_digits(cells[3]) && cells[3].size() <= 10) r.c4 = std::move(cells[3]);
+    out = std::move(r);
+    return true;
+}
+
+[[maybe_unused]] void parse_asn_rows(std::string_view body, std::vector<AsnRow>& rows) {
+    std::string_view scope = body;
+    const size_t tb = find_open_tag(body, "tbody", 0);
+    if (tb != std::string_view::npos) {
+        const size_t te = find_close_tag(body, "tbody", tb);
+        scope = body.substr(tb, te == std::string_view::npos ? std::string_view::npos : te - tb);
+    }
+    size_t pos = 0;
+    while (rows.size() < kMaxRowsPerPage && (pos = find_open_tag(scope, "tr", pos)) != std::string_view::npos) {
+        const size_t tr_end = find_close_tag(scope, "tr", pos);
+        const std::string_view row = scope.substr(pos, tr_end == std::string_view::npos ? std::string_view::npos : tr_end - pos);
+        pos = (tr_end == std::string_view::npos) ? scope.size() : tr_end + 4;
+        AsnRow r;
+        if (parse_asn_row(row, r)) rows.push_back(std::move(r));
+    }
+}
+
+struct AsnRowStream {
+    enum class State { Pre, Body, Done };
+    State                state = State::Pre;
+    std::string          carry;
+    std::vector<AsnRow>  pre_rows;
+    std::vector<AsnRow>  rows;
+
+    void reset() {
+        state = State::Pre;
+        std::string().swap(carry);
+        std::vector<AsnRow>().swap(pre_rows);
+        std::vector<AsnRow>().swap(rows);
+    }
+
+    bool feed(std::string_view chunk) {
+        if (state == State::Done) return true;
+        carry.append(chunk.data(), chunk.size());
+        const std::string_view sv(carry);
+        size_t pos = 0;
+        for (;;) {
+            const size_t tr = find_open_tag(sv, "tr", pos);
+            const std::string_view region = (tr == std::string_view::npos) ? sv : sv.substr(0, tr);
+            if (state == State::Pre) {
+                const size_t tb = find_open_tag(region, "tbody", pos);
+                if (tb != std::string_view::npos) {
+                    state = State::Body;
+                    std::vector<AsnRow>().swap(pre_rows);
+                    pos = tb + 6;
+                    continue;
+                }
+            }
+            if (state == State::Body) {
+                const size_t te = find_close_tag(region, "tbody", pos);
+                if (te != std::string_view::npos) {
+                    state = State::Done;
+                    std::string().swap(carry);
+                    return true;
+                }
+            }
+            if (tr == std::string_view::npos) {
+                if (sv.size() > kStreamTail) pos = std::max(pos, sv.size() - kStreamTail);
+                break;
+            }
+            const size_t end = find_close_tag(sv, "tr", tr);
+            if (end == std::string_view::npos) { pos = tr; break; }
+            AsnRow r;
+            if (parse_asn_row(sv.substr(tr, end - tr), r)) {
+                std::vector<AsnRow>& dst = (state == State::Pre) ? pre_rows : rows;
+                if (dst.size() >= kMaxRowsPerPage) {
+                    state = State::Done;
+                    std::string().swap(carry);
+                    return true;
+                }
+                dst.push_back(std::move(r));
+            }
+            pos = end + 4;
+        }
+        carry.erase(0, pos);
+        return carry.size() <= kMaxAsnRowBytes;
+    }
+
+    void finish() {
+        if (state != State::Done && !carry.empty()) {
+            const std::string_view sv(carry);
+            const size_t tr = find_open_tag(sv, "tr", 0);
+            if (tr != std::string_view::npos) {
+                AsnRow r;
+                if (parse_asn_row(sv.substr(tr), r))
+                    (state == State::Pre ? pre_rows : rows).push_back(std::move(r));
+            }
+        }
+        if (state == State::Pre) rows.swap(pre_rows);
+        std::string().swap(carry);
+    }
+};
+
+bool is_domain_line(std::string_view l) {
+    if (l.empty() || l.size() > 300) return false;
+    bool dot = false;
+    for (char ch : l) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (c == '.') dot = true;
+        else if (!(is_alnum_ascii(c) || c == '-' || c == '_' || c == '*' || c == ',')) return false;
+    }
+    return dot;
+}
+
+constexpr size_t kMaxDomains = 200000;
+
+bool parse_reverse_body(std::string_view body, std::vector<std::string>& domains, std::string& message) {
+    std::unordered_set<std::string> seen;
+    bool first = true;
+    size_t pos = 0;
+    while (pos < body.size() && domains.size() < kMaxDomains) {
+        const size_t nl = body.find('\n', pos);
+        std::string_view line = body.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
+        pos = (nl == std::string_view::npos) ? body.size() : nl + 1;
+        line = trim_sv(line);
+        if (line.empty()) continue;
+        if (!is_domain_line(line)) {
+            if (first) {
+                message.assign(line.substr(0, 200));
+                sanitize_inplace(message);
+                return false;
+            }
+            continue;
+        }
+        first = false;
+        std::string d(line);
+        if (seen.insert(d).second) domains.push_back(std::move(d));
+    }
+    return true;
+}
+
+bool normalize_range24(std::string_view in, std::string& out, bool& adjusted) {
+    in = trim_sv(in);
+    const size_t slash = in.find('/');
+    if (slash == std::string_view::npos) return false;
+    uint32_t base = 0;
+    uint64_t len = 0;
+    if (!parse_v4_addr(in.substr(0, slash), base) || !parse_u64(in.substr(slash + 1), len) || len != 24) return false;
+    adjusted = (base & 0xFFu) != 0;
+    out = v4_to_string(base & 0xFFFFFF00u) + "/24";
+    return true;
+}
+
+void json_skip_ws(std::string_view s, size_t& p) {
+    while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r' || s[p] == '\n')) ++p;
+}
+
+bool json_hex4(std::string_view s, size_t& p, uint32_t& out) {
+    if (p + 4 > s.size()) return false;
+    uint64_t v = 0;
+    auto r = std::from_chars(s.data() + p, s.data() + p + 4, v, 16);
+    if (r.ec != std::errc() || r.ptr != s.data() + p + 4) return false;
+    out = static_cast<uint32_t>(v);
+    p += 4;
+    return true;
+}
+
+bool json_read_string(std::string_view s, size_t& p, std::string& out) {
+    if (p >= s.size() || s[p] != '"') return false;
+    ++p;
+    out.clear();
+    while (p < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[p++]);
+        if (c == '"') return true;
+        if (out.size() > 4096 || c < 0x20) return false;
+        if (c != '\\') { out.push_back(static_cast<char>(c)); continue; }
+        if (p >= s.size()) return false;
+        const char e = s[p++];
+        switch (e) {
+            case '"':  out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/':  out.push_back('/'); break;
+            case 'b':  out.push_back('\b'); break;
+            case 'f':  out.push_back('\f'); break;
+            case 'n':  out.push_back('\n'); break;
+            case 'r':  out.push_back('\r'); break;
+            case 't':  out.push_back('\t'); break;
+            case 'u': {
+                uint32_t cp = 0;
+                if (!json_hex4(s, p, cp)) return false;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    uint32_t lo = 0;
+                    size_t q = p + 2;
+                    if (p + 1 < s.size() && s[p] == '\\' && s[p + 1] == 'u' && json_hex4(s, q, lo) &&
+                        lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        p = q;
+                    } else {
+                        cp = '?';
+                    }
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    cp = '?';
+                }
+                append_utf8(out, cp);
+                break;
+            }
+            default: return false;
+        }
+    }
+    return false;
+}
+
+bool json_find_string(std::string_view s, std::string_view key, std::string& out) {
+    std::string needle = "\"";
+    needle += key;
+    needle += '"';
+    size_t from = 0;
+    while ((from = s.find(needle, from)) != std::string_view::npos) {
+        size_t p = from + needle.size();
+        from = p;
+        json_skip_ws(s, p);
+        if (p >= s.size() || s[p] != ':') continue;
+        ++p;
+        json_skip_ws(s, p);
+        if (json_read_string(s, p, out)) return true;
+    }
+    return false;
+}
+
+constexpr size_t kMaxRoutes = 200000;
+
+bool json_string_array(std::string_view s, size_t from, std::string_view key, std::vector<std::string>& out) {
+    std::string needle = "\"";
+    needle += key;
+    needle += '"';
+    size_t f = s.find(needle, from);
+    while (f != std::string_view::npos) {
+        size_t p = f + needle.size();
+        json_skip_ws(s, p);
+        if (p < s.size() && s[p] == ':') {
+            ++p;
+            json_skip_ws(s, p);
+            if (p < s.size() && s[p] == '[') {
+                ++p;
+                for (;;) {
+                    json_skip_ws(s, p);
+                    if (p >= s.size()) return false;
+                    if (s[p] == ']') return true;
+                    if (s[p] == ',') { ++p; continue; }
+                    std::string v;
+                    if (!json_read_string(s, p, v) || out.size() >= kMaxRoutes) return false;
+                    out.push_back(std::move(v));
+                }
+            }
+        }
+        f = s.find(needle, f + needle.size());
+    }
+    return false;
+}
+
+}
+
+namespace {
+
+int run_ranges(const Options& opts) {
+    const Country* cp = nullptr;
+    CountryMatch::How how = CountryMatch::How::None;
+    if (!pick_country(opts.country, cp, how)) return 1;
+    const Country& country = *cp;
 
     Job job;
     job.cc[0] = country.iso2[0];
@@ -1308,17 +2253,32 @@ int run(const Options& opts) {
         std::cerr << "[discover] nothing to do: both IPv4 and IPv6 are disabled\n";
         return 1;
     }
-    const std::string cc_lower = [&] { std::string s(country.iso2); for (char& c : s) c = lower_ascii(c); return s; }();
 
-    std::cerr << col(kBold) << "[discover] country : " << country.name << " (" << country.iso2 << ")" << col(kReset);
-    if (m.how == CountryMatch::How::Prefix) std::cerr << "   <- '" << opts.country << "' matched by prefix";
-    if (m.how == CountryMatch::How::Fuzzy)  std::cerr << "   <- '" << opts.country << "' corrected to closest name";
-    std::cerr << "\n";
+    const bool filtering = opts.owner && !opts.owner_name.empty();
+    OwnerMatcher matcher;
+    if (filtering && !make_owner_matcher(opts.owner_name, matcher)) {
+        std::cerr << col(kRed) << "[discover] --owner: '" << opts.owner_name << "' has no searchable words"
+                  << col(kReset) << "\n";
+        return 1;
+    }
+
+    const std::string cc_lower = [&] {
+        std::string s(country.iso2);
+        for (char& c : s) c = lower_ascii(c);
+        return s;
+    }();
+
+    print_country_line(country, how, opts.country);
+
     std::vector<std::unique_ptr<Source>> sources;
     auto add = [&](Kind k, const char* label, std::string url, bool streaming, size_t cap) {
         auto s = std::make_unique<Source>();
-        s->kind = k; s->label = label; s->url = std::move(url);
-        s->job = &job; s->streaming = streaming; s->cap = cap;
+        s->kind = k;
+        s->label = label;
+        s->url = std::move(url);
+        s->job = &job;
+        s->streaming = streaming;
+        s->cap = cap;
         sources.push_back(std::move(s));
     };
     if (job.want_v4)
@@ -1328,75 +2288,29 @@ int run(const Options& opts) {
         add(Kind::RirV4, "rir-list-v4", "https://www-public.telecom-sudparis.eu/~maigron/rir-stats/rir-delegations/ip-lists/ipv4/" + cc_lower + "-ipv4-list.txt", true, kCapStreamBytes);
     if (job.want_v6)
         add(Kind::RirV6, "rir-list-v6", "https://www-public.telecom-sudparis.eu/~maigron/rir-stats/rir-delegations/ip-lists/ipv6/" + cc_lower + "-ipv6-list.txt", true, kCapStreamBytes);
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-        std::cerr << col(kRed) << "[discover] curl_global_init failed" << col(kReset) << "\n";
-        return 1;
-    }
-    CURLM* multi = curl_multi_init();
-    if (!multi) {
-        std::cerr << col(kRed) << "[discover] curl_multi_init failed" << col(kReset) << "\n";
-        curl_global_cleanup();
-        return 1;
-    }
-    CURLSH* share = curl_share_init();
-    if (share) {
-        curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
-        curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
-    }
-    for (auto& s : sources) {
-        s->easy = curl_easy_init();
-        if (!s->easy) { s->done = true; s->note = "curl_easy_init failed"; continue; }
-        setup_easy(*s, opts, share);
-        curl_multi_add_handle(multi, s->easy);
-        if (opts.verbose) std::cerr << "[discover]   GET " << s->url << "\n";
-    }
-    std::cerr << "[discover] fetching " << sources.size() << " endpoints in parallel...\n";
-    size_t finished = 0;
-    for (auto& s : sources) if (s->done) ++finished;     
 
-    int running = 0;
-    curl_multi_perform(multi, &running);
-    reap(multi, finished);
-    while (running > 0 && !terminate_flag.load(std::memory_order_relaxed)) {
-        int nfds = 0;
-        if (wait_multi(multi, 200, &nfds) != CURLM_OK) break;     
-        curl_multi_perform(multi, &running);
-        reap(multi, finished);
-    }
-    const bool interrupted = terminate_flag.load(std::memory_order_relaxed);
-    for (auto& s : sources) {
-        if (s->easy) {
-            if (!s->done) curl_multi_remove_handle(multi, s->easy);
-            curl_easy_cleanup(s->easy);
-            s->easy = nullptr;
-        }
-    }
-    curl_multi_cleanup(multi);
-    if (share) curl_share_cleanup(share);
-    curl_global_cleanup();
+    std::vector<Xfer*> xs;
+    xs.reserve(sources.size());
+    for (auto& s : sources) xs.push_back(s.get());
 
-    if (interrupted) {
+    const int rc = run_transfers(xs, opts, xs.size(), nullptr);
+    if (rc == 130) {
         std::cerr << "[discover] interrupted - transfers aborted, partial results discarded\n";
         return 130;
+    }
+    if (rc != 0) {
+        std::cerr << col(kRed) << "[discover] curl_multi_init failed" << col(kReset) << "\n";
+        return 1;
     }
 
     size_t ok_count = 0;
     std::vector<V4> all_v4;
     std::vector<V6> all_v6;
     for (auto& s : sources) {
-        char line[160];
         if (s->ok) {
             ++ok_count;
-            std::snprintf(line, sizeof(line), "[discover]   %sok%s    %-16s %9s  %6zu v4  %6zu v6  %.2fs",
-                          col(kGreen), col(kReset), s->label, human_bytes(s->total_bytes).c_str(),
-                          s->v4.size(), s->v6.size(), s->secs);
-            std::cerr << line << "\n";
             all_v4.insert(all_v4.end(), s->v4.begin(), s->v4.end());
             all_v6.insert(all_v6.end(), s->v6.begin(), s->v6.end());
-        } else {
-            std::snprintf(line, sizeof(line), "[discover]   %sskip%s  %-16s %s",
-                          col(kYellow), col(kReset), s->label, s->note.c_str());
-            std::cerr << line << "\n";
         }
     }
     if (ok_count == 0) {
@@ -1404,22 +2318,17 @@ int run(const Options& opts) {
         return 1;
     }
 
-    const size_t raw_v4 = all_v4.size(), raw_v6 = all_v6.size();
     std::string text;
     size_t out_v4 = 0, out_v6 = 0;
-    uint64_t addr_v4 = 0;
     std::vector<std::pair<std::string, uint32_t>> v4_samples;
     std::vector<std::pair<std::string, u128>>     v6_samples;
     if (job.want_v4) {
         std::vector<V4> merged = merge_v4(std::move(all_v4));
-        for (const V4& iv : merged) {
-            addr_v4 += static_cast<uint64_t>(iv.second) - iv.first + 1;
-            out_v4 += emit_v4(iv, text, opts.owner ? &v4_samples : nullptr);
-        }
+        for (const V4& iv : merged) out_v4 += emit_v4(iv, opts.owner ? nullptr : &text, opts.owner ? &v4_samples : nullptr);
     }
     if (job.want_v6) {
         std::vector<V6> merged = merge_v6(std::move(all_v6));
-        for (const V6& iv : merged) out_v6 += emit_v6(iv, text, opts.owner ? &v6_samples : nullptr);
+        for (const V6& iv : merged) out_v6 += emit_v6(iv, opts.owner ? nullptr : &text, opts.owner ? &v6_samples : nullptr);
     }
 
     if (out_v4 + out_v6 == 0) {
@@ -1427,53 +2336,416 @@ int run(const Options& opts) {
         return 1;
     }
 
-    if (opts.owner) {
-        std::cerr << "[discover] resolving owners for " << (out_v4 + out_v6)
-                   << " ranges (1 sample IP per range, Team Cymru ASN lookup)...\n";
-        std::vector<std::string> v4_labels, v6_labels;
-        size_t owners_resolved = 0, owners_attempted = 0;
-        resolve_owners(v4_samples, v6_samples, opts, v4_labels, v6_labels, owners_resolved, owners_attempted);
-
-        std::string annotated;
-        annotated.reserve(text.size() + owners_attempted * 24);
-        for (size_t i = 0; i < v4_samples.size(); ++i) {
-            annotated += v4_samples[i].first;
-            if (!v4_labels[i].empty()) { annotated += "  # "; annotated += v4_labels[i]; }
-            annotated += '\n';
-        }
-        for (size_t i = 0; i < v6_samples.size(); ++i) {
-            annotated += v6_samples[i].first;
-            if (!v6_labels[i].empty()) { annotated += "  # "; annotated += v6_labels[i]; }
-            annotated += '\n';
-        }
-        text = std::move(annotated);
-        std::cerr << "[discover] owners  : " << owners_resolved << "/" << owners_attempted << " ranges resolved\n";
+    if (!opts.owner) {
+        write_out(opts, text);
+        return 0;
     }
 
-    std::cout.write(text.data(), static_cast<std::streamsize>(text.size()));
+    std::vector<std::string> v4_labels, v6_labels;
+    size_t owners_resolved = 0, owners_attempted = 0;
+    resolve_owners(v4_samples, v6_samples, opts, v4_labels, v6_labels, owners_resolved, owners_attempted);
+    (void)owners_resolved;
+    (void)owners_attempted;
+
+    OwnerFilter flt;
+    if (filtering) {
+        apply_owner_filter(matcher, v4_labels, v6_labels, flt);
+        if (flt.best == 0) {
+            std::cerr << col(kYellow) << "[discover] no range owner matched '" << opts.owner_name << "'" << col(kReset) << "\n";
+            if (!flt.nearest.items.empty()) {
+                std::cerr << "[discover] did you mean:\n";
+                for (const auto& it : flt.nearest.items) std::cerr << "             " << it.second << "\n";
+            }
+            return 1;
+        }
+        if (flt.best < 3)
+            std::cerr << "[discover] no exact owner match - showing closest (typo-tolerant) matches\n";
+    }
+
+    std::vector<OwnerRow> rows;
+    collect_owner_rows(v4_samples, v4_labels, v6_samples, v6_labels,
+                       filtering ? &flt.keep4 : nullptr, filtering ? &flt.keep6 : nullptr, rows);
+
+    std::string colored, plain;
+    render_owner_table(rows, true, colored);
+    render_owner_table(rows, false, plain);
+    std::cout << colored;
     std::cout.flush();
-
-    if (!opts.output_file.empty()) {
-        std::ofstream f(opts.output_file, std::ios::binary | std::ios::trunc);
-        if (!f) std::cerr << col(kRed) << "[discover] cannot write '" << opts.output_file << "'" << col(kReset) << "\n";
-        else { f.write(text.data(), static_cast<std::streamsize>(text.size())); std::cerr << "[discover] saved  : " << opts.output_file << "\n"; }
-    }
-
-    std::cerr << col(kBold) << "[discover] result  : " << col(kReset);
-    if (job.want_v4) std::cerr << out_v4 << " IPv4 ranges (" << addr_v4 << " addresses)";
-    if (job.want_v4 && job.want_v6) std::cerr << ", ";
-    if (job.want_v6) std::cerr << out_v6 << " IPv6 ranges";
-    std::cerr << "  [from " << raw_v4 << " v4 + " << raw_v6 << " v6 raw entries, " << ok_count << "/" << sources.size() << " sources]\n";
+    save_file(opts, plain);
     return 0;
 }
 
-}  
+struct AsnHit {
+    int      score;
+    size_t   page;
+    size_t   idx;
+    AsnRow   row;
+};
+
+struct AsnCollector {
+    const Cleaned*           query = nullptr;
+    std::vector<AsnHit>      hits;
+    std::vector<std::string> names;
+    std::unordered_set<uint64_t> seen;
+    size_t                   total_rows = 0;
+
+    void add(size_t page, std::vector<AsnRow>&& rows) {
+        size_t idx = 0;
+        for (AsnRow& r : rows) {
+            const size_t i = idx++;
+            uint64_t key = 0;
+            for (size_t k = 2; k < r.asn.size(); ++k) key = key * 10 + static_cast<uint64_t>(r.asn[k] - '0');
+            if (!seen.insert(key).second) continue;
+            ++total_rows;
+            if (!query) {
+                hits.push_back({0, page, i, std::move(r)});
+                continue;
+            }
+            const int sc = org_score(*query, clean_name(r.name, true));
+            if (sc > 0) hits.push_back({sc, page, i, std::move(r)});
+            else names.push_back(std::move(r.name));
+        }
+    }
+};
+
+struct AsnPage : Xfer {
+    size_t         index = 0;
+    AsnCollector*  sink = nullptr;
+    AsnRowStream   stream;
+
+    bool on_data(const char* p, size_t n) override {
+        if (stream.feed(std::string_view(p, n))) return true;
+        aborted = true;
+        abort_reason = "malformed page (row too large)";
+        return false;
+    }
+    void on_finish() override {
+        stream.finish();
+        sink->add(index, std::move(stream.rows));
+        stream.reset();
+    }
+    void on_fail() override { body.clear(); stream.reset(); }
+    void on_reset() override { stream.reset(); }
+};
+
+constexpr size_t kScanConcurrency  = 8;
+constexpr size_t kRetryConcurrency = 2;
+
+int run_asn_list(const Options& opts) {
+    const bool filtering = !opts.org.empty();
+    Cleaned query;
+    if (filtering) {
+        query = clean_name(opts.org, false);
+        if (query.tokens.empty()) {
+            std::cerr << col(kRed) << "[discover] --org: '" << opts.org << "' has no searchable words" << col(kReset) << "\n";
+            return 1;
+        }
+    }
+
+    std::vector<const Country*> targets;
+    if (!opts.country.empty()) {
+        const Country* cp = nullptr;
+        CountryMatch::How how = CountryMatch::How::None;
+        if (!pick_country(opts.country, cp, how)) return 1;
+        print_country_line(*cp, how, opts.country);
+        targets.push_back(cp);
+    } else if (filtering) {
+        targets.reserve(kCountryCount);
+        for (const Country& c : kCountries) targets.push_back(&c);
+        std::cerr << "[discover] --org without --cn: scanning all " << targets.size() << " country pages\n";
+    } else {
+        std::cerr << col(kRed) << "[discover] give --cn <country> and/or --org <name>" << col(kReset) << "\n";
+        return 1;
+    }
+
+    AsnCollector sink;
+    sink.query = filtering ? &query : nullptr;
+
+    std::vector<std::unique_ptr<AsnPage>> pages;
+    pages.reserve(targets.size());
+    std::vector<Xfer*> xs;
+    xs.reserve(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        auto p = std::make_unique<AsnPage>();
+        p->url = std::string("https://ipgeolocation.io/browse/asn/countries/") + targets[i]->iso2;
+        p->cap = kCapAsnPageBytes;
+        p->not_found_ok = true;
+        p->index = i;
+        p->sink = &sink;
+        xs.push_back(p.get());
+        pages.push_back(std::move(p));
+    }
+
+    const bool multi = targets.size() > 1;
+    ProgressFn progress;
+    if (multi) {
+        progress = [](size_t done, size_t total) {
+            if (err_tty()) std::cerr << "\r[discover] country pages " << done << "/" << total << std::flush;
+            else if (done == total || done % 25 == 0) std::cerr << "[discover] country pages " << done << "/" << total << "\n";
+        };
+    }
+
+    int rc = run_transfers(xs, opts, multi ? kScanConcurrency : 1, progress);
+    if (multi && err_tty()) std::cerr << "\n";
+
+    if (rc == 0) {
+        std::vector<Xfer*> failed;
+        for (auto& p : pages)
+            if (!p->ok && !p->aborted) { p->reset(); failed.push_back(p.get()); }
+        if (!failed.empty()) {
+            if (multi) std::cerr << "[discover] retrying " << failed.size() << " failed page(s)\n";
+            Options ropts = opts;
+            ropts.total_timeout_sec = static_cast<int>(std::max<long long>(
+                opts.total_timeout_sec, std::min<long long>(2LL * opts.total_timeout_sec, 600)));
+            rc = run_transfers(failed, ropts, kRetryConcurrency, nullptr);
+        }
+    }
+    if (rc == 130) {
+        std::cerr << "[discover] interrupted - partial results discarded\n";
+        return 130;
+    }
+    if (rc != 0) {
+        std::cerr << col(kRed) << "[discover] curl_multi_init failed" << col(kReset) << "\n";
+        return 1;
+    }
+
+    size_t failed_pages = 0;
+    std::string last_note, failed_list;
+    for (size_t i = 0; i < pages.size(); ++i) {
+        if (pages[i]->ok) continue;
+        ++failed_pages;
+        last_note = pages[i]->note;
+        if (failed_pages <= 8) {
+            if (!failed_list.empty()) failed_list += ", ";
+            failed_list += targets[i]->iso2;
+            failed_list += " (" + pages[i]->note + ")";
+        }
+    }
+    if (failed_pages == pages.size()) {
+        std::cerr << col(kRed) << "[discover] every page failed: " << last_note << col(kReset) << "\n";
+        return 1;
+    }
+    if (failed_pages > 0)
+        std::cerr << col(kYellow) << "[discover] " << failed_pages << " page(s) failed: " << failed_list
+                  << (failed_pages > 8 ? ", ..." : "") << " - results may be incomplete" << col(kReset) << "\n";
+
+    if (sink.total_rows == 0) {
+        std::cerr << col(kYellow) << "[discover] no ASN rows found - the page has none for this country or its layout changed"
+                  << col(kReset) << "\n";
+        return 1;
+    }
+
+    std::vector<AsnHit>& hits = sink.hits;
+    if (filtering) {
+        if (hits.empty()) {
+            std::cerr << col(kYellow) << "[discover] no organisation matched '" << opts.org << "'" << col(kReset) << "\n";
+            Nearest nearest;
+            for (const std::string& n : sink.names) {
+                const Cleaned c = clean_name(n, true);
+                const int d = approx_sub(query.compact, c.compact, 4);
+                if (d <= 4) nearest.offer(d, n);
+            }
+            if (!nearest.items.empty()) {
+                std::cerr << "[discover] did you mean:\n";
+                for (const auto& it : nearest.items) std::cerr << "             " << it.second << "\n";
+            }
+            return 1;
+        }
+        std::sort(hits.begin(), hits.end(), [](const AsnHit& a, const AsnHit& b) {
+            if (a.score != b.score) return a.score > b.score;
+            if (a.page != b.page) return a.page < b.page;
+            return a.idx < b.idx;
+        });
+        const int th = keep_threshold(hits.front().score);
+        if (hits.front().score < 3)
+            std::cerr << "[discover] no exact organisation match - showing closest (typo-tolerant) matches\n";
+        hits.erase(std::remove_if(hits.begin(), hits.end(), [th](const AsnHit& h) { return h.score < th; }), hits.end());
+    }
+
+    std::vector<OwnerRow> table;
+    table.reserve(hits.size());
+    for (AsnHit& h : hits) {
+        OwnerRow r;
+        r.asn = h.row.asn;
+        r.org = h.row.name;
+        split_trailing_cc(r.org, r.country);
+        if (r.country.empty()) r.country = "-";
+        table.push_back(std::move(r));
+    }
+    std::string colored, plain;
+    render_owner_table(table, true, colored, false);
+    render_owner_table(table, false, plain, false);
+    std::cout << colored;
+    std::cout.flush();
+    save_file(opts, plain);
+    std::cerr << col(kBold) << "[discover] result  : " << col(kReset) << hits.size() << " ASN(s)";
+    if (filtering) std::cerr << " matching '" << opts.org << "'";
+    std::cerr << "  [from " << sink.total_rows << " ASNs on " << (pages.size() - failed_pages) << "/" << pages.size() << " page(s)]\n";
+    return 0;
+}
+
+int run_reverse(const Options& opts) {
+    std::string query;
+    if (!opts.ip.empty()) {
+        uint32_t host = 0;
+        if (!parse_v4_addr(trim_sv(opts.ip), host)) {
+            std::cerr << col(kRed) << "[discover] --ip: '" << opts.ip << "' is not a valid IPv4 address" << col(kReset) << "\n";
+            return 1;
+        }
+        query = v4_to_string(host);
+    } else {
+        bool adjusted = false;
+        if (!normalize_range24(opts.range, query, adjusted)) {
+            std::cerr << col(kRed) << "[discover] --range: only IPv4 /24 ranges are supported (e.g. 103.48.88.0/24)"
+                      << col(kReset) << "\n";
+            return 1;
+        }
+        if (adjusted) std::cerr << "[discover] --range: host bits cleared, using " << query << "\n";
+    }
+
+    Xfer page;
+    page.url = "https://api.hackertarget.com/reverseiplookup/?q=" + query;
+    page.cap = kCapReplyBytes;
+    std::vector<Xfer*> xs{&page};
+    const int rc = run_transfers(xs, opts, 1, nullptr);
+    if (rc == 130) { std::cerr << "[discover] interrupted\n"; return 130; }
+    if (rc != 0 || !page.ok) {
+        std::cerr << col(kRed) << "[discover] hackertarget request failed: " << (page.note.empty() ? "internal error" : page.note)
+                  << col(kReset) << "\n";
+        return 1;
+    }
+
+    std::vector<std::string> domains;
+    std::string message;
+    if (!parse_reverse_body(page.body, domains, message)) {
+        if (message.find("API count exceeded") != std::string::npos)
+            std::cerr << col(kRed) << "[discover] hackertarget daily quota exceeded - try later or from another IP" << col(kReset) << "\n";
+        else
+            std::cerr << col(kYellow) << "[discover] hackertarget: " << message << col(kReset) << "\n";
+        return 1;
+    }
+    if (domains.empty()) {
+        std::cerr << col(kYellow) << "[discover] no domains found for " << query << col(kReset) << "\n";
+        return 1;
+    }
+    std::string text;
+    for (const std::string& d : domains) { text += d; text += '\n'; }
+    write_out(opts, text);
+    std::cerr << col(kBold) << "[discover] result  : " << col(kReset) << domains.size() << " domain(s) for " << query << "\n";
+    return 0;
+}
+
+int run_asn_routes(const Options& opts) {
+    uint32_t asn = 0;
+    if (!parse_asn_arg(opts.asn, asn)) {
+        std::cerr << col(kRed) << "[discover] --asn: '" << opts.asn << "' is not a valid ASN (use AS45353 or 45353)" << col(kReset) << "\n";
+        return 1;
+    }
+    if (!opts.want_v4 && !opts.want_v6) {
+        std::cerr << "[discover] nothing to do: both IPv4 and IPv6 are disabled\n";
+        return 1;
+    }
+
+    Xfer page;
+    page.url = "https://ip.guide/AS" + std::to_string(asn);
+    page.cap = kCapReplyBytes;
+    std::vector<Xfer*> xs{&page};
+    const int rc = run_transfers(xs, opts, 1, nullptr);
+    if (rc == 130) { std::cerr << "[discover] interrupted\n"; return 130; }
+    if (rc != 0 || !page.ok) {
+        if (page.note == "HTTP 404")
+            std::cerr << col(kRed) << "[discover] AS" << asn << " not found" << col(kReset) << "\n";
+        else
+            std::cerr << col(kRed) << "[discover] ip.guide request failed: " << (page.note.empty() ? "internal error" : page.note)
+                      << col(kReset) << "\n";
+        return 1;
+    }
+
+    const std::string_view b(page.body);
+    const size_t rp = b.find("\"routes\"");
+    if (rp == std::string_view::npos) {
+        std::cerr << col(kRed) << "[discover] unexpected response from ip.guide (no routes object)" << col(kReset) << "\n";
+        return 1;
+    }
+
+    std::vector<std::string> r4, r6;
+    json_string_array(b, rp, "v4", r4);
+    json_string_array(b, rp, "v6", r6);
+
+    std::string name, org, cc;
+    json_find_string(b, "name", name);
+    json_find_string(b, "organization", org);
+    json_find_string(b, "country", cc);
+    sanitize_inplace(name);
+    sanitize_inplace(org);
+    sanitize_inplace(cc);
+    std::string label = name;
+    if (!org.empty() && org != name) label = label.empty() ? org : label + " - " + org;
+    if (label.empty()) label = "-";
+    if (cc.empty()) cc = "-";
+    const std::string asn_s = "AS" + std::to_string(asn);
+
+    std::vector<OwnerRow> rows;
+    std::unordered_set<std::string> seen;
+    size_t n4 = 0, n6 = 0;
+    if (opts.want_v4) {
+        for (const std::string& r : r4) {
+            V4 iv;
+            if (parse_v4_cidr(r, iv) && seen.insert(r).second) { rows.push_back({asn_s, r, cc, label}); ++n4; }
+        }
+    }
+    if (opts.want_v6) {
+        for (const std::string& r : r6) {
+            V6 iv;
+            if (parse_v6_cidr(r, iv) && seen.insert(r).second) { rows.push_back({asn_s, r, cc, label}); ++n6; }
+        }
+    }
+
+    if (n4 + n6 == 0) {
+        std::cerr << col(kYellow) << "[discover] no routes found for AS" << asn << col(kReset) << "\n";
+        return 1;
+    }
+    std::string colored, plain;
+    render_owner_table(rows, true, colored);
+    render_owner_table(rows, false, plain);
+    std::cout << colored;
+    std::cout.flush();
+    save_file(opts, plain);
+    std::cerr << col(kBold) << "[discover] result  : " << col(kReset);
+    if (opts.want_v4) std::cerr << n4 << " IPv4 routes";
+    if (opts.want_v4 && opts.want_v6) std::cerr << ", ";
+    if (opts.want_v6) std::cerr << n6 << " IPv6 routes";
+    std::cerr << "\n";
+    return 0;
+}
+
+}
+
+int run(const Options& opts) {
+    std::cerr << "\nStarting " << col(kBold) << "Shiv" << col(kReset) << " (" << col(kYellow) << "DISCOVERY"
+              << col(kReset) << ") at " << format_time() << "\n";
+    CurlGlobal cg;
+    if (!cg.ok) {
+        std::cerr << col(kRed) << "[discover] curl_global_init failed" << col(kReset) << "\n";
+        return 1;
+    }
+    switch (opts.mode) {
+        case Mode::Ranges:    return run_ranges(opts);
+        case Mode::AsnList:   return run_asn_list(opts);
+        case Mode::ReverseIp: return run_reverse(opts);
+        case Mode::AsnRoutes: return run_asn_routes(opts);
+        case Mode::None:      break;
+    }
+    std::cerr << col(kRed) << "[discover] no discovery mode selected" << col(kReset) << "\n";
+    return 1;
+}
+
+}
 
 #ifdef DISCOVER_SELFTEST
 std::atomic<bool> terminate_flag(false);
-std::vector<std::string> g_dns_servers; 
+std::vector<std::string> g_dns_servers;
 
-#include <cassert>
 #include <set>
 
 static int g_fail = 0;
@@ -1482,50 +2754,68 @@ static int g_fail = 0;
 int main() {
     using namespace discover;
     std::set<std::string> i2, i3;
-    for (const Country& c : kCountries) { CHECK(i2.insert(c.iso2).second); CHECK(i3.insert(c.iso3).second); CHECK(std::strlen(c.iso2) == 2 && std::strlen(c.iso3) == 3); }
+    for (const Country& c : kCountries) {
+        CHECK(i2.insert(c.iso2).second);
+        CHECK(i3.insert(c.iso3).second);
+        CHECK(std::strlen(c.iso2) == 2 && std::strlen(c.iso3) == 3);
+    }
     CHECK(country_count() == 199);
     CHECK(std::strlen("AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty") == 64);
+    CHECK(std::is_sorted(std::begin(kNoise), std::end(kNoise)));
     for (const Country& c : kCountries) {
         CHECK(resolve_country(c.iso2).country == &c);
         CHECK(resolve_country(c.iso3).country == &c);
         CHECK(resolve_country(c.name).country == &c);
         std::string_view al(c.aliases);
         while (!al.empty()) {
-            size_t bar = al.find('|');
+            const size_t bar = al.find('|');
             std::string one(al.substr(0, bar));
             CHECK(resolve_country(one).country == &c);
             if (bar == std::string_view::npos) break;
             al.remove_prefix(bar + 1);
         }
     }
-    auto iso = [](const char* s) { auto m = resolve_country(s); return m.country ? std::string(m.country->iso2) : std::string("??"); };
+    auto iso = [](const char* s) {
+        auto m = resolve_country(s);
+        return m.country ? std::string(m.country->iso2) : std::string("??");
+    };
     CHECK(iso("nepal") == "NP");   CHECK(iso("  NEPAL ") == "NP");  CHECK(iso("np") == "NP");   CHECK(iso("NPL") == "NP");
     CHECK(iso("United States") == "US"); CHECK(iso("usa") == "US"); CHECK(iso("uk") == "GB");
     CHECK(iso("South Korea") == "KR");   CHECK(iso("north-korea") == "KP");
     CHECK(iso("Côte d'Ivoire") == "CI"); CHECK(iso("Türkiye") == "TR"); CHECK(iso("são tomé") == "ST");
-    CHECK(iso("neth") == "NL");    
-    CHECK(iso("nepl") == "NP");    
+    CHECK(iso("neth") == "NL");
+    CHECK(iso("nepl") == "NP");
+    CHECK(iso("nepla") == "NP");
     CHECK(iso("germny") == "DE");
     CHECK(iso("bangaldesh") == "BD");
     CHECK(iso("kazakstan") == "KZ");
-    CHECK(iso("ind") == "IN");     
+    CHECK(iso("ind") == "IN");
     CHECK(iso("guinea") == "GN");  CHECK(iso("niger") == "NE"); CHECK(iso("nigeria") == "NG");
     CHECK(iso("sudan") == "SD");   CHECK(iso("south sudan") == "SS");
     CHECK(iso("xx") == "??");      CHECK(iso("") == "??");  CHECK(iso("atlantis") == "??");
-    CHECK(!resolve_country("mal").country && !resolve_country("mal").suggestions.empty());   
-    CHECK(!resolve_country("korea").country);                                                 
+    CHECK(!resolve_country("mal").country && !resolve_country("mal").suggestions.empty());
+    CHECK(!resolve_country("korea").country);
+
     std::string t;
-    CHECK(emit_v4({0x1B220000u, 0x1B22FFFFu}, t) == 1 && t == "27.34.0.0/16\n");             
-    t.clear(); CHECK(emit_v4({0x0A000000u, 0x0A0002FFu}, t) == 2 && t == "10.0.0.0/23\n10.0.2.0/24\n"); 
-    t.clear(); CHECK(emit_v4({0x0A000001u, 0x0A000006u}, t) == 4);                            
-    t.clear(); CHECK(emit_v4({0u, 0xFFFFFFFFu}, t) == 1 && t == "0.0.0.0/0\n");
+    CHECK(emit_v4({0x1B220000u, 0x1B22FFFFu}, &t) == 1 && t == "27.34.0.0/16\n");
+    t.clear(); CHECK(emit_v4({0x0A000000u, 0x0A0002FFu}, &t) == 2 && t == "10.0.0.0/23\n10.0.2.0/24\n");
+    t.clear(); CHECK(emit_v4({0x0A000001u, 0x0A000006u}, &t) == 4);
+    t.clear(); CHECK(emit_v4({0u, 0xFFFFFFFFu}, &t) == 1 && t == "0.0.0.0/0\n");
+    CHECK(emit_v4({0x0A000000u, 0x0A0000FFu}, nullptr) == 1);
     std::vector<V4> v = {{10, 20}, {21, 30}, {5, 12}, {100, 200}};
-    auto mv = merge_v4(v);  CHECK(mv.size() == 2 && mv[0] == V4(5, 30) && mv[1] == V4(100, 200));
-    V6 a, b; CHECK(parse_v6_cidr("2405:d000::/32", a) && parse_v6_cidr("2405:d001::/32", b));
-    auto m6 = merge_v6({b, a});  CHECK(m6.size() == 1);
-    t.clear(); CHECK(emit_v6(m6[0], t) == 1 && t == "2405:d000::/31\n");
-    V6 all; CHECK(parse_v6_cidr("::/1", all));
-    Job job; job.cc[0] = 'N'; job.cc[1] = 'P';
+    auto mv = merge_v4(v);
+    CHECK(mv.size() == 2 && mv[0] == V4(5, 30) && mv[1] == V4(100, 200));
+    V6 a, b;
+    CHECK(parse_v6_cidr("2405:d000::/32", a) && parse_v6_cidr("2405:d001::/32", b));
+    auto m6 = merge_v6({b, a});
+    CHECK(m6.size() == 1);
+    t.clear(); CHECK(emit_v6(m6[0], &t) == 1 && t == "2405:d000::/31\n");
+    V6 all;
+    CHECK(parse_v6_cidr("::/1", all));
+
+    Job job;
+    job.cc[0] = 'N';
+    job.cc[1] = 'P';
     const std::string body =
         "2|apnic|20260919|9999|19830613|20260918|+1000\n"
         "apnic|*|ipv4|*|9999|summary\n"
@@ -1534,42 +2824,306 @@ int main() {
         "apnic|NP|ipv4|103.1.92.0|1024|20110316|assigned\r\n"
         "apnic|NP|ipv4|202.79.32.0|8192|20100629|reserved\n"
         "apnic|NP|ipv6|2405:8d40::|32|20120523|allocated\n"
-        "apnic|NP|ipv4|202.166.192.0|4096|20100629|allocated";           
+        "apnic|NP|ipv4|202.166.192.0|4096|20100629|allocated";
     for (size_t cut = 0; cut <= body.size(); ++cut) {
-        Source s; s.kind = Kind::ApnicDelegated; s.job = &job;
-        CHECK(feed(s, body.data(), cut) && feed(s, body.data() + cut, body.size() - cut));
-        finish(s);
+        Source s;
+        s.kind = Kind::ApnicDelegated;
+        s.job = &job;
+        CHECK(s.ingest(body.data(), cut) && s.ingest(body.data() + cut, body.size() - cut));
+        s.on_finish();
         CHECK(s.v4.size() == 3 && s.v6.size() == 1);
         CHECK(s.v4[0] == V4(0x1B220000u, 0x1B227FFFu));
         CHECK(s.v4[1] == V4(0x67015C00u, 0x67015FFFu));
     }
-    { 
-        Source s; s.kind = Kind::ApnicDelegated; s.job = &job;
-        for (char ch : body) CHECK(feed(s, &ch, 1));
-        finish(s);  CHECK(s.v4.size() == 3 && s.v6.size() == 1);
+    {
+        Source s;
+        s.kind = Kind::ApnicDelegated;
+        s.job = &job;
+        for (char ch : body) CHECK(s.ingest(&ch, 1));
+        s.on_finish();
+        CHECK(s.v4.size() == 3 && s.v6.size() == 1);
     }
-    { 
-        Job j4 = job; j4.want_v6 = false;
-        Source s; s.kind = Kind::ApnicDelegated; s.job = &j4; feed(s, body.data(), body.size()); finish(s);
+    {
+        Job j4 = job;
+        j4.want_v6 = false;
+        Source s;
+        s.kind = Kind::ApnicDelegated;
+        s.job = &j4;
+        s.ingest(body.data(), body.size());
+        s.on_finish();
         CHECK(s.v6.empty() && s.v4.size() == 3);
     }
-    { 
-        Source s; s.kind = Kind::RirV4; s.job = &job;
+    {
+        Source s;
+        s.kind = Kind::RirV4;
+        s.job = &job;
         const std::string l = "# generated\n27.34.0.0/17\n\n bad line\n103.1.92.0/22\n";
-        feed(s, l.data(), l.size()); finish(s);
+        s.ingest(l.data(), l.size());
+        s.on_finish();
         CHECK(s.v4.size() == 2 && s.v4[0] == V4(0x1B220000u, 0x1B227FFFu));
     }
-    { 
-        std::string html = "<a href=\"/country/NP\">Nepal</a><span>CIDR:</span> 14.137.53.0/24 <span>CIDR:</span> 102.38.241.0/24 <span>CIDR:</span> 14.137.51.128/25";
-        Source s; s.kind = Kind::NwDb; s.job = &job; s.streaming = false; s.cap = kCapPageBytes;
-        feed(s, html.data(), html.size()); finish(s);
+    {
+        Source s;
+        s.kind = Kind::RirV4;
+        s.job = &job;
+        s.cap = 8;
+        const std::string l = "27.34.0.0/17\n27.34.0.0/17\n";
+        CHECK(!s.ingest(l.data(), l.size()) && s.aborted);
+    }
+    {
+        const std::string html = "<a href=\"/country/NP\">Nepal</a><span>CIDR:</span> 14.137.53.0/24 <span>CIDR:</span> 102.38.241.0/24 <span>CIDR:</span> 14.137.51.128/25";
+        Source s;
+        s.kind = Kind::NwDb;
+        s.job = &job;
+        s.streaming = false;
+        s.ingest(html.data(), html.size());
+        s.on_finish();
         CHECK(s.note.empty() && s.v4.size() == 3 && s.v4[2] == V4(0x0E893380u, 0x0E8933FFu));
-        Source s2; s2.kind = Kind::NwDb; s2.job = &job; s2.streaming = false;
-        std::string other = "<a href=\"/country/US\">x</a> <span>CIDR:</span> 1.2.3.0/24";
-        feed(s2, other.data(), other.size()); finish(s2);
+        Source s2;
+        s2.kind = Kind::NwDb;
+        s2.job = &job;
+        s2.streaming = false;
+        const std::string other = "<a href=\"/country/US\">x</a> <span>CIDR:</span> 1.2.3.0/24";
+        s2.ingest(other.data(), other.size());
+        s2.on_finish();
         CHECK(!s2.note.empty() && s2.v4.empty());
     }
-    CHECK(nwdb_slug("Nepal") == "nepal");  CHECK(nwdb_slug("United States") == "united-states");  CHECK(nwdb_slug("Cote d'Ivoire") == "cote-divoire");
+    CHECK(nwdb_slug("Nepal") == "nepal");
+    CHECK(nwdb_slug("United States") == "united-states");
+    CHECK(nwdb_slug("Cote d'Ivoire") == "cote-divoire");
+
+    CHECK(edit_distance("nepla", "nepal", 1) == 1);
+    CHECK(edit_distance("kitten", "sitting", 3) == 3);
+    CHECK(edit_distance("abc", "abc", 0) == 0);
+    CHECK(edit_distance("abcdef", "uvwxyz", 2) == 3);
+    CHECK(approx_sub("wolrdlink", "worldlinkcommunications", 2) == 2);
+    CHECK(approx_sub("link", "worldlink", 1) == 0);
+
+    auto score = [](const char* q, const char* name) {
+        return org_score(clean_name(q, false), clean_name(name, true));
+    };
+    CHECK(score("sky broadband", "Sky Broadband Pvt. Ltd, NP") == 5);
+    CHECK(score("SKY-BROADBAND", "Sky Broadband Pvt. Ltd, NP") == 5);
+    CHECK(score("skybroadband", "Sky Broadband Pvt. Ltd, NP") == 4);
+    CHECK(score("broadband", "Sky Broadband Pvt. Ltd, NP") == 4);
+    CHECK(score("broadband sky", "Sky Broadband Pvt. Ltd, NP") == 3);
+    CHECK(score("sky brodaband", "Sky Broadband Pvt. Ltd, NP") == 2);
+    CHECK(score("sky broadbnad", "Sky Broadband Pvt. Ltd, NP") == 2);
+    CHECK(score("mercantile ofice", "Mercantile Office Systems, NP") == 2);
+    CHECK(score("worldl", "WorldLink Communications Pvt Ltd") == 4);
+    CHECK(score("wolrd link", "WorldLink Communications Pvt Ltd") == 1);
+    CHECK(score("nitc", "NITC: IT Agency of Government of Nepal") == 4);
+    CHECK(score("net", "Nepal Electricity Authority, NP") == 0);
+    CHECK(score("net", "Internet Ltd") == 0);
+    CHECK(score("nepal telecom", "Sky Broadband Pvt. Ltd, NP") == 0);
+    CHECK(score("np", "Sky Broadband Pvt. Ltd, NP") == 0);
+    CHECK(score("kacific", "KBSPL-AS-AP - Kacific Broadband Satellites Pte Ltd, SG (AS135409)") == 4);
+    CHECK(clean_name("Pvt. Ltd.", false).tokens.empty());
+    CHECK(!clean_name("Pvt. Ltd.", true).tokens.empty());
+    {
+        const Cleaned c = clean_name("Kacific Broadband Satellites Pte Ltd, SG (AS135409)", true);
+        CHECK(c.tokens.size() == 3 && c.compact == "kacificbroadbandsatellites");
+    }
+    CHECK(label_asn("MOS-NP - Mercantile Office Systems, NP (AS4613)") == 4613);
+    CHECK(label_asn("no asn here") == 0);
+    CHECK(label_asn("x (AS)") == 0);
+    {
+        OwnerMatcher m1, m2, m3;
+        CHECK(make_owner_matcher("AS4613", m1) && m1.asn == 4613);
+        CHECK(make_owner_matcher("4613", m2) && m2.asn == 4613);
+        CHECK(make_owner_matcher("mercantile office", m3) && m3.asn == 0);
+        CHECK(m1.score("MOS-NP - Mercantile Office Systems, NP (AS4613)") == 5);
+        CHECK(m1.score("X (AS4614)") == 0);
+        CHECK(m3.score("MOS-NP - Mercantile Office Systems, NP (AS4613)") == 4);
+        CHECK(!make_owner_matcher("pvt ltd", m3));
+        std::vector<std::string> l4 = {"MOS-NP - Mercantile Office Systems, NP (AS4613)", "", "WLINK-NEPAL-AS-AP - WorldLink Communications Pvt Ltd, NP (AS17501)"};
+        std::vector<std::string> l6 = {"WLINK-NEPAL-AS-AP - WorldLink Communications Pvt Ltd, NP (AS17501)"};
+        OwnerFilter f;
+        OwnerMatcher wl;
+        CHECK(make_owner_matcher("worldlnk", wl));
+        apply_owner_filter(wl, l4, l6, f);
+        CHECK(f.best == 2 && f.keep4[2] && !f.keep4[0] && !f.keep4[1] && f.keep6[0] && f.kept_orgs == 1);
+        OwnerFilter g;
+        OwnerMatcher none;
+        CHECK(make_owner_matcher("zzzzzz", none));
+        apply_owner_filter(none, l4, l6, g);
+        CHECK(g.best == 0 && !g.keep4[0]);
+    }
+    CHECK(v4_cidr_size("10.0.0.0/24") == 256);
+    CHECK(v4_cidr_size("10.0.0.0/32") == 1);
+    {
+        Nearest n;
+        n.offer(3, "c"); n.offer(1, "a"); n.offer(2, "b"); n.offer(1, "a");
+        n.offer(4, "d"); n.offer(5, "e"); n.offer(6, "f"); n.offer(0, "z");
+        CHECK(n.items.size() == 5 && n.items[0].second == "z" && n.items[1].second == "a" && n.items[4].second == "d");
+    }
+
+    {
+        const std::string html =
+            "<html><table><thead><tr><th>ASN</th><th>Org</th></tr></thead><tbody>"
+            "<tr><td><span>AS135303</span></td><td><span>NETTV Pvt. Ltd., NP</span></td><td><span>1</span></td><td><span>0</span></td></tr>\n"
+            "<TR class=\"x\">\n<TD><span>AS58504</span></TD>\n<TD><span>TECHMINDS &amp; NETWORKS\n PVT. LTD., NP</span></TD><TD><span>16</span></TD><TD><span>20</span></TD></TR>"
+            "<tr><td><span>bogus</span></td><td><span>skip me</span></td></tr>"
+            "<tr><td><span>AS4613</span></td><td><span>Mercantile&nbsp;Office Systems, NP</span></td><td><span>32</span></td><td><span>0</span></td></tr>"
+            "<tr><td><span>AS9</span></td><td><span>bad\x1b[31m</span></td></tr>"
+            "</tbody></table></html>";
+        std::vector<AsnRow> rows;
+        parse_asn_rows(html, rows);
+        CHECK(rows.size() == 4);
+        CHECK(rows[0].asn == "AS135303" && rows[0].name == "NETTV Pvt. Ltd., NP" && rows[0].c3 == "1" && rows[0].c4 == "0");
+        CHECK(rows[1].asn == "AS58504" && rows[1].name == "TECHMINDS & NETWORKS PVT. LTD., NP" && rows[1].c3 == "16" && rows[1].c4 == "20");
+        CHECK(rows[2].name == "Mercantile Office Systems, NP");
+        CHECK(rows[3].name == "bad[31m");
+        std::vector<AsnRow> none;
+        parse_asn_rows("<html>nothing</html>", none);
+        CHECK(none.empty());
+        AsnCollector sink;
+        const Cleaned q = clean_name("mercantile", false);
+        sink.query = &q;
+        sink.add(0, std::move(rows));
+        CHECK(sink.total_rows == 4 && sink.hits.size() == 1 && sink.hits[0].row.asn == "AS4613" && sink.names.size() == 3);
+    }
+    CHECK(html_text("  a &lt;b&gt; &#65;&#x42; <i>c</i>\n\t d &bogus; ") == "a <b> AB c d &bogus;");
+
+    {
+        std::vector<std::string> d;
+        std::string msg;
+        CHECK(parse_reverse_body("a.example.com\r\nb.example.org\na.example.com\n\nc-d.example.net\n", d, msg));
+        CHECK(d.size() == 3 && d[0] == "a.example.com" && d[2] == "c-d.example.net");
+        d.clear();
+        CHECK(!parse_reverse_body("API count exceeded - Increase Quota with Membership", d, msg));
+        CHECK(msg.find("API count exceeded") != std::string::npos && d.empty());
+        d.clear();
+        CHECK(!parse_reverse_body("error check your search parameter\x1b[2J", d, msg));
+        CHECK(msg.find('\x1b') == std::string::npos);
+        d.clear();
+        CHECK(!parse_reverse_body("No DNS A records found for 1.2.3.4", d, msg));
+        d.clear();
+        CHECK(!parse_reverse_body("error", d, msg));
+        d.clear();
+        CHECK(parse_reverse_body("ok.example.com\nsome junk line\nfine.example.com\n", d, msg) && d.size() == 2);
+        d.clear();
+        CHECK(parse_reverse_body("", d, msg) && d.empty());
+    }
+    CHECK(is_domain_line("*.example.com") && is_domain_line("a_b.example.com,1.2.3.4"));
+    CHECK(!is_domain_line("nodots") && !is_domain_line("has space.com") && !is_domain_line("a.com;rm"));
+    {
+        std::string out;
+        bool adj = false;
+        CHECK(normalize_range24("103.48.88.0/24", out, adj) && out == "103.48.88.0/24" && !adj);
+        CHECK(normalize_range24(" 103.48.88.33/24 ", out, adj) && out == "103.48.88.0/24" && adj);
+        CHECK(!normalize_range24("103.48.88.0/23", out, adj));
+        CHECK(!normalize_range24("103.48.88.0/25", out, adj));
+        CHECK(!normalize_range24("103.48.88.0", out, adj));
+        CHECK(!normalize_range24("2001:db8::/24", out, adj));
+        CHECK(!normalize_range24("103.48.88.0/024x", out, adj));
+    }
+    {
+        uint32_t asn = 0;
+        CHECK(parse_asn_arg("AS45353", asn) && asn == 45353);
+        CHECK(parse_asn_arg("as45353", asn) && asn == 45353);
+        CHECK(parse_asn_arg(" 45353 ", asn) && asn == 45353);
+        CHECK(parse_asn_arg("4294967295", asn) && asn == 4294967295u);
+        CHECK(!parse_asn_arg("4294967296", asn));
+        CHECK(!parse_asn_arg("AS", asn) && !parse_asn_arg("AS0", asn) && !parse_asn_arg("", asn));
+        CHECK(!parse_asn_arg("AS45x", asn) && !parse_asn_arg("AS-1", asn) && !parse_asn_arg("12345678901", asn));
+    }
+    {
+        const std::string js =
+            "{\n  \"asn\": 45353,\n  \"name\": \"NITC-AS-AP - NITC: IT Agency \\u00e9 \\\"Nepal\\\" \\ud83d\\ude00\",\n"
+            "  \"organization\": \"NITC\",\n  \"country\": \"NP\",\n  \"rir\": \"APNIC\",\n"
+            "  \"routes\": {\n    \"v4\": [\n      \"103.69.124.0/24\",\n      \"202.45.144.0/22\"\n    ],\n    \"v6\": []\n  }\n}";
+        std::string name, rir;
+        CHECK(json_find_string(js, "name", name) && name == "NITC-AS-AP - NITC: IT Agency \xC3\xA9 \"Nepal\" \xF0\x9F\x98\x80");
+        CHECK(json_find_string(js, "rir", rir) && rir == "APNIC");
+        CHECK(!json_find_string(js, "missing", rir));
+        const size_t rp = js.find("\"routes\"");
+        std::vector<std::string> r4, r6;
+        CHECK(json_string_array(js, rp, "v4", r4) && r4.size() == 2 && r4[1] == "202.45.144.0/22");
+        CHECK(json_string_array(js, rp, "v6", r6) && r6.empty());
+        std::vector<std::string> bad;
+        CHECK(!json_string_array("{\"v4\": [1, 2]}", 0, "v4", bad));
+        CHECK(!json_string_array("{\"v4\": [\"a\"", 0, "v4", bad));
+        std::string s;
+        CHECK(!json_find_string("{\"k\": \"bad\\q\"}", "k", s));
+        CHECK(!json_find_string("{\"k\": \"unterminated", "k", s));
+        CHECK(json_find_string("{\"k\": \"\\ud800x\"}", "k", s) && s == "?x");
+    }
+
+
+    {
+        const std::string html =
+            "<html><table><thead><tr><th>ASN</th><th>Org</th></tr></thead><tbody class=\"x\">"
+            "<tr><td><span>AS135303</span></td><td><span>NETTV Pvt. Ltd., NP</span></td><td><span>1</span></td><td><span>0</span></td></tr>\n"
+            "<TR class=\"x\">\n<TD><span>AS58504</span></TD>\n<TD><span>TECHMINDS &amp; NETWORKS\n PVT. LTD., NP</span></TD><TD><span>16</span></TD><TD><span>20</span></TD></TR>"
+            "<tr><td><span>bogus</span></td><td><span>skip me</span></td></tr>"
+            "<tr><td><span>AS4613</span></td><td><span>Mercantile&nbsp;Office Systems, NP</span></td><td><span>32</span></td><td><span>0</span></td></tr>"
+            "</tbody></table><table><tbody><tr><td>AS1</td><td>after tbody</td></tr></tbody></table></html>";
+        std::vector<AsnRow> ref;
+        parse_asn_rows(html, ref);
+        CHECK(ref.size() == 3);
+        const size_t chunks[] = {1, 2, 3, 5, 7, 16, 64, 1000, 100000};
+        for (size_t cs : chunks) {
+            AsnRowStream st;
+            bool ok = true;
+            for (size_t i = 0; i < html.size(); i += cs)
+                ok = st.feed(std::string_view(html).substr(i, cs)) && ok;
+            st.finish();
+            CHECK(ok);
+            CHECK(st.rows.size() == ref.size());
+            for (size_t i = 0; i < ref.size() && i < st.rows.size(); ++i)
+                CHECK(st.rows[i].asn == ref[i].asn && st.rows[i].name == ref[i].name &&
+                      st.rows[i].c3 == ref[i].c3 && st.rows[i].c4 == ref[i].c4);
+        }
+        const std::string nobody =
+            "<table><tr><td>AS7</td><td>No Tbody Net, US</td></tr><tr><td>AS8</td><td>Second, US</td></tr></table>";
+        AsnRowStream st2;
+        for (size_t i = 0; i < nobody.size(); i += 4) st2.feed(std::string_view(nobody).substr(i, 4));
+        st2.finish();
+        CHECK(st2.rows.size() == 2 && st2.rows[1].asn == "AS8");
+        AsnRowStream st3;
+        st3.feed("<tbody><tr><td>AS9</td><td>trunc");
+        st3.finish();
+        CHECK(st3.rows.size() == 1 && st3.rows[0].name == "trunc");
+        AsnRowStream st4;
+        st4.feed("<tbody><tr>");
+        CHECK(!st4.feed(std::string(kMaxAsnRowBytes + 10, 'x')));
+        AsnRowStream big;
+        std::string many = "<tbody>";
+        for (int i = 0; i < 5000; ++i)
+            many += "<tr><td>AS" + std::to_string(100 + i) + "</td><td>Org " + std::to_string(i) + ", NP</td></tr>";
+        many += "</tbody>";
+        for (size_t i = 0; i < many.size(); i += 4096) big.feed(std::string_view(many).substr(i, 4096));
+        big.finish();
+        CHECK(big.rows.size() == 5000 && big.carry.empty());
+        big.reset();
+        CHECK(big.rows.empty());
+    }
+
+    {
+        std::string n = "WorldLink Communications, NP", cc;
+        split_trailing_cc(n, cc);
+        CHECK(n == "WorldLink Communications" && cc == "NP");
+        n = "Acme, LLC"; split_trailing_cc(n, cc);
+        CHECK(n == "Acme, LLC" && cc.empty());
+        n = "Foo Ltd,BD"; split_trailing_cc(n, cc);
+        CHECK(n == "Foo Ltd" && cc == "BD");
+        n = "NP"; split_trailing_cc(n, cc);
+        CHECK(n == "NP" && cc.empty());
+
+        std::vector<OwnerRow> rows{{"AS141219", "103.156.108.0/23", "BD", "WORLDLINK-AS-AP - World Link"}};
+        std::string plain;
+        render_owner_table(rows, false, plain);
+        CHECK(plain.rfind("ASN", 0) == 0 && plain.find("RANGE") != std::string::npos &&
+              plain.find("103.156.108.0/23") != std::string::npos && plain.find('\033') == std::string::npos);
+        std::string plain3;
+        render_owner_table(rows, false, plain3, false);
+        CHECK(plain3.find("RANGE") == std::string::npos && plain3.find("COUNTRY") != std::string::npos);
+
+        std::string s = std::string("a\x1b[31mb") + "\xC2\x9B" + "c" + "\xE2\x80\xAE" + "d\xC3\xA9";
+        sanitize_inplace(s);
+        CHECK(s == "a[31mbcd\xC3\xA9");
+    }
 
     std::cerr << (g_fail ? "SELFTEST FAILED\n" : "SELFTEST OK\n");
     return g_fail ? 1 : 0;
