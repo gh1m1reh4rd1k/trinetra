@@ -508,92 +508,101 @@ std::string format_ipv6(const uint8_t* ip6) {
 }
 
 const std::unordered_map<uint16_t, std::string>& read_services_from_file(const std::string &filename) {
-    static std::unordered_map<uint16_t, std::string> service_map;
-    static std::once_flag once_flag;
+    static std::mutex cache_mutex;
+    static std::unordered_map<std::string, std::unordered_map<uint16_t, std::string>> cache;
 
-    std::call_once(once_flag, [&]() {
-        int fd = open(filename.c_str(), O_RDONLY);
-        if (fd < 0) {
-            std::cerr << "Failed to open services file: " << strerror(errno) << std::endl;
-            return;
+    std::lock_guard<std::mutex> lk(cache_mutex);
+    auto found = cache.find(filename);
+    if (found != cache.end()) return found->second;
+    auto& service_map = cache[filename];
+
+    int fd = open(filename.c_str(), O_RDONLY);
+    if (fd < 0) {
+        std::cerr << "Failed to open services file: " << filename << ": " << strerror(errno) << std::endl;
+        return service_map;
+    }
+    struct FDGuard {
+        int fd;
+        ~FDGuard() { if (fd >= 0) close(fd); }
+    } fd_guard{fd};
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        std::cerr << "Failed to get services file size: " << strerror(errno) << std::endl;
+        return service_map;
+    }
+    if (st.st_size == 0) {
+        std::cerr << "services file is empty\n";
+        return service_map;
+    }
+    size_t file_size = static_cast<size_t>(st.st_size);
+    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    if (mapped == MAP_FAILED) {
+        std::cerr << "mmap failed for services file: " << strerror(errno) << std::endl;
+        return service_map;
+    }
+    struct MapGuard {
+        void* ptr; size_t size;
+        ~MapGuard() { munmap(ptr, size); }
+    } map_guard{mapped, file_size};
+
+    service_map.reserve(20000);
+    const char *data = static_cast<const char*>(mapped);
+    const char *end = data + file_size;
+    const char *line_start = data;
+    while (line_start < end) {
+        const char *nl = static_cast<const char*>(memchr(line_start, '\n', end - line_start));
+        const char *line_end = nl ? nl : end;
+        const char *next_line = nl ? nl + 1 : end;
+        if (line_end > line_start && line_end[-1] == '\r') --line_end;
+
+        if (line_start == line_end || *line_start == '#') {
+            line_start = next_line;
+            continue;
         }
-        struct stat st;
-        if (fstat(fd, &st) < 0) {
-            std::cerr << "Failed to get services file size: " << strerror(errno) << std::endl;
-            close(fd);
-            return;
+        const char *ptr = line_start;
+        const char *service_start = ptr;
+        while (ptr < line_end && *ptr != '\t' && *ptr != ' ') {
+            ptr++;
         }
-        off_t file_size = st.st_size;
-        if (file_size == 0) {
-            std::cerr << "services file is empty\n";
-            close(fd);
-            return;
+        if (ptr == service_start) {
+            line_start = next_line;
+            continue;
         }
-        char *mapped_data = static_cast<char*>(mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
-        if (mapped_data == MAP_FAILED) {
-            std::cerr << "mmap failed for services file: " << strerror(errno) << std::endl;
-            close(fd);
-            return;
+        std::string_view service_name(service_start, ptr - service_start);
+        while (ptr < line_end && (*ptr == '\t' || *ptr == ' ')) {
+            ptr++;
         }
-        service_map.reserve(20000);
-        const char *data = mapped_data;
-        const char *end = data + file_size;
-        const char *line_start = data;
-        while (line_start < end) {
-            const char *line_end = static_cast<const char*>(memchr(line_start, '\n', end - line_start));
-            if (!line_end) line_end = end;
-            if (line_start == line_end || *line_start == '#') {
-                line_start = line_end + 1;
-                continue;
+        uint32_t port = 0;
+        bool valid_port = false;
+        bool overflow = false;
+        while (ptr < line_end && *ptr >= '0' && *ptr <= '9') {
+            if (!overflow) {
+                port = port * 10 + static_cast<uint32_t>(*ptr - '0');
+                if (port > 65535) overflow = true;
             }
-            const char *ptr = line_start;
-            const char *service_start = ptr;
+            ptr++;
+            valid_port = true;
+        }
+        if (!valid_port || overflow || port == 0) {
+            line_start = next_line;
+            continue;
+        }
+        bool is_tcp = false;
+        if (ptr < line_end && *ptr == '/') {
+            ptr++;
+            const char *proto_start = ptr;
             while (ptr < line_end && *ptr != '\t' && *ptr != ' ') {
                 ptr++;
             }
-            if (ptr == service_start) {
-                line_start = line_end + 1;
-                continue;
-            }
-            std::string_view service_name(service_start, ptr - service_start);
-            while (ptr < line_end && (*ptr == '\t' || *ptr == ' ')) {
-                ptr++;
-            }
-            uint16_t port = 0;
-            bool valid_port = false;
-            while (ptr < line_end && *ptr >= '0' && *ptr <= '9') {
-                port = port * 10 + (*ptr - '0');
-                ptr++;
-                valid_port = true;
-            }
-            if (!valid_port || port == 0 || port > 65535) {
-                line_start = line_end + 1;
-                continue;
-            }
-            bool is_tcp = false;
-            if (ptr < line_end && *ptr == '/') {
-                ptr++;
-                const char *proto_start = ptr;
-                while (ptr < line_end && *ptr != '\t' && *ptr != ' ') {
-                    ptr++;
-                }
-                std::string_view protocol(proto_start, ptr - proto_start);
-                if (protocol.length() == 3 &&
-                    protocol[0] == 't' &&
-                    protocol[1] == 'c' &&
-                    protocol[2] == 'p') {
-                    is_tcp = true;
-                }
-            }
-            if (is_tcp) {
-                service_map[port] = std::string(service_name);
-            }
-            line_start = line_end + 1;
+            std::string_view protocol(proto_start, ptr - proto_start);
+            if (protocol == "tcp") is_tcp = true;
         }
-        munmap(mapped_data, file_size);
-        close(fd);
-    });
-
+        if (is_tcp) {
+            service_map[static_cast<uint16_t>(port)] = std::string(service_name);
+        }
+        line_start = next_line;
+    }
     return service_map;
 }
 
@@ -1335,21 +1344,26 @@ void for_each_line(const std::string& path,
     struct stat st;
     if (fstat(fd, &st) < 0 || st.st_size == 0) { close(fd); return; }
     size_t file_size = st.st_size;
-    char* data = static_cast<char*>(mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0));
+    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
     close(fd);
-    if (data == MAP_FAILED) return;
+    if (mapped == MAP_FAILED) return;
+    struct MapGuard {
+        void* ptr; size_t size;
+        ~MapGuard() { munmap(ptr, size); }
+    } map_guard{mapped, file_size};
 
+    const char* data = static_cast<const char*>(mapped);
     const char* end = data + file_size;
     const char* p = data;
     while (p < end) {
-        const char* line_end = static_cast<const char*>(memchr(p, '\n', end - p));
-        if (!line_end) line_end = end;
+        const char* nl = static_cast<const char*>(memchr(p, '\n', end - p));
+        const char* line_end = nl ? nl : end;
+        const char* next_line = nl ? nl + 1 : end;
         size_t len = line_end - p;
         if (len > 0 && p[len - 1] == '\r') --len;
         if (len > 0) handle_line(p, len);
-        p = line_end + 1;
+        p = next_line;
     }
-    munmap(data, file_size);
 }
 
 void load_plain_range_file(const std::string& path, const std::string& label) {
