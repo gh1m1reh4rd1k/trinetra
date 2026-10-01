@@ -19,11 +19,17 @@ CXX := g++
 # Optimization flags
 OPT_FLAGS := -std=c++20 -pthread -lssl -lcrypto -lz -lpcre2-8 -march=native -O3 -mavx2 -D__AVX2__ -static-libgcc -static-libstdc++
 
-# Security hardening
-SECURE_FLAGS := -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
-                -Wformat -Wformat-security -fPIE -pie \
-                -Wl,-z,relro,-z,now \
-                -Wl,-z,noexecstack -fstack-clash-protection
+# Security flags for COMPILING (.o files)
+SECURE_CXXFLAGS := -fstack-protector-strong -D_FORTIFY_SOURCE=3 \
+                   -Wformat -Wformat-security -fPIE \
+                   -fstack-clash-protection -fcf-protection=full \
+                   -fzero-call-used-regs=all -D_GLIBCXX_ASSERTIONS
+
+# Security flags for LINKING (final binary)
+SECURE_LDFLAGS := -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
+
+CXXFLAGS := $(SECURE_CXXFLAGS) $(OPT_FLAGS) $(INCLUDES)
+LDFLAGS := $(SECURE_LDFLAGS) $(OPT_FLAGS) $(LIB_DIRS)
 
 # Include and library paths
 INCLUDES := -I/usr/include/liburing
