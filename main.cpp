@@ -615,7 +615,7 @@ int main(int argc, char *argv[]) {
             std::string val = get_next_arg(idx, "--cong-curve");
             try {
                 double c = std::stod(val);
-                if (c <= 0.0) { std::cerr << "--cong-curve: must be > 0\n"; exit(1); }
+                if (!std::isfinite(c) || c <= 0.0) { std::cerr << "--cong-curve: must be a finite number > 0\n"; exit(1); }
                 g_cong_tune.curve_exp = c;
             } catch (...) { std::cerr << "--cong-curve: invalid number\n"; exit(1); }
         }},
