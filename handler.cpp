@@ -433,22 +433,24 @@ void load_mac_vendors(const std::string &filename) {
     const char* end = data + file_size;
     const char* p = data;
     while (p < end) {
-        const char* line_end = static_cast<const char*>(memchr(p, '\n', end - p));
-        if (!line_end) line_end = end;
-        if (p == line_end || *p == '#') { p = line_end + 1; continue; }
+        const char* nl = static_cast<const char*>(memchr(p, '\n', end - p));
+        const char* line_end = nl ? nl : end;
+        const char* next_line = nl ? nl + 1 : end;
+        if (line_end > p && line_end[-1] == '\r') --line_end;
+        if (p == line_end || *p == '#') { p = next_line; continue; }
         const char* delim = p;
         while (delim < line_end && *delim != ' ' && *delim != '\t') ++delim;
-        if (delim == line_end) { p = line_end + 1; continue; }
+        if (delim == line_end) { p = next_line; continue; }
         char key[7]; int k = 0;
         for (const char* c = p; c < delim && k < 6; ++c)
             if (*c != ':') key[k++] = toupper((unsigned char)*c);
-        if (k != 6) { p = line_end + 1; continue; }
+        if (k != 6) { p = next_line; continue; }
 
         const char* v = delim;
         while (v < line_end && (*v == ' ' || *v == '\t')) ++v;
 
         mac_vendor_map.emplace(std::string(key, 6), std::string(v, line_end - v));
-        p = line_end + 1;
+        p = next_line;
     }
 }
 
@@ -2202,7 +2204,7 @@ void save_scan_results(const std::vector<RecPross>& results, const std::string& 
     std::sort(combined_result.open_ports.begin(), combined_result.open_ports.end());
     std::sort(combined_result.filtered_ports.begin(), combined_result.filtered_ports.end());
 
-    const auto& service_map = read_services_from_file("services");
+    const auto& service_map = read_services_from_file("/usr/share/nmap/nmap-services");
 
     const std::string safe_mac = combined_result.mac_address;
     const std::string safe_vendor = combined_result.mac_address.empty()
@@ -2783,7 +2785,7 @@ void thread_worker(const std::vector<std::string>& thread_ips,
         }
 
         RecPross& result = results[i];
-        const auto& service_map = read_services_from_file("services");
+        const auto& service_map = read_services_from_file("/usr/share/nmap/nmap-services");
         std::string not_shown_message;
         if (result.closed_ports > 0 && !print_individual_closed_filtered) {
             not_shown_message += std::to_string(result.closed_ports) + " closed tcp ports (reset)";
