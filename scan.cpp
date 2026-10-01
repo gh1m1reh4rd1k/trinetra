@@ -6915,7 +6915,7 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
     }
     
     if (result.filtered_ports.size() > 0 && result.filtered_ports.size() <= 4) {
-        const auto& service_map = read_services_from_file("services");
+        const auto& service_map = read_services_from_file("/usr/share/nmap/nmap-services");
         for (uint16_t fport : result.filtered_ports) {
             std::string fsvc = service_map.count(fport) ? service_map.at(fport) : "unknown";
             std::string icmp_note;
