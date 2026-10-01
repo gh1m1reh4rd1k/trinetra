@@ -3587,7 +3587,7 @@ void print_full_help() {
 		std::cerr << color::yellow << "  --retry-delay-min" << color::reset << " <dur>       Floor for congestion-scaled retry delay (default: 3ms)\n";
 		std::cerr << color::yellow << "  --retry-delay-max" << color::reset << " <dur>       Ceiling for congestion-scaled retry delay (default: 700ms)\n";
 		std::cerr << color::yellow << "  --retry-delay-floor-div" << color::reset << " <n>   Divisor applied to learned RTT timeout for the delay floor (default: 4)\n";
-		std::cerr << color::yellow << "  --cong-curve" << color::reset << " <float>          Exponent shaping how fast delay ramps up with congestion (default: 2.0, higher = more aggressive near the ceiling)\n";
+		std::cerr << color::yellow << "  --cong-curve" << color::reset << " <float>          Exponent shaping how fast retry delay, dynamic rate limit, batch delay and retry cap ramp up with congestion (default: 2.0, higher = stays gentle longer, then ramps harder near full congestion)\n";
 		std::cerr << color::yellow << "  --cong-alpha-up" << color::reset << " <0-1>         EMA smoothing weight when congestion is rising (default: 0.5, higher = reacts faster)\n";
 		std::cerr << color::yellow << "  --cong-alpha-down" << color::reset << " <0-1>       EMA smoothing weight when congestion is falling (default: 0.1, lower = recovers slower/more cautiously)\n\n";
 
@@ -3597,14 +3597,14 @@ void print_full_help() {
 
 		std::cerr << color::yellow << "  --rate-dyn-window" << color::reset << " <dur>       Window size for the adaptive rate limiter (default: 200ms)\n";
 		std::cerr << color::yellow << "  --rate-dyn-min" << color::reset << " <n>            Min packets/window under heavy congestion (default: 20)\n";
-		std::cerr << color::yellow << "  --rate-dyn-max" << color::reset << " <n>            Max packets/window when healthy (default: 150)\n\n";
+		std::cerr << color::yellow << "  --rate-dyn-max" << color::reset << " <n>            Max packets/window once congestion is detected (default: 150); rate is unlimited until the first retry congestion appears\n\n";
 
 		std::cerr << color::yellow << "  --batch-delay-dyn-min" << color::reset << " <dur>   Min inter-batch sleep under adaptive batch delay (default: 0)\n";
 		std::cerr << color::yellow << "  --batch-delay-dyn-max" << color::reset << " <dur>   Max inter-batch sleep under adaptive batch delay (default: 800ms)\n\n";
 
 		std::cerr << color::yellow << "  --buf-peak" << color::reset << " <float>            Peak buffer-pool over-allocation factor (default: 1.3)\n";
 		std::cerr << color::yellow << "  --batch-settle" << color::reset << " <us>           io_uring batch-settle wait before submit (default: 500)\n";
-		std::cerr << color::yellow << "  --sqpoll-threshold" << color::reset << " <n>        Probe volume (hosts*ports) that auto-enables SQPOLL when pacing is adaptive/dynamic (default: 300000). When rate/batch-delay use fixed, non-dynamic pacing, an estimated-duration check is used instead.\n";
+		std::cerr << color::yellow << "  --sqpoll-threshold" << color::reset << " <n>        Probe volume (hosts*ports) per host batch that auto-enables SQPOLL when pacing is adaptive/dynamic (default: 300000, triggers at >=). When rate/batch-delay use fixed, non-dynamic pacing, an estimated-duration check is used instead.\n";
 		std::cerr << "\n  " << color::yellow << "Note: --rate-dyn-* requires the rate limiter to stay in its default adaptive mode —\n"
                      				     << "  combining it with an explicit --rate is rejected at startup.\n"
                                                      << "  Same rule for --batch-delay-dyn-* and an explicit --batch-delay." << color::reset << "\n\n";
@@ -3635,7 +3635,7 @@ void print_full_help() {
 		std::cerr << color::yellow << " --rcv-uring" << color::reset << " <depth> Set io_uring receive queue depth (Allowed values: 2, 4, 6, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, default: auto=dynamic)\n";
 		std::cerr << color::yellow << " --rcvbuf" << color::reset << " <size> Set receive buffer size in bytes(128k, 2m, 1g, or bytes), (default: auto)\n";
 		std::cerr << color::yellow << " --send-uring" << color::reset << " <depth> Set io_uring send queue depth (Allowed values: 2, 4, 6, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, default: auto=2048)\n";
-		std::cerr << color::yellow << " --sqpoll" << color::reset << " Force-enable io_uring SQPOLL mode (kernel-thread submission, fewer io_uring_enter syscalls). Auto-enabled when adaptive pacing sees >300000 total probes, or when fixed pacing predicts a scan >=8s\n";
+		std::cerr << color::yellow << " --sqpoll" << color::reset << " Force-enable io_uring SQPOLL mode (kernel-thread submission, fewer io_uring_enter syscalls). Auto-enabled when adaptive pacing sees >= --sqpoll-threshold probes (default 300000, counted per host batch), or when fixed pacing predicts a scan >=8s\n";
 		std::cerr << color::yellow << " -b <size>" << color::reset << " Set max port batch size (default: 500, support: 1 to 65535)\n"
 			  		   << "     Ports are split into batches of at most this size, evenly\n"
 			                   << "     distributed across chunk — actual batch sizes may be smaller(auto handles uneven).\n"
