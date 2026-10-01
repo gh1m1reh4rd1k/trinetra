@@ -1281,6 +1281,27 @@ int run(int argc, char* argv[]) {
     int tls_port = kDefaultTlsPort;
     const std::string bind_addr = "127.0.0.1";
     std::string fixed_token;
+    bool token_given = false;
+
+    auto parse_port = [](const std::string& s, int& out) -> bool {
+        if (s.empty() || s.size() > 5) return false;
+        for (unsigned char c : s) if (!std::isdigit(c)) return false;
+        long v = std::strtol(s.c_str(), nullptr, 10);
+        if (v < 1024 || v > 65535) return false;
+        out = static_cast<int>(v);
+        return true;
+    };
+
+    auto valid_token = [](const std::string& t) -> bool {
+        if (t.size() < kMinFixedTokenLen || t.size() > 128) return false;
+        bool seen[256] = {false};
+        int distinct = 0;
+        for (unsigned char c : t) {
+            if (!(std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')) return false;
+            if (!seen[c]) { seen[c] = true; ++distinct; }
+        }
+        return distinct >= 8;
+    };
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1292,9 +1313,13 @@ int run(int argc, char* argv[]) {
             return argv[++i];
         };
         if (arg == "--server-port") {
-            tls_port = std::atoi(next("--server-port").c_str());
+            if (!parse_port(next("--server-port"), tls_port)) {
+                std::cerr << "--server-port must be a whole number from 1024 to 65535\n";
+                return 1;
+            }
         } else if (arg == "--server-token") {
             fixed_token = next("--server-token");
+            token_given = true;
             std::cerr << "warning: --server-token puts the token in argv, which is visible to "
                          "any local user via `ps` or /proc/<pid>/cmdline, and often ends up in "
                          "shell history. Prefer leaving this unset and using the randomly "
@@ -1308,9 +1333,9 @@ int run(int argc, char* argv[]) {
         std::cerr << "--server-port must be 1-65535\n";
         return 1;
     }
-    if (!fixed_token.empty() && fixed_token.size() < kMinFixedTokenLen) {
-        std::cerr << "--server-token must be at least " << kMinFixedTokenLen
-                   << " characters (needs enough entropy to resist guessing)\n";
+    if (token_given && !valid_token(fixed_token)) {
+        std::cerr << "--server-token must be 16-128 characters, only letters, digits and - _ . ~, "
+                     "and not repetitive (e.g. not 'aaaaaaaaaaaaaaaa')\n";
         return 1;
     }
 
