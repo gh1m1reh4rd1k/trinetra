@@ -204,7 +204,7 @@ size_t PacketBufferPool::get_max_buffer_count(size_t ports, size_t num_threads, 
     size_t max_count = static_cast<size_t>(base_count * PEAK_FACTOR);
     size_t effective_batch = std::min(batch_size, ports);
     const size_t ABSOLUTE_MAX = std::max<size_t>(2048, effective_batch * 2);
-    return std::min(max_count, ABSOLUTE_MAX);
+    return std::max(base_count, std::min(max_count, ABSOLUTE_MAX));
 }
 
 void PacketBufferPool::initialize_thread_local_buffers() {
@@ -212,7 +212,7 @@ void PacketBufferPool::initialize_thread_local_buffers() {
         return;
     }
 
-    const size_t effective_pool_size = std::min(pool_size, max_buffers);
+    const size_t effective_pool_size = max_buffers;
     slab.resize(effective_pool_size * buffer_size);
 
     slab_start = slab.data();
@@ -6894,14 +6894,14 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
         if (batch_delay_config.enabled && !terminate_flag) {
 	    uint64_t sleep_us = 0;
 	    if (batch_delay_config.dynamic_mode) {                       
-		if (retry_budget.ports_in_retry.load(std::memory_order_relaxed) == 0) {
-		    sleep_us = 0;                                      
-		} else {
-		    double ratio  = retry_budget.congestion_ratio.load(std::memory_order_relaxed);
+		{
+		    double ratio = retry_budget.congestion_ratio.load(std::memory_order_relaxed);
+		    if (!(ratio > 0.0)) ratio = 0.0;
+		    if (ratio > 1.0)    ratio = 1.0;
 		    double curved = std::pow(ratio, g_cong_tune.curve_exp);
 		    sleep_us = batch_delay_config.min_us +
-		        static_cast<uint64_t>(curved *
-		            (batch_delay_config.max_us - batch_delay_config.min_us));
+			static_cast<uint64_t>(curved *
+			    (batch_delay_config.max_us - batch_delay_config.min_us));
 		}
 	    } else if (batch_delay_config.random_mode || batch_delay_config.range_mode) {
 		std::uniform_int_distribution<uint64_t> dist(
