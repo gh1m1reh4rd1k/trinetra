@@ -2589,7 +2589,10 @@ int run_reverse(const Options& opts) {
     if (!opts.ip.empty()) {
         uint32_t host = 0;
         if (!parse_v4_addr(trim_sv(opts.ip), host)) {
-            std::cerr << col(kRed) << "[discover] --ip: '" << opts.ip << "' is not a valid IPv4 address" << col(kReset) << "\n";
+            std::string shown = opts.ip;
+            sanitize_inplace(shown);
+            if (shown.size() > 64) shown.resize(64);
+            std::cerr << col(kRed) << "[discover] --ip: '" << shown << "' is not a valid IPv4 address" << col(kReset) << "\n";
             return 1;
         }
         query = v4_to_string(host);
@@ -2638,7 +2641,10 @@ int run_reverse(const Options& opts) {
 int run_asn_routes(const Options& opts) {
     uint32_t asn = 0;
     if (!parse_asn_arg(opts.asn, asn)) {
-        std::cerr << col(kRed) << "[discover] --asn: '" << opts.asn << "' is not a valid ASN (use AS45353 or 45353)" << col(kReset) << "\n";
+        std::string shown = opts.asn;
+        sanitize_inplace(shown);
+        if (shown.size() > 64) shown.resize(64);
+        std::cerr << col(kRed) << "[discover] --asn: '" << shown << "' is not a valid ASN (use AS45353 or 45353)" << col(kReset) << "\n";
         return 1;
     }
     if (!opts.want_v4 && !opts.want_v6) {
