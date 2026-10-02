@@ -500,6 +500,7 @@ static IfaceSubnetInfo get_iface_subnet_info_cached(const std::string& interface
         }
         close(tmp_sock);
     }
+    if (!info.ok) return info;
     std::lock_guard<std::mutex> lk(g_iface_subnet_mutex);
     return g_iface_subnet_cache[interface] = info;
 }
@@ -613,17 +614,8 @@ bool is_target_same_network_internal(const std::string& target_ip, std::string* 
     return !same_as_default_path;
 }
 
-static std::mutex g_onlink_cache_mutex;
-static std::unordered_map<std::string, bool> g_onlink_cache;
-
 bool is_target_onlink_cached(const std::string& target_ip, const std::string& interface = "") {
-    std::string key = target_ip + "|" + interface;
-    { std::lock_guard<std::mutex> lk(g_onlink_cache_mutex);
-      auto it = g_onlink_cache.find(key);
-      if (it != g_onlink_cache.end()) return it->second; }
-    bool result = is_target_onlink(target_ip, interface);
-    std::lock_guard<std::mutex> lk(g_onlink_cache_mutex);
-    return g_onlink_cache[key] = result;
+    return is_target_onlink(target_ip, interface);
 }
 
 TargetLocality assess_target_locality(const std::string& target_ip, std::string interface) {
