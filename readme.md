@@ -191,8 +191,10 @@ If you already have all dependencies installed:
     sudo shiv 10.0.0.5 -p 80,443,8080 -sX
 
     # Full 4-way handshake scan inside an isolated namespace
-    sudo shiv 10.0.0.5 -p 80,443 -G \
-        --split --split-ip 192.168.1.114/24 --split-gw 192.168.1.254
+    sudo shiv 10.0.0.5 -p 80,443 -G 
+
+    # Scan inside an isolated namespace
+    sudo shiv --split 192.168.1.254 -p 443,22
 
 ### Service / version detection
 
