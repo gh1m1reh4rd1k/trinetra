@@ -96,6 +96,21 @@ struct RetryBudgetState {
     std::atomic<size_t> active_ports{0};
 
     RetryBudgetState() { dynamic_max_retries.store(g_cong_tune.min_retries); }
+    double update_congestion(double sample) {
+        if (!std::isfinite(sample)) sample = 0.0;
+        sample = std::clamp(sample, 0.0, 1.0);
+        double prev  = congestion_ratio.load(std::memory_order_relaxed);
+        double alpha = (sample > prev) ? g_cong_tune.alpha_up : g_cong_tune.alpha_down;
+        double next  = std::clamp(alpha * sample + (1.0 - alpha) * prev, 0.0, 1.0);
+        if (next < 0.01) next = 0.0;              
+        congestion_ratio.store(next, std::memory_order_relaxed);
+        int span = g_cong_tune.max_retries - g_cong_tune.min_retries;
+        int dyn  = g_cong_tune.min_retries +
+                   static_cast<int>(std::lround(std::pow(next, g_cong_tune.curve_exp) * span));
+        dyn = std::clamp(dyn, g_cong_tune.min_retries, g_cong_tune.max_retries);
+        dynamic_max_retries.store(dyn, std::memory_order_relaxed);
+        return next;
+    }
 };
 void track_raw_socket(int fd);
 void untrack_raw_socket(int fd);
