@@ -3,7 +3,7 @@
 > A low-level, high-performance TCP/UDP port scanner and service
 > fingerprinter built on Linux `io_uring`.
 
-[![License](https://img.shields.io/badge/license-<YOUR_LICENSE>-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)]()
 [![Kernel](https://img.shields.io/badge/kernel-6.12%2B-critical.svg)]()
 [![C++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)]()
