@@ -261,7 +261,7 @@ If you already have all dependencies installed:
 
 > For the full flag reference — pacing, IP/TCP header crafting, IPv6
 > extension-header control, buffer management, debug modes, and more —
-> see [`wiki/standard_documentation`](wiki/standard_documentation) (or run `shiv --help`)
+> see [`https://github.com/gh1m1reh4rd1k/trinetra/wiki/standard_documentation`](https://github.com/gh1m1reh4rd1k/trinetra/wiki/standard_documentation) (or run `shiv --help`)
 
 ---
 
