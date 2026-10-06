@@ -1684,6 +1684,12 @@ int main(int argc, char *argv[]) {
         std::cerr << "network seems down, scan terminated\n";
         return 0;
     }
+    
+    for (int pre_idx = arg_idx; pre_idx < argc; ++pre_idx) {
+        const std::string pre_arg = argv[pre_idx];
+        if (pre_arg == "-6") g_target_ip_pref = 6;
+        else if (pre_arg == "-4") g_target_ip_pref = 4;
+    }
 
     while (arg_idx < argc) {
         std::string arg = argv[arg_idx];
@@ -2537,9 +2543,9 @@ int main(int argc, char *argv[]) {
 
         for (const auto& ip : ips) {
 	    if (terminate_flag) break;
-	    auto hops = (config.traceroute_ip_version == 6)
-		            ? run_traceroute6(ip, topts)
-		            : run_traceroute(ip, topts);
+	    struct in6_addr target_addr6{};
+	    const bool target_is_v6 = (::inet_pton(AF_INET6, ip.c_str(), &target_addr6) == 1);
+	    auto hops = target_is_v6 ? run_traceroute6(ip, topts) : run_traceroute(ip, topts);
 	    print_traceroute_results(ip, hops, topts.max_hops);
 	}
     };
