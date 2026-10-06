@@ -3519,7 +3519,7 @@ void print_full_help() {
 		std::cerr << color::yellow << " --dns-servers" << color::reset << " <server,server,...> Use these DNS servers (1-10, IPv4 or IPv6) instead of the system resolver\n";
 		std::cerr << color::yellow << " --dns-servers-tls" << color::reset << " <server,server,...> Use these DNS servers over DNS-over-TLS, port 853, cert-verified (1-10, IPv4 or IPv6)\n";
 		std::cerr << color::yellow << " -4" << color::reset << " Force IPv4-only when resolving domain targets (fails instead of falling back to IPv6)\n";
-		std::cerr << color::yellow << " -6" << color::reset << " Prefer IPv6 when resolving domain targets (falls back to IPv4 if the domain has no AAAA record)\n";
+		std::cerr << color::yellow << " -6" << color::reset << " Force IPv6-only when resolving domain targets (fails instead of falling back to IPv4)\n";
 		std::cerr << color::yellow << " --exclude-ports" << color::reset << " <PORT_SPEC> Ports to exclude from scanning (format same as -p)\n\n";
 		std::cerr << color::green << "State Machine Scan:\n" << color::reset;
 		std::cerr << color::yellow << " -G" << color::reset << " State Machine Scan (perform 4 way handshake , it run inside namespace )\n\n";
