@@ -249,8 +249,7 @@ If you already have all dependencies installed:
 
     sudo shiv 8.8.8.8 --traceroute
 
-    # IPv6 traceroute
-    sudo shiv 2606:4700:4700::1111 --traceroute -6
+    sudo shiv scanme.nmap.org --traceroute
 
 ### Server mode
 
