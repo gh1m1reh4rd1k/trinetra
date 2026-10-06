@@ -3587,7 +3587,7 @@ void print_full_help() {
 
 		std::cerr << color::yellow << "  --rto-mult" << color::reset << " <n>                RTT-variance multiplier in the RTO formula base_rtt + n*rttvar (default: 4, Jacobson/Karels)\n";
 		std::cerr << color::yellow << "  --rto-pad1" << color::reset << " <ms>               Extra timeout padding added on 1st retry (default: 40ms)\n";
-		std::cerr << color::yellow << "  --rto-pad2" << color::reset << " <ms>               Extra timeout padding added on 2nd+ retry (default: 100ms)\n\n";
+		std::cerr << color::yellow << "  --rto-pad2" << color::reset << " <ms>               Extra timeout padding added on the 2nd retry, escalating by +50% of this value per retry stage beyond that (default: 100ms)\n";
 
 		std::cerr << color::yellow << "  --rate-dyn-window" << color::reset << " <dur>       Window size for the adaptive rate limiter (default: 200ms)\n";
 		std::cerr << color::yellow << "  --rate-dyn-min" << color::reset << " <n>            Min packets/window under heavy congestion (default: 20)\n";
@@ -3596,8 +3596,8 @@ void print_full_help() {
 		std::cerr << color::yellow << "  --batch-delay-dyn-min" << color::reset << " <dur>   Min inter-batch sleep under adaptive batch delay (default: 0)\n";
 		std::cerr << color::yellow << "  --batch-delay-dyn-max" << color::reset << " <dur>   Max inter-batch sleep under adaptive batch delay (default: 800ms)\n\n";
 
-		std::cerr << color::yellow << "  --buf-peak" << color::reset << " <float>            Peak buffer-pool over-allocation factor (default: 1.3)\n";
-		std::cerr << color::yellow << "  --batch-settle" << color::reset << " <us>           io_uring batch-settle wait before submit (default: 500)\n";
+		std::cerr << color::yellow << "  --buf-peak" << color::reset << " <float>            Peak buffer-pool over-allocation factor, 1.0-20.0 (default: 1.3; hard limit 65536 buffers)\n";
+		std::cerr << color::yellow << "  --batch-settle" << color::reset << " <us>           Min wait (us) for receive-ring completions to coalesce before processing (default: 500)\n";
 		std::cerr << color::yellow << "  --sqpoll-threshold" << color::reset << " <n>        Probe volume (hosts*ports) per host batch that auto-enables SQPOLL when pacing is adaptive/dynamic (default: 300000, triggers at >=). When rate/batch-delay use fixed, non-dynamic pacing, an estimated-duration check is used instead.\n";
 		std::cerr << "\n  " << color::yellow << "Note: --rate-dyn-* requires the rate limiter to stay in its default adaptive mode —\n"
                      				     << "  combining it with an explicit --rate is rejected at startup.\n"
