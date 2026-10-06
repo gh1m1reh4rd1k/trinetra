@@ -199,12 +199,10 @@ size_t PacketBufferPool::get_buffer_count(size_t ports, size_t num_threads, size
 }
 
 size_t PacketBufferPool::get_max_buffer_count(size_t ports, size_t num_threads, size_t batch_size) {
-    const double PEAK_FACTOR = g_cong_tune.buf_peak_factor;
     size_t base_count = get_buffer_count(ports, num_threads, batch_size);
-    size_t max_count = static_cast<size_t>(base_count * PEAK_FACTOR);
-    size_t effective_batch = std::min(batch_size, ports);
-    const size_t ABSOLUTE_MAX = std::max<size_t>(2048, effective_batch * 2);
-    return std::max(base_count, std::min(max_count, ABSOLUTE_MAX));
+    size_t max_count  = static_cast<size_t>(base_count * g_cong_tune.buf_peak_factor);
+    constexpr size_t HARD_MAX = 65536;            
+    return std::max(base_count, std::min(max_count, HARD_MAX));
 }
 
 void PacketBufferPool::initialize_thread_local_buffers() {
@@ -2946,11 +2944,6 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
         std::chrono::steady_clock::now();
     const int MIN_TIMEOUT_MS = port_timeout_min_ms;
     const int MAX_TIMEOUT_MS = port_timeout_max_ms;
-    // ── Phase-1 RTT gate ─────────────────────────────────────────────
-    // A port that hits its first no-reply timeout before any real RTT
-    // sample exists gets parked here instead of scheduled off a guess.
-    // Released the instant a real RTT arrives (Edit E), or at
-    // phase1_deadline if the target never replies at all (Edit D).
     const auto phase1_deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(MAX_TIMEOUT_MS);
     std::vector<uint16_t> gate_pending_ports;
@@ -3082,14 +3075,15 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
 		if (rate_config.gate_by_retry && no_retries_yet) {
 		    rs.rate_window_target = UINT32_MAX;   
 		} else {
-		    double ratio  = retry_budget.congestion_ratio.load(std::memory_order_relaxed);
+                    double ratio = std::clamp(
+		        retry_budget.congestion_ratio.load(std::memory_order_relaxed), 0.0, 1.0);
 		    if (ratio <= 0.0) {
-			rs.rate_window_target = UINT32_MAX; 
+			rs.rate_window_target = UINT32_MAX;
 		    } else {
 			double curved = std::pow(ratio, g_cong_tune.curve_exp);
 			uint32_t span = rate_config.max_packets - rate_config.min_packets;
-			rs.rate_window_target = rate_config.max_packets -
-			    static_cast<uint32_t>(curved * span);
+			uint32_t cut  = std::min<uint32_t>(span, static_cast<uint32_t>(curved * span));
+			rs.rate_window_target = rate_config.max_packets - cut;
 		    }
 		}
 	    } else if (rate_config.min_packets < rate_config.max_packets) {
@@ -4465,19 +4459,8 @@ RecPross receive_response(const char *dest_ip, std::span<const int> ports, uint3
 		    double filtered_ratio = static_cast<double>(retry_budget.ports_in_retry.load(std::memory_order_relaxed)) /
 		        static_cast<double>(global_active > 0 ? global_active : 1);
 		        
-		    double prev_g = retry_budget.congestion_ratio.load(std::memory_order_relaxed);
-		    double alpha  = (filtered_ratio > prev_g) ? g_cong_tune.alpha_up : g_cong_tune.alpha_down;
-		    double new_g  = alpha * filtered_ratio + (1 - alpha) * prev_g;
-		    retry_budget.congestion_ratio.store(new_g, std::memory_order_relaxed);
-		    // corrected — direct relationship, not inverted
-		    {
-		        double ratio_c = std::pow(new_g, g_cong_tune.curve_exp);
-		        int span = g_cong_tune.max_retries - g_cong_tune.min_retries;
-		        int dyn  = g_cong_tune.min_retries +
-			          static_cast<int>(std::lround(ratio_c * span)); 
-		        dyn = std::clamp(dyn, g_cong_tune.min_retries, g_cong_tune.max_retries);
-		        retry_budget.dynamic_max_retries.store(dyn, std::memory_order_relaxed);
-		    }
+		    filtered_ratio = std::min(filtered_ratio, 1.0);
+		    retry_budget.update_congestion(filtered_ratio);
 
 		    const uint64_t MIN_DELAY_US = g_cong_tune.retry_delay_min_us;
 		    const uint64_t MAX_DELAY_US = g_cong_tune.retry_delay_max_us;
@@ -6889,29 +6872,33 @@ void worker_thread(const char *ip, uint32_t local_ip, const char* source_ip, con
         result.strack_counts += batch_result.strack_counts;
         result.strack_entries.insert(result.strack_entries.end(),
             batch_result.strack_entries.begin(), batch_result.strack_entries.end());
-            
-        
+
+        {
+            size_t act = retry_budget.active_ports.load(std::memory_order_relaxed);
+            size_t pir = retry_budget.ports_in_retry.load(std::memory_order_relaxed);
+            retry_budget.update_congestion(
+                static_cast<double>(pir) / static_cast<double>(act > 0 ? act : 1));
+        }
+
         if (batch_delay_config.enabled && !terminate_flag) {
-	    uint64_t sleep_us = 0;
-	    if (batch_delay_config.dynamic_mode) {                       
-		{
-		    double ratio = retry_budget.congestion_ratio.load(std::memory_order_relaxed);
-		    if (!(ratio > 0.0)) ratio = 0.0;
-		    if (ratio > 1.0)    ratio = 1.0;
-		    double curved = std::pow(ratio, g_cong_tune.curve_exp);
-		    sleep_us = batch_delay_config.min_us +
-			static_cast<uint64_t>(curved *
-			    (batch_delay_config.max_us - batch_delay_config.min_us));
-		}
-	    } else if (batch_delay_config.random_mode || batch_delay_config.range_mode) {
-		std::uniform_int_distribution<uint64_t> dist(
-		    batch_delay_config.min_us, batch_delay_config.max_us);
-		sleep_us = dist(rng);
-	    } else {
-		sleep_us = batch_delay_config.delay_us;
-	    }
-	    pending_dispatch_delay_us = sleep_us;
-	}
+            uint64_t sleep_us = 0;
+            if (batch_delay_config.dynamic_mode) {
+                double ratio = retry_budget.congestion_ratio.load(std::memory_order_relaxed);
+                if (!(ratio > 0.0)) ratio = 0.0;
+                if (ratio > 1.0)    ratio = 1.0;
+                double curved = std::pow(ratio, g_cong_tune.curve_exp);
+                uint64_t lo   = batch_delay_config.min_us;
+                uint64_t hi   = std::max(batch_delay_config.max_us, lo);   // guard against underflow
+                sleep_us = lo + static_cast<uint64_t>(curved * static_cast<double>(hi - lo));
+            } else if (batch_delay_config.random_mode || batch_delay_config.range_mode) {
+                std::uniform_int_distribution<uint64_t> dist(
+                    batch_delay_config.min_us, batch_delay_config.max_us);
+                sleep_us = dist(rng);
+            } else {
+                sleep_us = batch_delay_config.delay_us;
+            }
+            pending_dispatch_delay_us = sleep_us;
+        }
     }
     
     if (result.filtered_ports.size() > 0 && result.filtered_ports.size() <= 4) {
