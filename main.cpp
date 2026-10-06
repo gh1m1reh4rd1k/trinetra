@@ -28,6 +28,7 @@
 #include <set>
 #include <iomanip>
 #include <cstdio>
+#include <cerrno>
 #include <queue>
 #include <unordered_set>
 #include <csignal>
@@ -310,6 +311,29 @@ int main(int argc, char *argv[]) {
    
     std::vector<std::string> ips;
     int arg_idx = 1;
+    auto parse_duration_allow_zero = [](const std::string& s, uint64_t& out, const char* opt) -> bool {
+        if (s == "0" || s == "0ms" || s == "0s" || s == "0m") { out = 0; return true; }
+        return parse_duration_to_us(s, out, opt);
+    };
+    auto parse_long_in = [](const std::string& s, const char* opt, long lo, long hi, long& out) -> bool {
+        char* end = nullptr; errno = 0;
+        long v = s.empty() ? 0 : std::strtol(s.c_str(), &end, 10);
+        if (s.empty() || errno != 0 || end == s.c_str() || *end != '\0' || v < lo || v > hi) {
+            std::cerr << opt << ": must be an integer between " << lo << " and " << hi << "\n";
+            return false;
+        }
+        out = v; return true;
+    };
+    auto parse_dbl_in = [](const std::string& s, const char* opt, double lo, double hi, bool lo_excl, double& out) -> bool {
+        char* end = nullptr; errno = 0;
+        double v = s.empty() ? 0.0 : std::strtod(s.c_str(), &end);
+        if (s.empty() || errno != 0 || end == s.c_str() || *end != '\0' || !std::isfinite(v)
+            || v > hi || (lo_excl ? v <= lo : v < lo)) {
+            std::cerr << opt << ": must be a number " << (lo_excl ? "> " : ">= ") << lo << " and <= " << hi << "\n";
+            return false;
+        }
+        out = v; return true;
+    };
 
     auto get_next_arg = [&](int& idx, const std::string& option_name) -> std::string {
         if (idx + 1 >= argc) {
@@ -574,12 +598,12 @@ int main(int argc, char *argv[]) {
         
         {"--batch-delay-dyn-min", [&](int& idx) {
             std::string val = get_next_arg(idx, "--batch-delay-dyn-min");
-            if (!parse_duration_to_us(val, config.batch_delay_dyn_min_us, "--batch-delay-dyn-min")) exit(1);
+            if (!parse_duration_allow_zero(val, config.batch_delay_dyn_min_us, "--batch-delay-dyn-min")) exit(1);
             config.batch_delay_dyn_explicit = true;
         }},
         {"--batch-delay-dyn-max", [&](int& idx) {
             std::string val = get_next_arg(idx, "--batch-delay-dyn-max");
-            if (!parse_duration_to_us(val, config.batch_delay_dyn_max_us, "--batch-delay-dyn-max")) exit(1);
+            if (!parse_duration_allow_zero(val, config.batch_delay_dyn_max_us, "--batch-delay-dyn-max")) exit(1);
             config.batch_delay_dyn_explicit = true;
         }},
 
@@ -596,113 +620,63 @@ int main(int argc, char *argv[]) {
 	
 	{"--retry-delay-min", [&](int& idx) {
             std::string val = get_next_arg(idx, "--retry-delay-min");
-            if (!parse_duration_to_us(val, g_cong_tune.retry_delay_min_us, "--retry-delay-min")) exit(1);
+            if (!parse_duration_allow_zero(val, g_cong_tune.retry_delay_min_us, "--retry-delay-min")) exit(1);
         }},
         {"--retry-delay-max", [&](int& idx) {
             std::string val = get_next_arg(idx, "--retry-delay-max");
             if (!parse_duration_to_us(val, g_cong_tune.retry_delay_max_us, "--retry-delay-max")) exit(1);
         }},
         {"--retry-delay-floor-div", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--retry-delay-floor-div");
-            try {
-                int d = std::stoi(val);
-                if (d < 1) { std::cerr << "--retry-delay-floor-div: must be >= 1\n"; exit(1); }
-                g_cong_tune.rtt_floor_div = static_cast<uint32_t>(d);
-            } catch (...) { std::cerr << "--retry-delay-floor-div: invalid number\n"; exit(1); }
+            long v;
+            if (!parse_long_in(get_next_arg(idx, "--retry-delay-floor-div"), "--retry-delay-floor-div", 1, 1000000, v)) exit(1);
+            g_cong_tune.rtt_floor_div = static_cast<uint32_t>(v);
         }},
-        
         {"--cong-curve", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--cong-curve");
-            try {
-                double c = std::stod(val);
-                if (!std::isfinite(c) || c <= 0.0) { std::cerr << "--cong-curve: must be a finite number > 0\n"; exit(1); }
-                g_cong_tune.curve_exp = c;
-            } catch (...) { std::cerr << "--cong-curve: invalid number\n"; exit(1); }
+            double v;
+            if (!parse_dbl_in(get_next_arg(idx, "--cong-curve"), "--cong-curve", 0.0, 1000.0, true, v)) exit(1);
+            g_cong_tune.curve_exp = v;
         }},
-        
         {"--cong-alpha-up", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--cong-alpha-up");
-            try {
-                double a = std::stod(val);
-                if (!std::isfinite(a) || a <= 0.0 || a > 1.0) {
-                    std::cerr << "--cong-alpha-up: must be a finite number in (0,1]\n"; exit(1);
-                }
-                g_cong_tune.alpha_up = a;
-            } catch (...) { std::cerr << "--cong-alpha-up: invalid number\n"; exit(1); }
+            double v;
+            if (!parse_dbl_in(get_next_arg(idx, "--cong-alpha-up"), "--cong-alpha-up", 0.0, 1.0, true, v)) exit(1);
+            g_cong_tune.alpha_up = v;
         }},
-        
         {"--cong-alpha-down", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--cong-alpha-down");
-            try {
-                double a = std::stod(val);
-                if (!std::isfinite(a) || a <= 0.0 || a > 1.0) {
-                    std::cerr << "--cong-alpha-down: must be a finite number in (0,1]\n"; exit(1);
-                }
-                g_cong_tune.alpha_down = a;
-            } catch (...) { std::cerr << "--cong-alpha-down: invalid number\n"; exit(1); }
+            double v;
+            if (!parse_dbl_in(get_next_arg(idx, "--cong-alpha-down"), "--cong-alpha-down", 0.0, 1.0, true, v)) exit(1);
+            g_cong_tune.alpha_down = v;
         }},
-        
         {"--rto-mult", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--rto-mult");
-            try {
-                int m = std::stoi(val);
-                if (m < 1 || m > 64) { std::cerr << "--rto-mult: must be between 1 and 64\n"; exit(1); }
-                g_cong_tune.rto_mult = m;
-            } catch (...) { std::cerr << "--rto-mult: invalid number\n"; exit(1); }
+            long v;
+            if (!parse_long_in(get_next_arg(idx, "--rto-mult"), "--rto-mult", 1, 64, v)) exit(1);
+            g_cong_tune.rto_mult = static_cast<int>(v);
         }},
-        
         {"--rto-pad1", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--rto-pad1");
-            try {
-                int p = std::stoi(val);
-                if (p < 0 || p > 10000) { std::cerr << "--rto-pad1: must be between 0 and 10000 (ms)\n"; exit(1); }
-                g_cong_tune.rto_pad1_ms = p;
-            } catch (...) { std::cerr << "--rto-pad1: invalid number\n"; exit(1); }
+            long v;
+            if (!parse_long_in(get_next_arg(idx, "--rto-pad1"), "--rto-pad1", 0, 10000, v)) exit(1);
+            g_cong_tune.rto_pad1_ms = static_cast<int>(v);
         }},
-        
         {"--rto-pad2", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--rto-pad2");
-            try {
-                int p = std::stoi(val);
-                if (p < 0 || p > 10000) { std::cerr << "--rto-pad2: must be between 0 and 10000 (ms)\n"; exit(1); }
-                g_cong_tune.rto_pad2_ms = p;
-            } catch (...) { std::cerr << "--rto-pad2: invalid number\n"; exit(1); }
+            long v;
+            if (!parse_long_in(get_next_arg(idx, "--rto-pad2"), "--rto-pad2", 0, 10000, v)) exit(1);
+            g_cong_tune.rto_pad2_ms = static_cast<int>(v);
         }},
-        
         {"--buf-peak", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--buf-peak");
-            try {
-                double p = std::stod(val);
-                if (!std::isfinite(p) || p < 1.0 || p > 20.0) {
-                    std::cerr << "--buf-peak: must be a finite number between 1.0 and 20.0\n"; exit(1);
-                }
-                g_cong_tune.buf_peak_factor = p;
-            } catch (...) { std::cerr << "--buf-peak: invalid number\n"; exit(1); }
+            double v;
+            if (!parse_dbl_in(get_next_arg(idx, "--buf-peak"), "--buf-peak", 1.0, 20.0, false, v)) exit(1);
+            g_cong_tune.buf_peak_factor = v;
         }},
-        
         {"--batch-settle", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--batch-settle");
-            if (val.find('-') != std::string::npos) {
-                std::cerr << "--batch-settle: must be a non-negative number\n"; exit(1);
-            }
-            try {
-                unsigned long v = std::stoul(val);
-                if (v > 5'000'000UL) { std::cerr << "--batch-settle: must be <= 5000000 (us)\n"; exit(1); }
-                g_cong_tune.batch_settle_us = static_cast<unsigned>(v);
-            } catch (...) { std::cerr << "--batch-settle: invalid number (microseconds)\n"; exit(1); }
+            long v;
+            if (!parse_long_in(get_next_arg(idx, "--batch-settle"), "--batch-settle", 0, 5000000, v)) exit(1);
+            g_cong_tune.batch_settle_us = static_cast<unsigned>(v);
         }},
-        
         {"--sqpoll-threshold", [&](int& idx) {
-            std::string val = get_next_arg(idx, "--sqpoll-threshold");
-            if (val.find('-') != std::string::npos) {
-                std::cerr << "--sqpoll-threshold: must be a non-negative number\n"; exit(1);
-            }
-            try {
-                g_cong_tune.sqpoll_threshold = static_cast<size_t>(std::stoul(val));
-            } catch (...) { std::cerr << "--sqpoll-threshold: invalid number\n"; exit(1); }
+            long v;
+            if (!parse_long_in(get_next_arg(idx, "--sqpoll-threshold"), "--sqpoll-threshold", 0, 1L << 40, v)) exit(1);
+            g_cong_tune.sqpoll_threshold = static_cast<size_t>(v);
         }},
         
-	
 	{"--bandwidth", [&](int& idx) {
             std::string bw_str = get_next_arg(idx, "--bandwidth");
             if (!parse_bandwidth_config(bw_str, config.bandwidth_config)) {
@@ -2278,15 +2252,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (g_cong_tune.retry_delay_min_us > g_cong_tune.retry_delay_max_us) {
-        std::cerr << "--retry-delay-min must be <= --retry-delay-max\n";
+        std::cerr << "--retry-delay-min (" << g_cong_tune.retry_delay_min_us / 1000.0
+                  << "ms) must be <= --retry-delay-max (" << g_cong_tune.retry_delay_max_us / 1000.0 << "ms)\n";
         return 1;
     }
     if (config.rate_dyn_min > config.rate_dyn_max) {
-        std::cerr << "--rate-dyn-min must be <= --rate-dyn-max\n";
+        std::cerr << "--rate-dyn-min (" << config.rate_dyn_min
+                  << ") must be <= --rate-dyn-max (" << config.rate_dyn_max << ")\n";
         return 1;
     }
     if (config.batch_delay_dyn_min_us > config.batch_delay_dyn_max_us) {
-        std::cerr << "--batch-delay-dyn-min must be <= --batch-delay-dyn-max\n";
+        std::cerr << "--batch-delay-dyn-min (" << config.batch_delay_dyn_min_us / 1000.0
+                  << "ms) must be <= --batch-delay-dyn-max (" << config.batch_delay_dyn_max_us / 1000.0 << "ms)\n";
         return 1;
     }
     static const std::unordered_map<ScanType, std::string> scan_names = {
@@ -2711,7 +2688,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    constexpr size_t TARGETS_PER_QUEUE = 1000;   // <-- the 1k limit
+    constexpr size_t TARGETS_PER_QUEUE = 1000;  
 
     if (!config.jitter_config.enabled) {
         std::string default_iface,  default_gw;
