@@ -3509,7 +3509,7 @@ void print_full_help() {
 		std::cerr << color::yellow << " --port-timeout" << color::reset << " <min>-<max> Set port giveup timeout(default: min:5ms-max:700ms). e.g. --port-timeout 10ms-500ms\n";
 		std::cerr << color::yellow << " --interface" << color::reset << " Set desired interface\n";
 		std::cerr << color::yellow << " --grep" << color::reset << " Print a plain, copy-friendly grepable target list at the end of the scan\n";
-		std::cerr << color::yellow << " --traceroute" << color::reset << " Print traced routes informations with Geo locations,ASN etc (use -6 to trace over IPv6)\n";
+		std::cerr << color::yellow << " --traceroute" << color::reset << " Print traced routes informations with Geo locations,ASN etc\n";
 	        std::cerr << color::yellow << " --os-detect" << color::reset << " Passively fingerprint the target OS from the replies received\n";
 		std::cerr << color::yellow << " -o" << color::reset << " <File_Name>.txt Save results to file (plain text)\n\n";
 
