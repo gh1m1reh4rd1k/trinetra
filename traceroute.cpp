@@ -486,6 +486,13 @@ void print_traceroute_results(const std::string& target_display,
                                const std::vector<TracerouteHop>& hops,
                                int max_hops_requested)
 {
+
+    if (hops.empty()) {
+        std::cout << "\n" << trcolor::red << "Traceroute to " << target_display
+                  << " could not run: address is not valid for this IP version, raw ICMP socket unavailable (root needed), or interrupted"
+                  << trcolor::reset << "\n\n";
+        return;
+    }
     constexpr int HOP_W  = 5;
     constexpr int IP_W   = 17;
     constexpr int HOST_W = 50;
