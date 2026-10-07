@@ -347,7 +347,7 @@ struct ScanResult {
    ════════════════════════════════════════════════════════ */
 class ProbeEngine {
 public:
-    explicit ProbeEngine(AllProbes *ap, int version_intensity = 0);
+    explicit ProbeEngine(AllProbes *ap, int version_intensity = 4);
     bool feedResponse(ServiceNFO *svc, const u8 *data, int datalen);
     bool handleEOF(ServiceNFO *svc, bool hadData, long elapsedMs);
 
@@ -361,10 +361,12 @@ public:
                              const std::string &probeName = "");
 
     int versionIntensity() const { return version_intensity_; }
+    void setIgnoreExclude(bool v) { ignore_exclude_ = v; }
 
 private:
     AllProbes *ap_;
     int        version_intensity_;
+    bool       ignore_exclude_ = false;
 
     bool processMatch(const MatchDetails *md, ServiceNFO *svc,
                       const char *probeName, const char *fallbackName);
