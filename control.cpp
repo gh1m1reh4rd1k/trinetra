@@ -3933,7 +3933,6 @@ static TlsConfig snapshot_tls_config() {
 }
 static std::mutex g_stdout_mu;        
 static std::mutex g_srcport443_mu;
-static std::mutex g_probes_exclude_mu;
 static std::vector<u8> capture_ssl(const std::string &ip, int port,
                                    int timeout_sec,
                                    const std::vector<u8> *payload,
@@ -3972,16 +3971,29 @@ static std::vector<u8> capture_ssl(const std::string &ip, int port,
                 : !tls_cfg.sni_name.empty() ? tls_cfg.sni_name
                                             : ip;
 
-    TlsCertInfo cert_info;
-    bool got_cert = false;
-    op->on_complete = [&cert_info, &got_cert](async_io::Operation &o) {
+    struct CertState {
+        std::mutex  mu;
+        TlsCertInfo info;
+        bool        got = false;
+    };
+    auto cert_state = std::make_shared<CertState>();
+    op->on_complete = [cert_state](async_io::Operation &o) {
         if (o.ssl_handle && o.result.load() == async_io::OpResult::SUCCESS) {
-            cert_info = extract_tls_cert_info(o.ssl_handle);
-            got_cert  = true;
+            TlsCertInfo tmp = extract_tls_cert_info(o.ssl_handle);
+            std::lock_guard<std::mutex> lk(cert_state->mu);
+            cert_state->info = std::move(tmp);
+            cert_state->got  = true;
         }
     };
 
     auto data = async_io::run_blocking(async_io::shared_reactor(), op);
+
+    TlsCertInfo cert_info;
+    bool        got_cert = false;
+    {
+        std::lock_guard<std::mutex> lk(cert_state->mu);
+        if (cert_state->got) { cert_info = cert_state->info; got_cert = true; }
+    }
 
     if (got_cert) {
         if (verbose) cert_info.print(std::cerr);
@@ -5900,14 +5912,10 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
 
     ProbeEngine engine(&probes, args.intensity);
 
-    if (args.port >= 9100 && args.port <= 9107) {
-        std::lock_guard<std::mutex> lk(g_probes_exclude_mu);
-        if (probes.isExcluded((u16)args.port, proto_int)) {
-            auto &ev = probes.excludedPorts.tcp_ports;
-            ev.erase(std::remove_if(ev.begin(), ev.end(),
-                [&](u16 p){ return p >= 9100 && p <= 9107; }), ev.end());
-            vlog::line(g_verbose, "temporarily overriding Exclude for port " + std::to_string(args.port), 1);
-        }
+    if (args.port >= 9100 && args.port <= 9107 &&
+        probes.isExcluded((u16)args.port, proto_int)) {
+        engine.setIgnoreExclude(true);
+        vlog::line(g_verbose, "overriding Exclude for port " + std::to_string(args.port), 1);
     }
 
     ScanResult result = engine.matchResponse(
