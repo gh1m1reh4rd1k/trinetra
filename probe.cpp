@@ -1496,7 +1496,7 @@ ScanResult ProbeEngine::matchResponse(u16 port, int proto,
                                        ServiceTunnel tunnel,
                                        const u8 *data, int datalen,
                                        const std::string &probeName) {
-    if (ap_->isExcluded(port, proto)) {
+    if (!ignore_exclude_ && ap_->isExcluded(port, proto)) {
         ScanResult r;
         r.port    = port; r.proto = proto;
         r.state   = ProbeState::FINISHED_EXCLUDED;
