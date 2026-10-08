@@ -39,6 +39,10 @@ behavior, and kernel I/O subsystems.
 
 ## Features
 
+<table>
+<tr>
+<td valign="top" width="50%">
+
 ### Scanning
 - **Multiple TCP scan types**: SYN (default), FIN, ACK, NULL, Xmas,
   Window, Maimon, plus per-flag scans (CWR, ECE, URG, PSH) and custom
@@ -64,6 +68,9 @@ behavior, and kernel I/O subsystems.
 - **Discovery module**: ASN/org lookup (`--cn`, `--org`), country
   IP-range fetch (`--country`, `--owner`, `--ipv4`/`--ipv6`), and
   reverse IP/ASN to domains (`--ip`, `--range`, `--asn`)
+
+</td>
+<td valign="top" width="50%">
 
 ### Performance & I/O
 - **`io_uring`-based async I/O** with per-thread rings
@@ -111,6 +118,10 @@ behavior, and kernel I/O subsystems.
 - **DNS-over-TLS** via `--dns-servers-tls` (port 853, certificate-verified)
 - Reverse DNS / PTR lookups
 - Full DNS enumeration via `--enum dns`
+
+</td>
+</tr>
+</table>
 
 ---
 
@@ -288,42 +299,55 @@ sudo shiv --server --server-port 9443 --server-token <token>
 
 ---
 
-## Architecture (for contributors)
+## Architecture
 
-### Sending Packets
+> For contributors. This section maps the internal design of Trinetra.
+
+<table>
+<tr>
+<td valign="top" width="50%">
+
+#### Sending Packets
 - TCP: `io_uring_prep_sendmsg()`
 - ARP: `io_uring_prep_sendto()` for batched ARP requests
 - Raw sockets: `socket(AF_INET, SOCK_RAW, IPPROTO_RAW)` for custom
   IP/TCP header crafting
 
-### Receiving Packets
+#### Receiving Packets
 - Primary: `io_uring_prep_recvmsg()` for async reception
 - Raw TCP socket: `socket(AF_INET, SOCK_RAW, IPPROTO_TCP)`
 - ARP: `io_uring_prep_recvmsg()`
 - Non-blocking sockets via `fcntl()` + `O_NONBLOCK`
 
-### `io_uring` Configuration
+#### `io_uring` Configuration
 - Separate send and receive rings (`io_uring_queue_init()`)
 - `io_uring_wait_cqe_timeout()` for response timeouts
 - Configurable queue depths (`--send-uring`, `--rcv-uring`)
 - `IORING_SETUP_SQPOLL` with a non-SQPOLL fallback if kernel init
   fails
 
-### Namespace Isolation
+</td>
+<td valign="top" width="50%">
+
+#### Namespace Isolation
 - `unshare(CLONE_NEWNET)` + macvlan device bridged off a physical
   interface (`--split*` family of flags)
 - Keeps scanner traffic separate from host routing/stack
 - `-G` (state-machine handshake) auto-enters the namespace
 
-### Concurrency
+#### Concurrency
 - `moodycamel::ConcurrentQueue` for task queuing
 - Per-thread `io_uring` rings for batch transmission
 - `std::atomic` for coordination; `std::mutex` for output sync
 
-### Buffer Management
+#### Buffer Management
 - Custom `PacketBufferPool`
 - Thread-local pools to reduce contention
 - Concurrent queue for buffer reuse
+
+</td>
+</tr>
+</table>
 
 ---
 
