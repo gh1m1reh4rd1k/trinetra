@@ -8,8 +8,6 @@
 [![Kernel](https://img.shields.io/badge/kernel-6.12%2B-critical.svg)]()
 [![C++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)]()
 
-![Trinetra demo](https://github.com/gh1m1reh4rd1k/trinetra/blob/main/images/io_uring.jpeg)
-
 ---
 
 ## What is Trinetra?
@@ -18,7 +16,7 @@ Trinetra is a from-scratch, raw-packet TCP scanner that leverages Linux
 `io_uring` for batched asynchronous I/O. It is designed as a
 **learning-first** tool: the implementation comes first, and the theory
 follows by observing real packet behavior. Trinetra provides deep,
-low-level control over every header and option it sends — making it a
+low-level control over every header and option it sends: making it a
 practical lab for understanding networking internals, protocol
 behavior, and kernel I/O subsystems.
 
@@ -42,34 +40,34 @@ all applicable laws.
 ## Features
 
 ### Scanning
-- **Multiple TCP scan types** — SYN (default), FIN, ACK, NULL, Xmas,
+- **Multiple TCP scan types**: SYN (default), FIN, ACK, NULL, Xmas,
   Window, Maimon, plus per-flag scans (CWR, ECE, URG, PSH) and custom
   named combinations (HANUMAN, KAKABHUSUNDI, GANESH, RAM, GARUD, JATAYU)
-- **State-machine handshake scan (`-G`)** — completes a real 4-way TCP
+- **State-machine handshake scan (`-G`)**: completes a real 4-way TCP
   handshake with graceful teardown inside an isolated network namespace
-- **Host discovery** — `-sn` (ICMP) and `-sn6` (ICMPv6), with optional
+- **Host discovery**: `-sn` (ICMP) and `-sn6` (ICMPv6), with optional
   `-Pn` to skip discovery
 - **IPv4 / IPv6 traceroute** (`--traceroute`, add `-6` for IPv6)
-- **Passive discovery (`--netradar`)** — observe existing traffic on the
+- **Passive discovery (`--netradar`)**: observe existing traffic on the
   wire (SYN/ACK/FIN/QUIC/DNS) without sending any packets of your own
 
 ### Fingerprinting & Enumeration
-- **Service/version detection (`-sV`)** — dual-stage: Nmap-style probe
+- **Service/version detection (`-sV`)**: dual-stage: Nmap-style probe
   DB for probe selection/matching, followed by a dynamic response-body
   signature layer (titles, asset paths, platform/CDN fingerprints)
 - **UDP service probing (`-sV --udp`)**
-- **TLS / HTTP fingerprinting** — certificate extraction (SANs, issuer,
+- **TLS / HTTP fingerprinting**: certificate extraction (SANs, issuer,
   validity), HTTP title/asset fingerprinting, optional mTLS
-- **OS fingerprinting** (`--os-detect`) — passive, from replies received
-- **Enumeration modules (`--enum`)** — `shodan`, `ssl`, `dns`,
+- **OS fingerprinting** (`--os-detect`): passive, from replies received
+- **Enumeration modules (`--enum`)**: `shodan`, `ssl`, `dns`,
   `trail:<api-key>` (SecurityTrails); comma-separated, any order
-- **Discovery module** — ASN/org lookup (`--cn`, `--org`), country
+- **Discovery module**: ASN/org lookup (`--cn`, `--org`), country
   IP-range fetch (`--country`, `--owner`, `--ipv4`/`--ipv6`), and
-  reverse IP/ASN → domains (`--ip`, `--range`, `--asn`)
+  reverse IP/ASN to domains (`--ip`, `--range`, `--asn`)
 
 ### Performance & I/O
 - **`io_uring`-based async I/O** with per-thread rings
-- **SQPOLL mode** — kernel-thread submission; auto-enabled by probe
+- **SQPOLL mode**: kernel-thread submission; auto-enabled by probe
   volume (adaptive pacing) or estimated duration (fixed pacing), or
   forced with `--sqpoll`
 - **Congestion-aware batching** with adaptive rate/delay tuning
@@ -83,16 +81,16 @@ all applicable laws.
   `--split-iface`) via macvlan
 - **MAC spoofing** (`--src-mac`) and **ARP-based on-link resolution**
   (`--dst-mac` to skip ARP)
-- **TCP option crafting** — MSS, window scale, SACK, timestamps, NOPs,
+- **TCP option crafting**: MSS, window scale, SACK, timestamps, NOPs,
   MPTCP, TCP-AO, TFO cookie injection, custom sequence numbers
-- **IP-layer control** — TTL, DSCP/TOS, IP ID generation modes,
+- **IP-layer control**: TTL, DSCP/TOS, IP ID generation modes,
   fragmentation (`-f`, `--frag ofo|zof|lap`), Router Alert, IPSO
-- **IPv6 extension headers** — Hop-by-Hop, Destination, Routing, AH,
+- **IPv6 extension headers**: Hop-by-Hop, Destination, Routing, AH,
   ESP, Flow Label, extension-header chain manipulation, early chain
   termination
-- **Checksum manipulation** — invalid checksums (`--badsum`), partial
+- **Checksum manipulation**: invalid checksums (`--badsum`), partial
   invalid checksum patterns (`--prsum`)
-- **Ethernet / VLAN** — single and double 802.1Q (QinQ) tagging,
+- **Ethernet / VLAN**: single and double 802.1Q (QinQ) tagging,
   custom EtherType, multicast destination MAC, padding
 
 ### Robustness
@@ -104,7 +102,7 @@ all applicable laws.
 - `--grep` for a plain, copy-friendly target list
 
 ### Server Mode
-- **`--server`** — start Trinetra as a LAN control panel accessible over
+- **`--server`**: start Trinetra as a LAN control panel accessible over
   HTTPS (TLS handled automatically via `stunnel`); configurable port
   (`--server-port`, default 8443) and auth token (`--server-token`)
 
@@ -129,8 +127,8 @@ all applicable laws.
 | Capabilities (if not root) | `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_SYS_ADMIN` | For raw sockets and `unshare(CLONE_NEWNET)` |
 
 **Runtime libraries installed by the setup script:**
-- [`liburing`](https://github.com/axboe/liburing) — built from source
-- [`concurrentqueue`](https://github.com/cameron314/concurrentqueue) — headers
+- [`liburing`](https://github.com/axboe/liburing): built from source
+- [`concurrentqueue`](https://github.com/cameron314/concurrentqueue): headers
 - `libcurl4-openssl-dev`, `libssl-dev` / `openssl`
 - `nlohmann-json3-dev`
 - `libpugixml-dev`
@@ -259,8 +257,8 @@ If you already have all dependencies installed:
     # Custom port and fixed token
     sudo shiv --server --server-port 9443 --server-token <token>
 
-> For the full flag reference — pacing, IP/TCP header crafting, IPv6
-> extension-header control, buffer management, debug modes, and more —
+> For the full flag reference: pacing, IP/TCP header crafting, IPv6
+> extension-header control, buffer management, debug modes, and more,
 > see [`https://github.com/gh1m1reh4rd1k/trinetra/wiki/standard_documentation`](https://github.com/gh1m1reh4rd1k/trinetra/wiki/standard_documentation) (or run `shiv --help`)
 
 ---
@@ -309,7 +307,7 @@ If you already have all dependencies installed:
 The CLI reference and `setup.sh` currently refer to the binary as
 **`shiv`**, and the installer writes data files under
 `/usr/share/shiv/`. The repository is named **Trinetra**. Until the
-two are unified, use whichever name your build actually produces —
+two are unified, use whichever name your build actually produces:
 `shiv` in most builds today.
 
 > **Maintainers:** see [Action Items](#action-items-for-maintainers)
@@ -350,20 +348,20 @@ Before the next tagged release, consider:
 
 1. **Unify the binary name.** The repo says *Trinetra*; the binary and
    install paths say *shiv*. Either rename the binary to `trinetra`
-   (recommended — matches the repo) or keep `shiv` and add a
+   (recommended: matches the repo) or keep `shiv` and add a
    short note at the top of the README explaining the codename.
-2. **Rename `/usr/share/shiv/` → `/usr/share/trinetra/`** in
+2. **Rename `/usr/share/shiv/` to `/usr/share/trinetra/`** in
    `setup.sh`, `Makefile`, and any path constants in the source.
 3. **Fix the error string** `"Shiv's minimum requirement kernel
-   version is 6.12"` → `"Trinetra requires Linux kernel 6.12 or
+   version is 6.12"` to `"Trinetra requires Linux kernel 6.12 or
    newer"`.
 4. **Add `docs/CLI.md`.** Your CLI reference is excellent and too long
    for the README. Split it out and link from the README's Usage
    section. This is the single biggest readability win.
 5. **Reorder `main()` in `setup.sh`.** Move `check_sudo` before
-   `check_io_uring_support` — the kernel check doesn't need root.
+   `check_io_uring_support`: the kernel check doesn't need root.
 6. **Remove dead `if [ $? -eq 0 ]` blocks** after `make` /
-   `make install` — with `set -euo pipefail`, the failure branch never
+   `make install`: with `set -euo pipefail`, the failure branch never
    runs.
 7. **Add a demo GIF** (`asciinema` + `agg` is fastest) below the
    badges.
