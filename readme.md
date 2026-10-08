@@ -39,89 +39,72 @@ behavior, and kernel I/O subsystems.
 
 ## Features
 
-<table>
-<tr>
-<td valign="top" width="50%">
-
 ### Scanning
-- **Multiple TCP scan types**: SYN (default), FIN, ACK, NULL, Xmas,
-  Window, Maimon, plus per-flag scans (CWR, ECE, URG, PSH) and custom
-  named combinations (HANUMAN, KAKABHUSUNDI, GANESH, RAM, GARUD, JATAYU)
-- **State-machine handshake scan (`-G`)**: completes a real 4-way TCP
-  handshake with graceful teardown inside an isolated network namespace
-- **Host discovery**: `-sn` (ICMP) and `-sn6` (ICMPv6), with optional
-  `-Pn` to skip discovery
-- **IPv4 / IPv6 traceroute** (`--traceroute`, add `-6` for IPv6)
-- **Passive discovery (`--netradar`)**: observe existing traffic on the
-  wire (SYN/ACK/FIN/QUIC/DNS) without sending any packets of your own
+
+| Feature | Description |
+|---|---|
+| **Multiple TCP scan types** | SYN (default), FIN, ACK, NULL, Xmas, Window, Maimon, plus per-flag scans (CWR, ECE, URG, PSH) and custom named combinations (HANUMAN, KAKABHUSUNDI, GANESH, RAM, GARUD, JATAYU). |
+| **State-machine handshake scan (`-G`)** | Completes a real 4-way TCP handshake with graceful teardown inside an isolated network namespace. |
+| **Host discovery** | `-sn` (ICMP) and `-sn6` (ICMPv6), with optional `-Pn` to skip discovery. |
+| **IPv4 / IPv6 traceroute** | `--traceroute`, add `-6` for IPv6. |
+| **Passive discovery (`--netradar`)** | Observe existing traffic on the wire (SYN/ACK/FIN/QUIC/DNS) without sending any packets of your own. |
 
 ### Fingerprinting & Enumeration
-- **Service/version detection (`-sV`)**: dual-stage: Nmap-style probe
-  DB for probe selection/matching, followed by a dynamic response-body
-  signature layer (titles, asset paths, platform/CDN fingerprints)
-- **UDP service probing (`-sV --udp`)**
-- **TLS / HTTP fingerprinting**: certificate extraction (SANs, issuer,
-  validity), HTTP title/asset fingerprinting, optional mTLS
-- **OS fingerprinting** (`--os-detect`): passive, from replies received
-- **Enumeration modules (`--enum`)**: `shodan`, `ssl`, `dns`,
-  `trail:<api-key>` (SecurityTrails); comma-separated, any order
-- **Discovery module**: ASN/org lookup (`--cn`, `--org`), country
-  IP-range fetch (`--country`, `--owner`, `--ipv4`/`--ipv6`), and
-  reverse IP/ASN to domains (`--ip`, `--range`, `--asn`)
 
-</td>
-<td valign="top" width="50%">
+| Feature | Description |
+|---|---|
+| **Service/version detection (`-sV`)** | Dual-stage: Nmap-style probe DB for probe selection/matching, followed by a dynamic response-body signature layer (titles, asset paths, platform/CDN fingerprints). |
+| **UDP service probing** | `-sV --udp`. |
+| **TLS / HTTP fingerprinting** | Certificate extraction (SANs, issuer, validity), HTTP title/asset fingerprinting, optional mTLS. |
+| **OS fingerprinting (`--os-detect`)** | Passive, from replies received. |
+| **Enumeration modules (`--enum`)** | `shodan`, `ssl`, `dns`, `trail:<api-key>` (SecurityTrails); comma-separated, any order. |
+| **Discovery module** | ASN/org lookup (`--cn`, `--org`), country IP-range fetch (`--country`, `--owner`, `--ipv4`/`--ipv6`), and reverse IP/ASN to domains (`--ip`, `--range`, `--asn`). |
 
 ### Performance & I/O
-- **`io_uring`-based async I/O** with per-thread rings
-- **SQPOLL mode**: kernel-thread submission; auto-enabled by probe
-  volume (adaptive pacing) or estimated duration (fixed pacing), or
-  forced with `--sqpoll`
-- **Congestion-aware batching** with adaptive rate/delay tuning
-  (`--cong-curve`, `--cong-alpha-*`, `--rate-dyn-*`, `--batch-delay-dyn-*`)
-- **EWMA RTT estimation** with retry logic (`--set-rtt`, `--rto-mult`,
-  `--rto-pad1/2`)
+
+| Feature | Description |
+|---|---|
+| **`io_uring`-based async I/O** | With per-thread rings. |
+| **SQPOLL mode** | Kernel-thread submission; auto-enabled by probe volume (adaptive pacing) or estimated duration (fixed pacing), or forced with `--sqpoll`. |
+| **Congestion-aware batching** | With adaptive rate/delay tuning (`--cong-curve`, `--cong-alpha-*`, `--rate-dyn-*`, `--batch-delay-dyn-*`). |
+| **EWMA RTT estimation** | With retry logic (`--set-rtt`, `--rto-mult`, `--rto-pad1/2`). |
 
 ### Networking & Isolation
-- **Network namespace isolation** (`--split`, `--split-ip`,
-  `--split-gw`, `--split-ip6`, `--split-gw6`, `--split-mac`,
-  `--split-iface`) via macvlan
-- **MAC spoofing** (`--src-mac`) and **ARP-based on-link resolution**
-  (`--dst-mac` to skip ARP)
-- **TCP option crafting**: MSS, window scale, SACK, timestamps, NOPs,
-  MPTCP, TCP-AO, TFO cookie injection, custom sequence numbers
-- **IP-layer control**: TTL, DSCP/TOS, IP ID generation modes,
-  fragmentation (`-f`, `--frag ofo|zof|lap`), Router Alert, IPSO
-- **IPv6 extension headers**: Hop-by-Hop, Destination, Routing, AH,
-  ESP, Flow Label, extension-header chain manipulation, early chain
-  termination
-- **Checksum manipulation**: invalid checksums (`--badsum`), partial
-  invalid checksum patterns (`--prsum`)
-- **Ethernet / VLAN**: single and double 802.1Q (QinQ) tagging,
-  custom EtherType, multicast destination MAC, padding
+
+| Feature | Description |
+|---|---|
+| **Network namespace isolation** | `--split`, `--split-ip`, `--split-gw`, `--split-ip6`, `--split-gw6`, `--split-mac`, `--split-iface`, via macvlan. |
+| **MAC spoofing and ARP-based on-link resolution** | `--src-mac` for spoofing; `--dst-mac` to skip ARP. |
+| **TCP option crafting** | MSS, window scale, SACK, timestamps, NOPs, MPTCP, TCP-AO, TFO cookie injection, custom sequence numbers. |
+| **IP-layer control** | TTL, DSCP/TOS, IP ID generation modes, fragmentation (`-f`, `--frag ofo|zof|lap`), Router Alert, IPSO. |
+| **IPv6 extension headers** | Hop-by-Hop, Destination, Routing, AH, ESP, Flow Label, extension-header chain manipulation, early chain termination. |
+| **Checksum manipulation** | Invalid checksums (`--badsum`), partial invalid checksum patterns (`--prsum`). |
+| **Ethernet / VLAN** | Single and double 802.1Q (QinQ) tagging, custom EtherType, multicast destination MAC, padding. |
 
 ### Robustness
-- SIGINT handling with safe shutdown
-- RAII-based resource management
-- Structured output with per-host packet-sent counters
-- Send-path drop detection at three checkpoints (buffer-pool
-  exhaustion, SQ backpressure, `sendmsg()` rejection)
-- `--grep` for a plain, copy-friendly target list
+
+| Feature | Description |
+|---|---|
+| **Signal handling** | SIGINT handling with safe shutdown. |
+| **Resource safety** | RAII-based resource management. |
+| **Output** | Structured output with per-host packet-sent counters. |
+| **Drop detection** | Send-path drop detection at three checkpoints: buffer-pool exhaustion, SQ backpressure, and `sendmsg()` rejection. |
+| **Target export** | `--grep` for a plain, copy-friendly target list. |
 
 ### Server Mode
-- **`--server`**: start Trinetra as a LAN control panel accessible over
-  HTTPS (TLS handled automatically via `stunnel`); configurable port
-  (`--server-port`, default 8443) and auth token (`--server-token`)
+
+| Feature | Description |
+|---|---|
+| **`--server`** | Start Trinetra as a LAN control panel accessible over HTTPS (TLS handled automatically via `stunnel`). Configurable port (`--server-port`, default 8443) and auth token (`--server-token`). |
 
 ### DNS
-- Custom DNS servers (IPv4/IPv6) via `--dns-servers`
-- **DNS-over-TLS** via `--dns-servers-tls` (port 853, certificate-verified)
-- Reverse DNS / PTR lookups
-- Full DNS enumeration via `--enum dns`
 
-</td>
-</tr>
-</table>
+| Feature | Description |
+|---|---|
+| **Custom DNS servers** | IPv4/IPv6 via `--dns-servers`. |
+| **DNS-over-TLS** | Via `--dns-servers-tls` (port 853, certificate-verified). |
+| **Reverse DNS** | PTR lookups. |
+| **DNS enumeration** | Full enumeration via `--enum dns`. |
 
 ---
 
@@ -299,55 +282,42 @@ sudo shiv --server --server-port 9443 --server-token <token>
 
 ---
 
-## Architecture
+## Architecture (for contributors)
 
-> For contributors. This section maps the internal design of Trinetra.
-
-<table>
-<tr>
-<td valign="top" width="50%">
-
-#### Sending Packets
+### Sending Packets
 - TCP: `io_uring_prep_sendmsg()`
 - ARP: `io_uring_prep_sendto()` for batched ARP requests
 - Raw sockets: `socket(AF_INET, SOCK_RAW, IPPROTO_RAW)` for custom
   IP/TCP header crafting
 
-#### Receiving Packets
+### Receiving Packets
 - Primary: `io_uring_prep_recvmsg()` for async reception
 - Raw TCP socket: `socket(AF_INET, SOCK_RAW, IPPROTO_TCP)`
 - ARP: `io_uring_prep_recvmsg()`
 - Non-blocking sockets via `fcntl()` + `O_NONBLOCK`
 
-#### `io_uring` Configuration
+### `io_uring` Configuration
 - Separate send and receive rings (`io_uring_queue_init()`)
 - `io_uring_wait_cqe_timeout()` for response timeouts
 - Configurable queue depths (`--send-uring`, `--rcv-uring`)
 - `IORING_SETUP_SQPOLL` with a non-SQPOLL fallback if kernel init
   fails
 
-</td>
-<td valign="top" width="50%">
-
-#### Namespace Isolation
+### Namespace Isolation
 - `unshare(CLONE_NEWNET)` + macvlan device bridged off a physical
   interface (`--split*` family of flags)
 - Keeps scanner traffic separate from host routing/stack
 - `-G` (state-machine handshake) auto-enters the namespace
 
-#### Concurrency
+### Concurrency
 - `moodycamel::ConcurrentQueue` for task queuing
 - Per-thread `io_uring` rings for batch transmission
 - `std::atomic` for coordination; `std::mutex` for output sync
 
-#### Buffer Management
+### Buffer Management
 - Custom `PacketBufferPool`
 - Thread-local pools to reduce contention
 - Concurrent queue for buffer reuse
-
-</td>
-</tr>
-</table>
 
 ---
 
