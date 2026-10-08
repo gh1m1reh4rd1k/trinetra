@@ -55,20 +55,33 @@ constexpr const char* kStunnelDir      = "/etc/stunnel";
 constexpr const char* kStunnelCertPath = "/etc/stunnel/shiv.pem";
 constexpr const char* kCertLockPath    = "/etc/stunnel/.shiv_cert.lock";
 
+// Builds <a><b><port><c> with reserve()+append instead of chained operator+.
+// GCC 15 emits a false-positive -Wstringop-overflow on the operator+ chain
+// (inlined std::string SSO copy); this form is equivalent and warning-free.
+std::string join_path_str(const char* a, const char* b, int port, const char* c) {
+    std::string s;
+    s.reserve(96);
+    s.append(a);
+    s.append(b);
+    s.append(std::to_string(port));
+    s.append(c);
+    return s;
+}
+
 std::string stunnel_conf_path(int tls_port) {
-    return std::string(kStunnelDir) + "/shiv-" + std::to_string(tls_port) + ".conf";
+    return join_path_str(kStunnelDir, "/shiv-", tls_port, ".conf");
 }
 
 std::string stunnel_section_name(int tls_port) {
-    return "shiv-" + std::to_string(tls_port);
+    return join_path_str("shiv-", "", tls_port, "");
 }
 
 std::string stunnel_manual_log_path(int tls_port) {
-    return "/tmp/shiv_stunnel_start-" + std::to_string(tls_port) + ".log";
+    return join_path_str("/tmp/shiv_stunnel_start-", "", tls_port, ".log");
 }
 
 std::string port_lock_path(int tls_port) {
-    return std::string(kStunnelDir) + "/.shiv_port_" + std::to_string(tls_port) + ".lock";
+    return join_path_str(kStunnelDir, "/.shiv_port_", tls_port, ".lock");
 }
 
 volatile std::sig_atomic_t g_shutdown = 0;
@@ -1072,7 +1085,9 @@ bool ensure_stunnel_installed() {
 }
 
 bool ensure_tls_cert() {
-    std::string mkdir_cmd = std::string("mkdir -p ") + kStunnelDir;
+    std::string mkdir_cmd;
+    mkdir_cmd.reserve(64);
+    mkdir_cmd.append("mkdir -p ").append(kStunnelDir);
     if (std::system(mkdir_cmd.c_str()) != 0) {}
 
     int lock_fd = open(kCertLockPath, O_CREAT | O_RDWR, 0600);
