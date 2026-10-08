@@ -16,7 +16,7 @@ Trinetra is a from-scratch, raw-packet TCP scanner that leverages Linux
 `io_uring` for batched asynchronous I/O. It is designed as a
 **learning-first** tool: the implementation comes first, and the theory
 follows by observing real packet behavior. Trinetra provides deep,
-low-level control over every header and option it sends: making it a
+low-level control over every header and option it sends making it a
 practical lab for understanding networking internals, protocol
 behavior, and kernel I/O subsystems.
 
