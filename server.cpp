@@ -27,12 +27,15 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace server {
 namespace {
 
 constexpr int    kDefaultTlsPort   = 8443;
+constexpr int    kMinCount         = 2;     // --count 1 is the default, so it is rejected
+constexpr int    kMaxCount         = 15;
 constexpr size_t kMaxHeaderBytes   = 16 * 1024;
 constexpr size_t kMaxBodyBytes     = 4  * 1024;
 constexpr size_t kMaxOutbufBytes   = 8 * 1024 * 1024;
@@ -46,7 +49,6 @@ constexpr size_t kMinFixedTokenLen      = 16;    // floor for --server-token
 constexpr int    kMaxAuthFailures       = 8;     // per-IP failures allowed...
 constexpr int    kAuthFailureWindowSec  = 60;    // ...within this window
 constexpr int    kCookieMaxAgeSec       = 3600;  // session cookie lifetime
-constexpr const char* kCookieName       = "shiv_token";
 constexpr int    kConnIdleTimeoutSec    = 20;    // slowloris guard
 constexpr int    kSweepIntervalSec      = 5;
 constexpr const char* kStunnelDir      = "/etc/stunnel";
@@ -65,18 +67,36 @@ std::string stunnel_manual_log_path(int tls_port) {
     return "/tmp/shiv_stunnel_start-" + std::to_string(tls_port) + ".log";
 }
 
+std::string port_lock_path(int tls_port) {
+    return std::string(kStunnelDir) + "/.shiv_port_" + std::to_string(tls_port) + ".lock";
+}
+
 volatile std::sig_atomic_t g_shutdown = 0;
 void on_signal(int) { g_shutdown = 1; }
-std::atomic<bool> g_scan_busy{false};
-pid_t g_running_pid = -1;
 
-std::string g_token;
 std::string g_self_path;
 bool g_secure_cookies = false;
 
-pid_t g_stunnel_pid = -1;
+// One "slot" = one link: its own token, its own public TLS port, its own
+// loopback backend listener, its own stunnel, and its own busy flag. With
+// --count N there are N slots, so N devices can each run a scan at the same
+// time; a single slot still runs only one scan at a time.
+struct Slot {
+    int index = 0;                 // 1-based, for display
+    int tls_port = 0;              // public HTTPS port (stunnel accept)
+    int internal_port = 0;         // 127.0.0.1 backend port (stunnel connect)
+    int listen_fd = -1;            // backend listener
+    int lock_fd = -1;              // per-port flock held for the process lifetime
+    std::string token;
+    std::string cookie_name;       // cookies are host-scoped, not port-scoped, so name by port
+    bool scan_busy = false;
+    pid_t running_pid = -1;
+    pid_t stunnel_pid = -1;
+    std::unordered_map<std::string, std::pair<int, std::time_t>> auth_fail;
+};
 
-std::unordered_map<std::string, std::pair<int, std::time_t>> g_auth_fail;
+std::vector<std::unique_ptr<Slot>> g_slots;
+std::unordered_map<int, Slot*> g_listen_slots;   // listener fd -> slot
 
 bool set_cloexec(int fd) {
     int flags = fcntl(fd, F_GETFD, 0);
@@ -584,6 +604,7 @@ enum class ConnState { READING_REQUEST, STREAMING_OUTPUT, DONE };
 struct Connection {
     int fd = -1;
     ConnState state = ConnState::READING_REQUEST;
+    Slot* slot = nullptr;          // the link (listener) that accepted this connection
     std::string peer_ip;
     std::time_t created_at = 0;
 
@@ -622,10 +643,11 @@ void epoll_del(int fd) {
 }
 
 void reap_child(Connection& c) {
+    Slot* s = c.slot;
     if (c.child_pid > 0) {
         int status = 0;
         waitpid(c.child_pid, &status, WNOHANG);
-        if (g_running_pid == c.child_pid) g_running_pid = -1;
+        if (s && s->running_pid == c.child_pid) s->running_pid = -1;
         c.child_pid = -1;
     }
     if (c.child_stdout_fd != -1) {
@@ -634,7 +656,7 @@ void reap_child(Connection& c) {
         close(c.child_stdout_fd);
         c.child_stdout_fd = -1;
     }
-    g_scan_busy = false;
+    if (s) s->scan_busy = false;
 }
 
 void close_connection(std::shared_ptr<Connection> c) {
@@ -694,21 +716,22 @@ std::string security_headers() {
     return h.str();
 }
 
-// --- auth / rate limiting ---------------------------------------------
+// --- auth / rate limiting (per slot) -----------------------------------
 
-bool auth_rate_limited(const std::string& ip) {
+bool auth_rate_limited(Slot& s, const std::string& ip) {
     std::time_t now = std::time(nullptr);
-    auto& st = g_auth_fail[ip];
+    auto& st = s.auth_fail[ip];
     if (now - st.second > kAuthFailureWindowSec) { st.first = 0; st.second = now; }
     return st.first >= kMaxAuthFailures;
 }
 
-void record_auth_failure(const std::string& ip) {
+void record_auth_failure(Slot& s, const std::string& ip) {
     std::time_t now = std::time(nullptr);
-    auto& st = g_auth_fail[ip];
+    auto& st = s.auth_fail[ip];
     if (now - st.second > kAuthFailureWindowSec) { st.first = 0; st.second = now; }
     st.first++;
-    std::cerr << "[shiv-server] failed auth attempt from " << ip
+    std::cerr << "[shiv-server] link " << s.index << " (port " << s.tls_port
+              << "): failed auth attempt from " << ip
               << " (failures in window: " << st.first << ")\n";
 }
 
@@ -728,47 +751,52 @@ void send_simple_response(std::shared_ptr<Connection> c, int code, const char* s
 }
 
 bool require_auth(std::shared_ptr<Connection> c, const std::string& provided) {
-    if (auth_rate_limited(c->peer_ip)) {
+    Slot& s = *c->slot;
+    if (auth_rate_limited(s, c->peer_ip)) {
         send_simple_response(c, 429, "Too Many Requests", "text/plain",
                               "too many failed attempts from this address, slow down\n");
         return false;
     }
-    if (tokens_match(provided, g_token)) return true;
-    record_auth_failure(c->peer_ip);
+    if (tokens_match(provided, s.token)) return true;
+    record_auth_failure(s, c->peer_ip);
     send_simple_response(c, 401, "Unauthorized", "text/plain", "Missing or invalid token\n");
     return false;
 }
 
 void start_run(std::shared_ptr<Connection> c, const std::string& command_line) {
-    if (g_scan_busy.exchange(true)) {
-        send_simple_response(c, 409, "Conflict", "text/plain",
-                              "A scan is already running on this server. Try again shortly.\n");
+    Slot& s = *c->slot;
+    if (s.scan_busy) {
+        std::string msg = "A scan is already running on this link. Wait for it to finish, "
+                          "or press Ctrl+C in the session that started it.\n";
+        if (g_slots.size() > 1) msg += "Other links are independent and are not affected.\n";
+        send_simple_response(c, 409, "Conflict", "text/plain", msg);
         return;
     }
+    s.scan_busy = true;
 
     std::vector<std::string> tokens;
     std::string tok_err;
     if (!tokenize_command(command_line, tokens, tok_err)) {
-        g_scan_busy = false;
+        s.scan_busy = false;
         send_simple_response(c, 400, "Bad Request", "text/plain", "parse error: " + tok_err + "\n");
         return;
     }
     if (tokens.empty()) {
-        g_scan_busy = false;
+        s.scan_busy = false;
         send_simple_response(c, 400, "Bad Request", "text/plain", "empty command\n");
         return;
     }
     if (tokens.front() == "shiv") tokens.erase(tokens.begin());
     for (const auto& t : tokens) {
         if (t == "--server") {
-            g_scan_busy = false;
+            s.scan_busy = false;
             send_simple_response(c, 400, "Bad Request", "text/plain",
                                   "refusing to start a nested --server from here\n");
             return;
         }
     }
     if (g_self_path.empty()) {
-        g_scan_busy = false;
+        s.scan_busy = false;
         send_simple_response(c, 500, "Internal Server Error", "text/plain",
                               "could not resolve own executable path\n");
         return;
@@ -776,7 +804,7 @@ void start_run(std::shared_ptr<Connection> c, const std::string& command_line) {
 
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) != 0) {
-        g_scan_busy = false;
+        s.scan_busy = false;
         send_simple_response(c, 500, "Internal Server Error", "text/plain", "pipe() failed\n");
         return;
     }
@@ -785,7 +813,7 @@ void start_run(std::shared_ptr<Connection> c, const std::string& command_line) {
     if (pid < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
-        g_scan_busy = false;
+        s.scan_busy = false;
         send_simple_response(c, 500, "Internal Server Error", "text/plain", "fork() failed\n");
         return;
     }
@@ -811,7 +839,7 @@ void start_run(std::shared_ptr<Connection> c, const std::string& command_line) {
     set_cloexec(pipefd[0]);
 
     c->child_pid = pid;
-    g_running_pid = pid;
+    s.running_pid = pid;
     c->child_stdout_fd = pipefd[0];
     c->state = ConnState::STREAMING_OUTPUT;
     g_conns[pipefd[0]] = c;
@@ -855,11 +883,13 @@ void on_child_pipe_readable(std::shared_ptr<Connection> c) {
 }
 
 void dispatch(std::shared_ptr<Connection> c, const HttpRequest& req) {
+    Slot& s = *c->slot;
+
     if (req.method == "GET" && (req.path == "/" || req.path == "/index.html")) {
         auto cookies = parse_cookies(header_value(req, "cookie"));
-        auto cit = cookies.find(kCookieName);
-        if (cit != cookies.end() && tokens_match(cit->second, g_token)) {
-            send_simple_response(c, 200, "OK", "text/html; charset=utf-8", render_terminal_page(g_token));
+        auto cit = cookies.find(s.cookie_name);
+        if (cit != cookies.end() && tokens_match(cit->second, s.token)) {
+            send_simple_response(c, 200, "OK", "text/html; charset=utf-8", render_terminal_page(s.token));
             return;
         }
 
@@ -871,7 +901,7 @@ void dispatch(std::shared_ptr<Connection> c, const HttpRequest& req) {
         std::ostringstream head;
         head << "HTTP/1.1 303 See Other\r\n"
              << "Location: /\r\n"
-             << "Set-Cookie: " << kCookieName << "=" << g_token
+             << "Set-Cookie: " << s.cookie_name << "=" << s.token
              << "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" << kCookieMaxAgeSec
              << (g_secure_cookies ? "; Secure" : "") << "\r\n"
              << security_headers()
@@ -886,7 +916,7 @@ void dispatch(std::shared_ptr<Connection> c, const HttpRequest& req) {
         std::string provided = header_value(req, "x-shiv-token");
         if (provided.empty()) {
             auto cookies = parse_cookies(header_value(req, "cookie"));
-            auto cit = cookies.find(kCookieName);
+            auto cit = cookies.find(s.cookie_name);
             if (cit != cookies.end()) provided = cit->second;
         }
         if (!require_auth(c, provided)) return;
@@ -896,11 +926,11 @@ void dispatch(std::shared_ptr<Connection> c, const HttpRequest& req) {
             return;
         }
 
-        // /kill
-        if (g_running_pid > 0) {
-            std::cerr << "[shiv-server] kill requested from " << c->peer_ip
-                       << " for pid " << g_running_pid << "\n";
-            kill(g_running_pid, SIGINT);
+        // /kill -- only ever touches this link's own scan
+        if (s.running_pid > 0) {
+            std::cerr << "[shiv-server] link " << s.index << ": kill requested from " << c->peer_ip
+                       << " for pid " << s.running_pid << "\n";
+            kill(s.running_pid, SIGINT);
             send_simple_response(c, 200, "OK", "text/plain", "sent interrupt\n");
         } else {
             send_simple_response(c, 200, "OK", "text/plain", "no scan running\n");
@@ -982,7 +1012,7 @@ void on_client_readable(std::shared_ptr<Connection> c) {
     }
 }
 
-void on_listener_readable(int listen_fd) {
+void on_listener_readable(int listen_fd, Slot* slot) {
     for (;;) {
         struct sockaddr_in peer{};
         socklen_t peerlen = sizeof(peer);
@@ -998,6 +1028,7 @@ void on_listener_readable(int listen_fd) {
 
         auto c = std::make_shared<Connection>();
         c->fd = fd;
+        c->slot = slot;
         c->created_at = std::time(nullptr);
         char ipbuf[INET_ADDRSTRLEN];
         c->peer_ip = inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof(ipbuf)) ? ipbuf : "unknown";
@@ -1168,34 +1199,89 @@ void print_captured_stunnel_output(const std::string& log_path) {
     if (!any) std::cerr << "(stunnel produced no output -- it may have exited before printing anything)\n";
 }
 
-bool report_if_port_busy(int tls_port) {
-    auto pids = pids_listening_on_port(tls_port);
-    if (pids.empty()) return false;
-    const std::string conf_path = stunnel_conf_path(tls_port);
-    for (int pid : pids) {
-        std::string comm = process_comm(pid);
-        bool ours = comm.find("stunnel") != std::string::npos &&
-                    process_cmdline_contains(pid, conf_path);
-        std::cerr << "Port " << tls_port << " is already in use by pid " << pid
-                   << " (" << (comm.empty() ? "unknown process" : comm) << ")";
-        if (ours) {
-            std::cerr << " -- this looks like a stunnel instance for this exact "
-                          "--server-port from an earlier shiv --server run. If it's "
-                          "stale, stop it with: kill " << pid << "\n";
-        } else {
-            std::cerr << ". Pick a different --server-port or stop that process yourself.\n";
+// --- strict port-collision handling ------------------------------------
+
+// True if something already holds 0.0.0.0:<port>. Pure bind() probe: it never
+// listens, so it leaves no state behind.
+bool port_in_use(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return false;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bool busy = bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0;
+    close(fd);
+    return busy;
+}
+
+void print_port_hint(int count) {
+    std::cerr << "Use a different port: shiv --server --server-port <port>";
+    if (count > 1)
+        std::cerr << "  (with --count " << count << ", <port> .. <port+" << (count - 1)
+                  << "> must all be free)";
+    std::cerr << "\n";
+}
+
+void report_port_collision(int port, int count) {
+    std::cerr << "Server port collision: port " << port << " is already in use";
+    auto pids = pids_listening_on_port(port);
+    if (pids.empty()) {
+        std::cerr << ".\n";
+    } else {
+        std::cerr << " by:\n";
+        const std::string conf_path = stunnel_conf_path(port);
+        for (int pid : pids) {
+            std::string comm = process_comm(pid);
+            bool ours = comm.find("stunnel") != std::string::npos &&
+                        process_cmdline_contains(pid, conf_path);
+            std::cerr << "  pid " << pid << " (" << (comm.empty() ? "unknown process" : comm) << ")";
+            if (ours)
+                std::cerr << " -- stunnel left by an earlier shiv --server on this port; "
+                              "if it is stale: kill " << pid;
+            std::cerr << "\n";
         }
+    }
+    print_port_hint(count);
+}
+
+// Reserves a public port for this slot: (1) takes a per-port flock that is held
+// for the whole process lifetime, so two shiv --server instances can never both
+// own the same port even if they start in the same instant; (2) probes the port
+// for any foreign listener. Prints the reason and returns false on failure.
+bool reserve_public_port(Slot& s, int count) {
+    mkdir(kStunnelDir, 0755);   // EEXIST is fine
+    const std::string path = port_lock_path(s.tls_port);
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        std::cerr << "Could not create port lock " << path << ": " << strerror(errno)
+                  << " -- refusing to start.\n";
+        return false;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        std::cerr << "Server port collision: port " << s.tls_port
+                  << " is reserved by another running shiv --server instance.\n";
+        print_port_hint(count);
+        return false;
+    }
+    s.lock_fd = fd;
+    if (port_in_use(s.tls_port)) {
+        report_port_collision(s.tls_port, count);
+        return false;
     }
     return true;
 }
 
-bool start_stunnel(int tls_port) {
-    if (report_if_port_busy(tls_port)) return false;
-
+bool start_stunnel(Slot& s) {
+    const int tls_port = s.tls_port;
     const std::string conf_path = stunnel_conf_path(tls_port);
     const std::string log_path  = stunnel_manual_log_path(tls_port);
+    const int count = static_cast<int>(g_slots.size());
 
-    int log_fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int log_fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     pid_t pid = fork();
     if (pid < 0) {
         std::cerr << "fork() failed launching stunnel: " << strerror(errno) << "\n";
@@ -1218,12 +1304,11 @@ bool start_stunnel(int tls_port) {
     usleep(150000);
     int status = 0;
     if (waitpid(pid, &status, WNOHANG) == pid) {
-        std::cerr << "stunnel exited immediately (is it installed as either "
-                      "'stunnel' or 'stunnel4'?).\n";
+        std::cerr << "stunnel for port " << tls_port << " exited immediately.\n";
         print_captured_stunnel_output(log_path);
+        if (port_in_use(tls_port)) report_port_collision(tls_port, count);
         return false;
     }
-    g_stunnel_pid = pid;
 
     std::vector<std::string> occupants;
     if (!wait_for_port_listening(tls_port, &occupants)) {
@@ -1246,9 +1331,20 @@ bool start_stunnel(int tls_port) {
         print_captured_stunnel_output(log_path);
         kill(pid, SIGKILL);
         waitpid(pid, &status, 0);
-        g_stunnel_pid = -1;
         return false;
     }
+
+    // The port answers -- but make sure the answer is OUR stunnel and not a
+    // foreign listener that grabbed the port while our stunnel died on bind.
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+        std::cerr << "stunnel for port " << tls_port << " exited right after start-up; "
+                     "another process most likely took the port.\n";
+        print_captured_stunnel_output(log_path);
+        report_port_collision(tls_port, count);
+        return false;
+    }
+
+    s.stunnel_pid = pid;
     std::string ufw_cmd = "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | "
                            "grep -q 'Status: active' && ufw allow " + std::to_string(tls_port) +
                            "/tcp >/dev/null 2>&1";
@@ -1256,21 +1352,86 @@ bool start_stunnel(int tls_port) {
     return true;
 }
 
-// Kills exactly the stunnel process this instance spawned -- nothing else.
-void stop_stunnel() {
-    if (g_stunnel_pid <= 0) return;
-    kill(g_stunnel_pid, SIGTERM);
+// Kills exactly the stunnel process this slot spawned -- nothing else.
+void stop_stunnel(Slot& s) {
+    if (s.stunnel_pid <= 0) return;
+    kill(s.stunnel_pid, SIGTERM);
     int status = 0;
     for (int i = 0; i < 20; ++i) {
-        if (waitpid(g_stunnel_pid, &status, WNOHANG) == g_stunnel_pid) {
-            g_stunnel_pid = -1;
+        if (waitpid(s.stunnel_pid, &status, WNOHANG) == s.stunnel_pid) {
+            s.stunnel_pid = -1;
             return;
         }
         usleep(100000);
     }
-    kill(g_stunnel_pid, SIGKILL);
-    waitpid(g_stunnel_pid, &status, 0);
-    g_stunnel_pid = -1;
+    kill(s.stunnel_pid, SIGKILL);
+    waitpid(s.stunnel_pid, &status, 0);
+    s.stunnel_pid = -1;
+}
+
+// Creates the slot's 127.0.0.1 backend listener on a kernel-chosen port. The
+// port is never allowed to land inside the public-port range [lo, hi], so a
+// backend listener can never block one of our own stunnel accept ports.
+bool create_backend_listener(Slot& s, int lo, int hi) {
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            std::cerr << "socket() failed: " << strerror(errno) << "\n";
+            return false;
+        }
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(0);
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+            std::cerr << "bind() failed: " << strerror(errno) << "\n";
+            close(fd);
+            return false;
+        }
+        if (listen(fd, 32) != 0) {
+            std::cerr << "listen() failed: " << strerror(errno) << "\n";
+            close(fd);
+            return false;
+        }
+        socklen_t addrlen = sizeof(addr);
+        if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrlen) != 0) {
+            std::cerr << "getsockname() failed: " << strerror(errno) << "\n";
+            close(fd);
+            return false;
+        }
+        int port = ntohs(addr.sin_port);
+        if (port >= lo && port <= hi) { close(fd); continue; }
+        s.listen_fd = fd;
+        s.internal_port = port;
+        return true;
+    }
+    std::cerr << "Could not get a backend port outside the public port range.\n";
+    return false;
+}
+
+// Tears down everything: scan children (gracefully first, so scanner cleanup
+// such as RST-block rules runs), every stunnel, every listener, every port lock.
+// Safe to call at any point of start-up, including after a partial start.
+void shutdown_all() {
+    std::vector<pid_t> kids;
+    for (auto& [fd, c] : g_conns)
+        if (c->fd == fd && c->child_pid > 0) kids.push_back(c->child_pid);
+    for (pid_t p : kids) kill(p, SIGINT);
+    for (int i = 0; i < 30 && !kids.empty(); ++i) {
+        for (auto it = kids.begin(); it != kids.end();) {
+            if (waitpid(*it, nullptr, WNOHANG) != 0) it = kids.erase(it);   // reaped or not ours
+            else ++it;
+        }
+        if (!kids.empty()) usleep(100000);
+    }
+    for (pid_t p : kids) { kill(p, SIGKILL); waitpid(p, nullptr, 0); }
+
+    for (auto& sp : g_slots) {
+        stop_stunnel(*sp);
+        if (sp->listen_fd >= 0) { close(sp->listen_fd); sp->listen_fd = -1; }
+        if (sp->lock_fd >= 0)   { close(sp->lock_fd);   sp->lock_fd = -1; }   // releases the flock
+    }
+    if (g_epfd >= 0) { close(g_epfd); g_epfd = -1; }
 }
 
 }
@@ -1278,8 +1439,9 @@ void stop_stunnel() {
 int run(int argc, char* argv[]) {
     ensure_root(argc, argv);
 
-    int tls_port = kDefaultTlsPort;
-    const std::string bind_addr = "127.0.0.1";
+    int base_port = kDefaultTlsPort;
+    int count = 1;
+    bool count_given = false;
     std::string fixed_token;
     bool token_given = false;
 
@@ -1288,6 +1450,15 @@ int run(int argc, char* argv[]) {
         for (unsigned char c : s) if (!std::isdigit(c)) return false;
         long v = std::strtol(s.c_str(), nullptr, 10);
         if (v < 1024 || v > 65535) return false;
+        out = static_cast<int>(v);
+        return true;
+    };
+
+    auto parse_count = [](const std::string& s, int& out) -> bool {
+        if (s.empty() || s.size() > 3) return false;
+        for (unsigned char c : s) if (!std::isdigit(c)) return false;
+        long v = std::strtol(s.c_str(), nullptr, 10);
+        if (v < kMinCount || v > kMaxCount) return false;
         out = static_cast<int>(v);
         return true;
     };
@@ -1313,24 +1484,34 @@ int run(int argc, char* argv[]) {
             return argv[++i];
         };
         if (arg == "--server-port") {
-            if (!parse_port(next("--server-port"), tls_port)) {
+            if (!parse_port(next("--server-port"), base_port)) {
                 std::cerr << "--server-port must be a whole number from 1024 to 65535\n";
                 return 1;
             }
         } else if (arg == "--server-token") {
             fixed_token = next("--server-token");
             token_given = true;
-            std::cerr << "warning: --server-token puts the token in argv, which is visible to "
-                         "any local user via `ps` or /proc/<pid>/cmdline, and often ends up in "
-                         "shell history. Prefer leaving this unset and using the randomly "
-                         "generated token shiv prints on startup.\n";
+        } else if (arg == "--count") {
+            if (!parse_count(next("--count"), count)) {
+                std::cerr << "--count must be a whole number from " << kMinCount << " to " << kMaxCount
+                          << " (leave --count out to run a single link)\n";
+                return 1;
+            }
+            count_given = true;
         } else {
             std::cerr << "Unknown --server option: " << arg << "\n";
             return 1;
         }
     }
-    if (tls_port <= 0 || tls_port > 65535) {
-        std::cerr << "--server-port must be 1-65535\n";
+    if (count_given && token_given) {
+        std::cerr << "--server-token cannot be used together with --count "
+                     "(every link gets its own random token)\n";
+        return 1;
+    }
+    if (base_port + count - 1 > 65535) {
+        std::cerr << "--server-port " << base_port << " with --count " << count
+                  << " would need ports up to " << (base_port + count - 1)
+                  << ", which is above 65535. Use a lower --server-port.\n";
         return 1;
     }
     if (token_given && !valid_token(fixed_token)) {
@@ -1338,16 +1519,16 @@ int run(int argc, char* argv[]) {
                      "and not repetitive (e.g. not 'aaaaaaaaaaaaaaaa')\n";
         return 1;
     }
+    if (token_given) {
+        std::cerr << "warning: --server-token puts the token in argv, which is visible to "
+                     "any local user via `ps` or /proc/<pid>/cmdline, and often ends up in "
+                     "shell history. Prefer leaving this unset and using the randomly "
+                     "generated token shiv prints on startup.\n";
+    }
 
     g_self_path = resolve_self_path();
     if (g_self_path.empty()) {
         std::cerr << "Could not resolve /proc/self/exe; refusing to start.\n";
-        return 1;
-    }
-
-    g_token = !fixed_token.empty() ? fixed_token : random_token();
-    if (g_token.empty()) {
-        std::cerr << "Could not generate an auth token (/dev/urandom unavailable).\n";
         return 1;
     }
 
@@ -1358,83 +1539,125 @@ int run(int argc, char* argv[]) {
     sigaction(SIGTERM, &sa, nullptr);
     signal(SIGCHLD, SIG_DFL);
 
-    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (listen_fd < 0) {
-        std::cerr << "socket() failed: " << strerror(errno) << "\n";
-        return 1;
+    // ---- build the slots: consecutive public ports, one unique token each ----
+    std::unordered_set<std::string> used_tokens;
+    for (int i = 0; i < count; ++i) {
+        auto s = std::make_unique<Slot>();
+        s->index = i + 1;
+        s->tls_port = base_port + i;
+        s->cookie_name = "shiv_token_" + std::to_string(s->tls_port);
+
+        std::string tok;
+        if (!fixed_token.empty()) {
+            tok = fixed_token;
+        } else {
+            do { tok = random_token(); } while (!tok.empty() && used_tokens.count(tok));
+        }
+        if (tok.empty()) {
+            std::cerr << "Could not generate an auth token (/dev/urandom unavailable).\n";
+            shutdown_all();
+            return 1;
+        }
+        used_tokens.insert(tok);
+        s->token = tok;
+        g_slots.push_back(std::move(s));
     }
 
-    // Port 0 asks the kernel for any free ephemeral port. This is what
-    // lets N instances run at once with zero chance of colliding on the
-    // backend listener -- each one just gets whatever's free right now.
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(0);
-    if (inet_pton(AF_INET, bind_addr.c_str(), &addr.sin_addr) != 1) {
-        std::cerr << "Internal error: invalid loopback bind address '" << bind_addr << "'\n";
-        return 1;
-    }
-    if (bind(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
-        std::cerr << "bind() failed: " << strerror(errno) << "\n";
-        return 1;
-    }
-    if (listen(listen_fd, 32) != 0) {
-        std::cerr << "listen() failed: " << strerror(errno) << "\n";
-        return 1;
+    const bool tls_possible = ensure_stunnel_installed() && ensure_tls_cert();
+    if (!tls_possible) {
+        std::cerr << "TLS is not available; falling back to plaintext, loopback-only links.\n";
     }
 
-    socklen_t addrlen = sizeof(addr);
-    if (getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), &addrlen) != 0) {
-        std::cerr << "getsockname() failed: " << strerror(errno) << "\n";
-        return 1;
+    // ---- strict collision check: every public port must be free, or we exit ----
+    if (tls_possible) {
+        for (auto& sp : g_slots) {
+            if (!reserve_public_port(*sp, count)) {
+                shutdown_all();
+                return 1;
+            }
+        }
     }
-    const int internal_port = ntohs(addr.sin_port);
 
+    // ---- backend listeners + epoll ----
     g_epfd = epoll_create1(EPOLL_CLOEXEC);
     if (g_epfd < 0) {
         std::cerr << "epoll_create1() failed: " << strerror(errno) << "\n";
+        shutdown_all();
         return 1;
     }
-    epoll_add(listen_fd, EPOLLIN);
-
-    std::cout << "shiv server listening on " << bind_addr << ":" << internal_port
-               << " (loopback only, internal)\n";
-    std::cout << "Auth token: " << g_token << "\n";
-
-    bool tls_ready = false;
-    if (!ensure_stunnel_installed()) {
-        std::cout << "Falling back to plaintext, loopback-only: http://127.0.0.1:" << internal_port
-                   << "/?token=" << g_token << "\n";
-    } else if (!ensure_tls_cert()) {
-        std::cout << "Falling back to plaintext, loopback-only: http://127.0.0.1:" << internal_port
-                   << "/?token=" << g_token << "\n";
-    } else if (!write_stunnel_config(tls_port, internal_port)) {
-        std::cout << "Could not write " << stunnel_conf_path(tls_port)
-                   << " (are you root?); TLS not started.\n";
-    } else if (!start_stunnel(tls_port)) {
-        std::cout << "Could not start stunnel; TLS not started. Is it installed?\n";
-    } else {
-        tls_ready = true;
+    for (auto& sp : g_slots) {
+        if (!create_backend_listener(*sp, base_port, base_port + count - 1)) {
+            shutdown_all();
+            return 1;
+        }
+        epoll_add(sp->listen_fd, EPOLLIN);
+        g_listen_slots[sp->listen_fd] = sp.get();
     }
-    g_secure_cookies = tls_ready;
 
-    if (tls_ready) {
-        auto ips = list_local_ipv4();
-        if (!ips.empty()) {
-            std::cout << "  Open: https://" << ips.front() << ":" << tls_port << "/?token=" << g_token << "\n";
+    // ---- stunnel per slot; any failure is fatal and cleans up everything ----
+    if (tls_possible) {
+        for (auto& sp : g_slots) {
+            if (!write_stunnel_config(sp->tls_port, sp->internal_port)) {
+                std::cerr << "Could not write " << stunnel_conf_path(sp->tls_port)
+                           << " (are you root?); exiting.\n";
+                shutdown_all();
+                return 1;
+            }
+            if (!start_stunnel(*sp)) {
+                std::cerr << "Could not start TLS for port " << sp->tls_port << "; exiting.\n";
+                shutdown_all();
+                return 1;
+            }
+        }
+    }
+    g_secure_cookies = tls_possible;
+
+    // ---- startup output ----
+    auto ips = list_local_ipv4();
+    const std::string host = ips.empty() ? "<this-host-ip>" : ips.front();
+
+    if (count == 1) {
+        Slot& s = *g_slots.front();
+        std::cout << "shiv server listening on 127.0.0.1:" << s.internal_port
+                   << " (loopback only, internal)\n";
+        std::cout << "Auth token: " << s.token << "\n";
+        if (tls_possible) {
+            std::cout << "  Open: https://" << host << ":" << s.tls_port << "/?token=" << s.token << "\n";
             for (size_t i = 1; i < ips.size(); ++i) {
-                std::cout << "  Also reachable at: https://" << ips[i] << ":" << tls_port
-                           << "/?token=" << g_token << "\n";
+                std::cout << "  Also reachable at: https://" << ips[i] << ":" << s.tls_port
+                           << "/?token=" << s.token << "\n";
             }
         } else {
-            std::cout << "  Open: https://<this-host-ip>:" << tls_port << "/?token=" << g_token << "\n";
+            std::cout << "Falling back to plaintext, loopback-only: http://127.0.0.1:"
+                       << s.internal_port << "/?token=" << s.token << "\n";
         }
-        std::cout << "(TLS via stunnel on port " << tls_port
-                   << " — your browser will warn about the self-signed cert the first time, that's expected.\n"
-                   << " Verify it's YOUR cert before accepting: openssl x509 -in " << kStunnelCertPath
-                   << " -noout -fingerprint -sha256)\n";
+    } else {
+        std::cout << "shiv server: " << count << " independent links (each link runs one scan at a time; "
+                     "different links can scan in parallel)\n";
+        for (auto& sp : g_slots) {
+            if (tls_possible) {
+                std::cout << "  Link " << sp->index << ": https://" << host << ":" << sp->tls_port
+                           << "/?token=" << sp->token << "\n";
+            } else {
+                std::cout << "  Link " << sp->index << ": http://127.0.0.1:" << sp->internal_port
+                           << "/?token=" << sp->token << "  (plaintext, loopback-only)\n";
+            }
+        }
+        if (tls_possible && ips.size() > 1) {
+            std::cout << "  Other host addresses (swap the IP in any link): ";
+            for (size_t i = 1; i < ips.size(); ++i) std::cout << (i > 1 ? ", " : "") << ips[i];
+            std::cout << "\n";
+        }
     }
+    if (tls_possible) {
+        std::cout << "(TLS via stunnel — your browser will warn about the self-signed cert the first time, "
+                     "that's expected.\n"
+                  << " Verify it's YOUR cert before accepting: openssl x509 -in " << kStunnelCertPath
+                  << " -noout -fingerprint -sha256)\n";
+    }
+    std::cout.flush();
 
+    // ---- event loop ----
     std::vector<struct epoll_event> events(kMaxEvents);
     while (!g_shutdown) {
         int n = epoll_wait(g_epfd, events.data(), kMaxEvents, kEpollTimeoutMs);
@@ -1446,8 +1669,9 @@ int run(int argc, char* argv[]) {
             int fd = events[i].data.fd;
             uint32_t ev = events[i].events;
 
-            if (fd == listen_fd) {
-                on_listener_readable(listen_fd);
+            auto ls = g_listen_slots.find(fd);
+            if (ls != g_listen_slots.end()) {
+                on_listener_readable(fd, ls->second);
                 continue;
             }
 
@@ -1478,12 +1702,7 @@ int run(int argc, char* argv[]) {
     }
 
     std::cout << "\nshiv server shutting down\n";
-    for (auto& [fd, c] : g_conns) {
-        if (c->fd == fd && c->child_pid > 0) kill(c->child_pid, SIGKILL);
-    }
-    if (tls_ready) stop_stunnel();
-    close(listen_fd);
-    close(g_epfd);
+    shutdown_all();
     return 0;
 }
 
