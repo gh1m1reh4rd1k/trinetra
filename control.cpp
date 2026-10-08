@@ -156,6 +156,19 @@ struct TlsCertInfo {
             if (clean.size() > maxlen) clean = clean.substr(0, maxlen - 3) + "...";
             out << "  |  " << std::left << std::setw(13) << label << ": " << clean << "\n";
         };
+        tls_emit("TLS version", tls_version);
+        tls_emit("Cipher", cipher, 48);
+        tls_emit("Subject", subject, 64);
+        tls_emit("Issuer", issuer, 64);
+        tls_emit("Not before", not_before);
+        tls_emit("Not after", not_after);
+        tls_emit("Serial", serial, 48);
+        tls_emit("SHA-1", fingerprint_sha1, 64);
+        tls_emit("SHA-256", fingerprint_sha256, 100);
+        for (size_t i = 0; i < sans.size() && i < 8; ++i)
+            tls_emit(i == 0 ? "SANs" : "", sans[i], 64);
+        if (sans.size() > 8) tls_emit("", "(+" + std::to_string(sans.size() - 8) + " more)");
+        tls_emit("Verify", verify_ok ? std::string("ok") : (verify_error.empty() ? std::string("failed") : verify_error), 64);
     }
 };
 
@@ -2940,74 +2953,12 @@ static void print_result(const ScanResult                  &result,
         return (p == std::string::npos) ? "" : s.substr(p);
     };
 
-    auto clean_via = [&](const std::string &raw) -> std::string {
-        if (raw.empty()) return "";
-        // Must contain at least one digit (the protocol version like 1.1 or 2)
-        bool has_digit = false;
-        for (char c : raw) if (isdigit((unsigned char)c)) { has_digit = true; break; }
-        if (!has_digit) return "";
-        // Collapse whitespace, strip control chars
-        std::string out;
-        out.reserve(raw.size());
-        bool in_ws = false;
-        for (unsigned char c : raw) {
-            if (c == '\r' || c == '\n') continue;
-            if (c == ' ' || c == '\t') {
-                if (!in_ws && !out.empty()) { out += ' '; in_ws = true; }
-            } else {
-                out += (char)c;
-                in_ws = false;
-            }
-        }
-        while (!out.empty() && out.back() == ' ') out.pop_back();
-        // Truncate if absurdly long (malformed / injected header)
-        if (out.size() > 120) out = out.substr(0, 117) + "...";
-        // Strip the leading HTTP version token (e.g. "1.1 ", "2 ")
-        auto sp = out.find(' ');
-        if (sp != std::string::npos)
-            out = out.substr(sp + 1);
-        while (!out.empty() && out.front() == ' ')
-            out.erase(out.begin());
-        // Collapse CloudFront's "hash.cloudfront.net (CloudFront)" -> "CloudFront"
-        {
-            std::string lower = out;
-            for (char &c : lower) c = (char)tolower((unsigned char)c);
-            if (lower.find("cloudfront") != std::string::npos)
-                out = "CloudFront";
-        }
-        return out;
-    };
-
-    auto val_lc = [](const std::string &s) {
-        std::string r = s;
-        for (char &c : r) c = (char)tolower((unsigned char)c);
-        return r;
-    };
-    std::set<std::string> shown_values;
-
-    // Clean the product/version fields before adding to shown_values
+    // Clean the product/version fields
     std::string clean_product = clean_field(result.product);
     std::string clean_version = clean_field(display_version);
     std::string clean_extra   = clean_field(display_extra);
     std::string clean_service = clean_field(result.service);
-
-    if (!clean_version.empty()) shown_values.insert(val_lc(clean_version));
-    if (!clean_product.empty())  shown_values.insert(val_lc(clean_product));
-    if (!clean_service.empty())  shown_values.insert(val_lc(clean_service));
-
-    // Shared dedup set — probe fields are inserted here first, then passed
-    // into fp.print() so HTTP fingerprint phases never repeat them.
-    std::set<std::string> seen_keys;
-
-    auto probe_emit = [&](const std::string &label, const std::string &val) {
-        if (val.empty()) return;
-        seen_keys.insert(label);
-        // Clean the value before printing
-        std::string cleaned = clean_field(val);
-        if (cleaned.empty()) return;
-        std::cout << std::left << std::setw(13) << label << "\033[32m" << cleaned << "\033[0m" << "\n";
-    };
-
+    (void)clean_service;
 
     auto alnum_lc = [](const std::string &s) -> std::string {
         std::string r;
@@ -3425,14 +3376,6 @@ static void print_result(const ScanResult                  &result,
     struct LabeledExtra { std::string value; std::string label; };
     std::vector<LabeledExtra> extra_candidates;
 
-    // Suppress product values that are just a raw Via: echo
-    // (e.g. "Via: 1.1 google") — the fp_via candidate handles those properly.
-    auto product_is_via_echo = [&]() -> bool {
-        std::string lp = clean_product;
-        for (char &c : lp) c = (char)tolower((unsigned char)c);
-        return lp.rfind("via:", 0) == 0 || lp.rfind("via ", 0) == 0;
-    };
-    (void)product_is_via_echo;
 
     if (!fp_server.empty() && !is_subsumed(fp_server, slot1))
         extra_candidates.push_back({ fp_server, "server" });
@@ -3568,10 +3511,6 @@ static void print_result(const ScanResult                  &result,
     } else {
         std::cout << "?\n";
     }
-    (void)probe_emit;
-    (void)seen_keys;
-    (void)val_lc;
-    (void)shown_values;
 
     {
         bool has_version = !clean_version.empty();
@@ -3580,7 +3519,6 @@ static void print_result(const ScanResult                  &result,
         bool has_tls_fp  = false;
         TlsCertInfo best_cert;
         int  best_status = 0;
-        std::string content_length_hdr;
 
         for (const auto &fp : effective_fps) {
             if (!fp.server.empty())    has_server  = true;
@@ -3594,23 +3532,11 @@ static void print_result(const ScanResult                  &result,
             }
         }
 
-        // Check 404 + Content-Length match for best SSL fingerprint response
-        bool is_404_cl_match = false;
-        if (best_status == 404 && !effective_fps.empty()) {
-            // Find the matching fingerprint to read Content-Length
-            for (const auto &fp : effective_fps) {
-                if (fp.is_ssl && fp.status_code == 404) {
-                    is_404_cl_match = true;
-                    break;
-                }
-            }
-        }
-
         bool no_info = !has_version && !has_server && !has_title;
 
         if (no_info && has_tls_fp && best_cert.populated &&
             !best_cert.subject.empty() &&
-            (best_status == 404 || is_404_cl_match || best_status == 0 || best_status == 200))
+            (best_status == 404 || best_status == 0 || best_status == 200))
         {
 
             std::string cn;
@@ -3863,6 +3789,18 @@ static bool buffer_tail_has_html_close(const std::vector<u8> &data)
     return false;
 }
 
+// Reactor tuning for the current scan (see VersionDetectOptions)
+struct ReactorTuning {
+    size_t      max_response_bytes = 0;
+    std::string ciphers_tls12;
+    std::string ciphersuites_tls13;
+    int         min_connect_ms = 0;
+};
+static thread_local ReactorTuning g_tuning;
+// Facts about the most recent plain-TCP capture on this thread (feeds tcpwrapped detection)
+struct LastTcpCapture { bool eof_no_data = false; long elapsed_ms = -1; };
+static thread_local LastTcpCapture g_last_tcp;
+
 static std::vector<u8> capture_tcp(const std::string &ip, int port,
                                    int timeout_sec,
                                    const std::vector<u8> *payload,
@@ -3883,9 +3821,16 @@ static std::vector<u8> capture_tcp(const std::string &ip, int port,
     op->timeouts.first_byte_sec = timeout_sec;
     // idle_sec left at 0 => reactor default (max(2, timeout_sec/2)), same
     // math as the old recv_all_tcp()'s idle_timeout_sec.
+    op->max_response_bytes = g_tuning.max_response_bytes ? g_tuning.max_response_bytes : (size_t)MAX_RESPONSE;
+    op->timeouts.min_connect_ms = g_tuning.min_connect_ms;
     op->src_port = src_port; // default EPHEMERAL — every normal call site is unaffected
 
+    const auto cap_t0 = std::chrono::steady_clock::now();
     auto data = async_io::run_blocking(async_io::shared_reactor(), op);
+    g_last_tcp.elapsed_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - cap_t0).count();
+    // SUCCESS with no bytes == the peer closed the connection (a timeout reports TIMEOUT)
+    g_last_tcp.eof_no_data = data.empty() && op->result.load() == async_io::OpResult::SUCCESS;
 
     if (verbose) {
         auto r = op->result.load();
@@ -3922,15 +3867,14 @@ struct TlsConfig {
     bool has_client_cert() const { return !client_cert.empty() && !client_key.empty(); }
 };
 
-static bool g_verbose = false;   
-static TlsConfig g_tls_config;
-static std::string g_hostname;
-static std::string g_target_path = "/";
-static std::mutex g_probe_setup_mu;
-static TlsConfig snapshot_tls_config() {
-    std::lock_guard<std::mutex> lk(g_probe_setup_mu);
-    return g_tls_config;
-}
+// Per-scan context. run_version_probe() may be called concurrently for many
+// targets; every capture for one scan runs on the calling thread, so this state
+// is thread_local instead of process-global (no cross-target Host/SNI/path mixups).
+static thread_local bool        g_verbose = false;
+static thread_local TlsConfig   g_tls_config;
+static thread_local std::string g_hostname;
+static thread_local std::string g_target_path = "/";
+static TlsConfig snapshot_tls_config() { return g_tls_config; }
 static std::mutex g_stdout_mu;        
 static std::mutex g_srcport443_mu;
 static std::vector<u8> capture_ssl(const std::string &ip, int port,
@@ -3962,6 +3906,10 @@ static std::vector<u8> capture_ssl(const std::string &ip, int port,
     op->timeouts.connect_sec    = connect_timeout_sec;
     op->timeouts.first_byte_sec = timeout_sec;
     const TlsConfig tls_cfg = snapshot_tls_config();
+    op->max_response_bytes = g_tuning.max_response_bytes ? g_tuning.max_response_bytes : (size_t)MAX_RESPONSE;
+    op->timeouts.min_connect_ms = g_tuning.min_connect_ms;
+    op->tls.cipher_list_tls12  = g_tuning.ciphers_tls12;
+    op->tls.ciphersuites_tls13 = g_tuning.ciphersuites_tls13;
     op->tls.verify_peer  = tls_cfg.verify_peer;
     op->tls.ca_file       = tls_cfg.ca_file;
     op->tls.ca_path       = tls_cfg.ca_path;
@@ -3969,7 +3917,7 @@ static std::vector<u8> capture_ssl(const std::string &ip, int port,
     op->tls.client_key    = tls_cfg.client_key;
     op->tls.sni = !sni_override.empty()    ? sni_override
                 : !tls_cfg.sni_name.empty() ? tls_cfg.sni_name
-                                            : ip;
+                                            : std::string();   // empty => reactor derives; IPs never sent as SNI
 
     struct CertState {
         std::mutex  mu;
@@ -4112,7 +4060,8 @@ static std::vector<u8> capture_ssl_permissive(const std::string &ip, int port,
     const std::string sni = !sni_override.empty()    ? sni_override
                            : !tls_cfg.sni_name.empty() ? tls_cfg.sni_name
                                                         : ip;
-    SSL_set_tlsext_host_name(ssl, sni.c_str());
+    if (!sni.empty() && !is_ip_literal(sni))   // never send an IP literal as SNI (RFC 6066)
+        SSL_set_tlsext_host_name(ssl, sni.c_str());
 
     // Attempt the TLS handshake with permissive settings ----------------------
     if (SSL_connect(ssl) <= 0) {
@@ -4149,20 +4098,34 @@ static std::vector<u8> capture_ssl_permissive(const std::string &ip, int port,
     }
     if (cert_out) *cert_out = cert_info;
 
-    if (payload && !payload->empty())
-        SSL_write(ssl, payload->data(), (int)payload->size());
+    bool send_ok = true;
+    if (payload && !payload->empty()) {
+        size_t off = 0;
+        while (off < payload->size()) {
+            int w = SSL_write(ssl, payload->data() + off, (int)(payload->size() - off));
+            if (w <= 0) { send_ok = false; break; }
+            off += (size_t)w;
+        }
+        if (!send_ok) vlog::fail(verbose, "ssl-permissive: send failed", 2);
+    }
 
-    const int idle_timeout_sec = std::max(2, timeout_sec / 2);
+    // Read until EOF / timeout / cap. After the first bytes arrive, use a
+    // shorter idle timeout so we don't wait the full first-byte budget.
+    const int idle_timeout_sec = std::max(1, std::max(2, timeout_sec / 2));
     bool got_first = false;
 
-    std::vector<u8> data; char buf[CHUNK];
-    while ((int)data.size() < MAX_RESPONSE) {
-        int n = SSL_read(ssl, buf, sizeof(buf));
+    std::vector<u8> data;
+    char buf[CHUNK];
+    while (send_ok && (int)data.size() < MAX_RESPONSE) {
+        int want = std::min<int>((int)sizeof(buf), MAX_RESPONSE - (int)data.size());
+        int n = SSL_read(ssl, buf, want);
         if (n <= 0) break;
         data.insert(data.end(), buf, buf + n);
-        break;
+        if (!got_first) { got_first = true; set_io_timeouts(fd, idle_timeout_sec); }
     }
-    SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+    ERR_clear_error();
+    if (SSL_in_init(ssl) == 0) SSL_shutdown(ssl);
+    SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
     return data;
 }
 
@@ -4294,7 +4257,6 @@ struct ProbeFileInfo {
     std::set<int>                  ssl_ports;
     std::map<int, std::vector<u8>> tcp_ports;
     std::map<int, std::vector<u8>> udp_ports;
-    std::set<int>                  excluded;
     bool has_tcp(int p) const { return tcp_ports.count(p) > 0; }
     bool has_udp(int p) const { return udp_ports.count(p) > 0; }
 };
@@ -4384,58 +4346,33 @@ static std::vector<int> expand_port_list(const std::string &token)
     return ports;
 }
 
-static ProbeFileInfo parse_probe_file_info(const std::string &path)
+// Build the port->payload tables from the probes already loaded into AllProbes
+// (single source of truth; the probe file is no longer parsed a second time).
+// First probe listing a port wins, matching nmap's probe-file order.
+// Exclude directives are enforced by ProbeEngine::matchResponse.
+static ProbeFileInfo build_probe_file_info(const AllProbes &probes)
 {
     ProbeFileInfo info;
-    std::ifstream f(path);
-    if (!f) { fprintf(stderr, "[!] Cannot open probe file: %s\n", path.c_str()); return info; }
-
-    std::string current_proto;
-    std::string current_name;
-    std::vector<u8> current_payload;
-
-    std::string line;
-    while (std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-
-        if (line.rfind("Exclude ", 0) == 0) {
-            std::string spec = line.substr(8);
-            std::istringstream ss2(spec); std::string seg;
-            while (std::getline(ss2, seg, ',')) {
-                while (!seg.empty() && isspace((unsigned char)seg.front())) seg.erase(seg.begin());
-                auto col = seg.find(':');
-                if (col != std::string::npos) seg = seg.substr(col + 1);
-                for (int p : expand_port_list(seg)) info.excluded.insert(p);
+    auto add = [&](ServiceProbe *sp) {
+        if (!sp) return;
+        int len = 0;
+        const u8 *ps = sp->getProbeString(&len);
+        std::vector<u8> payload;
+        if (ps && len > 0 && len <= MAX_RESPONSE) payload.assign(ps, ps + len);
+        const int proto = sp->getProtocol();
+        auto &table = (proto == IPPROTO_UDP) ? info.udp_ports : info.tcp_ports;
+        if (proto != IPPROTO_TCP && proto != IPPROTO_UDP) return;
+        for (auto it = sp->probablePortsBegin(); it != sp->probablePortsEnd(); ++it)
+            if (!table.count((int)*it)) table[(int)*it] = payload;
+        if (proto == IPPROTO_TCP) {
+            for (auto it = sp->probableSslPortsBegin(); it != sp->probableSslPortsEnd(); ++it) {
+                info.ssl_ports.insert((int)*it);
+                if (!info.tcp_ports.count((int)*it)) info.tcp_ports[(int)*it] = payload;
             }
-        } else if (line.rfind("Probe ", 0) == 0) {
-            std::istringstream tok(line.substr(6));
-            std::string proto, name, qstr;
-            tok >> proto >> name >> qstr;
-            current_proto   = proto;
-            current_name    = name;
-            current_payload.clear();
-            if (name != "NULL") {
-                size_t a = qstr.find('|'), b = qstr.rfind('|');
-                if (a != std::string::npos && b != a) {
-                    std::string raw = qstr.substr(a + 1, b - a - 1);
-                    current_payload = unescape_probe_string(raw);
-                }
-            }
-        } else if (line.rfind("ports ", 0) == 0 && current_proto == "TCP") {
-            for (int p : expand_port_list(line.substr(6)))
-                if (!info.has_tcp(p)) info.tcp_ports[p] = current_payload;
-
-        } else if (line.rfind("sslports ", 0) == 0 && current_proto == "TCP") {
-            for (int p : expand_port_list(line.substr(9))) {
-                info.ssl_ports.insert(p);
-                if (!info.has_tcp(p)) info.tcp_ports[p] = current_payload;
-            }
-
-        } else if (line.rfind("ports ", 0) == 0 && current_proto == "UDP") {
-            for (int p : expand_port_list(line.substr(6)))
-                if (!info.has_udp(p)) info.udp_ports[p] = current_payload;
         }
-    }
+    };
+    add(probes.nullProbe);
+    for (ServiceProbe *sp : probes.probes) add(sp);
     return info;
 }
 
@@ -4497,16 +4434,44 @@ static const char *kDefaultUserAgent =
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36";
 
+static const char *accept_encoding_value()
+{
+    // Advertise only what decompress_body() can actually decode in this build.
+    return "gzip, deflate"
+#ifdef HAVE_BROTLI
+           ", br"
+#endif
+#ifdef HAVE_ZSTD
+           ", zstd"
+#endif
+        ;
+}
+
+// The request target ends up in a raw HTTP request line: percent-encode anything
+// that could break the line (CR/LF, spaces, control and non-ASCII bytes).
+static std::string sanitize_request_target(const std::string &path)
+{
+    std::string out;
+    out.reserve(path.size() + 1);
+    if (path.empty() || path[0] != '/') out += '/';
+    static const char hex[] = "0123456789ABCDEF";
+    for (unsigned char c : path) {
+        if (c <= 0x20 || c >= 0x7f) { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+        else out += (char)c;
+    }
+    return out;
+}
+
 static std::string make_get_request(const std::string &path, const std::string &ip,
                                     int port, bool is_ssl,
                                     const std::string &host_override = "")
 {
-    return "GET " + path + " HTTP/1.1\r\n"
+    return "GET " + sanitize_request_target(path) + " HTTP/1.1\r\n"
            "Host: " + make_host_header(ip, port, is_ssl, host_override) + "\r\n"
            "User-Agent: " + kDefaultUserAgent + "\r\n"
            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
            "Accept-Language: en-US,en;q=0.5\r\n"
-           "Accept-Encoding: gzip, deflate, br\r\n"
+           "Accept-Encoding: " + accept_encoding_value() + "\r\n"
            "Connection: close\r\n\r\n";
 }
 
@@ -4779,59 +4744,6 @@ spa_done:
     return results;
 }
 
-static bool has_spa_redirect(const std::vector<u8> &resp)
-{
-    int code = extract_status_code(resp);
-    if (code >= 300 && code < 400) return false; // already a real redirect — not SPA
-
-    // Extract body text (after \r\n\r\n boundary)
-    size_t body_start = 0;
-    const size_t lim = std::min(resp.size(), (size_t)65536);
-    for (size_t i = 0; i + 3 < lim; ++i) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            body_start = i + 4; break;
-        }
-    }
-    if (body_start == 0) {
-        for (size_t i = 0; i + 1 < lim; ++i) {
-            if (resp[i]=='\n' && resp[i+1]=='\n') { body_start = i + 2; break; }
-        }
-    }
-    if (body_start >= resp.size()) return false;
-
-    std::string body(resp.begin() + (std::ptrdiff_t)body_start,
-                     resp.begin() + (std::ptrdiff_t)lim);
-    auto locs = extract_spa_locations(body);
-    return !locs.empty();
-}
-
-// Return the first SPA-detected URL from a 200 response body.
-// Empty string if none found or if response is already a 3xx redirect.
-static std::string get_spa_redirect_url(const std::vector<u8> &resp)
-{
-    int code = extract_status_code(resp);
-    if (code >= 300 && code < 400) return "";
-
-    size_t body_start = 0;
-    const size_t lim = std::min(resp.size(), (size_t)65536);
-    for (size_t i = 0; i + 3 < lim; ++i) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            body_start = i + 4; break;
-        }
-    }
-    if (body_start == 0) {
-        for (size_t i = 0; i + 1 < lim; ++i) {
-            if (resp[i]=='\n' && resp[i+1]=='\n') { body_start = i + 2; break; }
-        }
-    }
-    if (body_start >= resp.size()) return "";
-
-    std::string body(resp.begin() + (std::ptrdiff_t)body_start,
-                     resp.begin() + (std::ptrdiff_t)lim);
-    auto locs = extract_spa_locations(body);
-    return locs.empty() ? "" : locs[0];
-}
-
 struct ParsedUrl {
     std::string scheme;  
     std::string host;     
@@ -4839,7 +4751,7 @@ struct ParsedUrl {
     std::string path;      
     std::string host_hdr;  
     std::string raw_host;
-    std::string &sni = raw_host;  
+    std::string sni;       // value, not a reference: safe to copy/move/assign
 };
 
 static ParsedUrl parse_redirect_url(const std::string &loc,
@@ -4857,6 +4769,7 @@ static ParsedUrl parse_redirect_url(const std::string &loc,
         out.path     = loc;
         out.host_hdr = cur_ip + ":" + std::to_string(cur_port);
         out.raw_host = cur_ip;   // will be overridden by caller's cur_sni
+        out.sni      = cur_ip;
         return out;
     }
     static const std::regex url_re(
@@ -4871,6 +4784,7 @@ static ParsedUrl parse_redirect_url(const std::string &loc,
         out.path     = "/";
         out.host_hdr = cur_ip + ":" + std::to_string(cur_port);
         out.raw_host = cur_ip;   // will be overridden by caller's cur_sni
+        out.sni      = cur_ip;
         return out;
     }
 
@@ -4884,7 +4798,15 @@ static ParsedUrl parse_redirect_url(const std::string &loc,
 
     // Port: explicit > scheme default
     if (m[3].matched && !m[3].str().empty()) {
-        out.port = std::stoi(m[3].str());
+        const std::string ps = m[3].str();
+        long pv = ps.size() <= 5 ? std::strtol(ps.c_str(), nullptr, 10) : 0;
+        if (pv < 1 || pv > 65535) {          // bad port: signal failure, caller stops
+            out.host.clear();
+            out.port = 0;
+            out.path = "/";
+            return out;
+        }
+        out.port = (int)pv;
     } else {
         out.port = (out.scheme == "https") ? 443 : 80;
     }
@@ -4894,6 +4816,7 @@ static ParsedUrl parse_redirect_url(const std::string &loc,
                            (out.scheme == "http"  && out.port == 80);
     out.host_hdr = is_default_port ? raw_host : (raw_host + ":" + std::to_string(out.port));
     out.raw_host = raw_host;
+    out.sni      = raw_host;
 
     return out;
 }
@@ -4940,6 +4863,17 @@ static std::vector<u8> follow_redirects_fp(
         if (!dst.sni.empty() && dst.sni == cur_ip)
             dst.sni = cur_sni;
 
+        if (dst.host.empty() || dst.port <= 0) {
+            vlog::fail(verbose, "redirect hop " + std::to_string(hop + 1) + ": unusable target, stopping", 2);
+            break;
+        }
+        // SSRF guard: a remote target must not be able to steer the scanner at
+        // loopback / private / link-local addresses via Location.
+        if (dst.host != cur_ip && is_lan_ip(dst.host) && !is_lan_ip(origin_ip)) {
+            vlog::fail(verbose, "redirect hop " + std::to_string(hop + 1) + ": refusing redirect to internal address " +
+                       dst.host, 2);
+            break;
+        }
         vlog::line(verbose, "redirect hop " + std::to_string(hop + 1) + ": " + loc + " -> " +
                    dst.scheme + "://" + dst.host + ":" + std::to_string(dst.port) + dst.path +
                    "  (SNI: " + dst.sni + ")", 2);
@@ -4950,7 +4884,7 @@ static std::vector<u8> follow_redirects_fp(
                        std::to_string(dst.port) + "]", 3);
 
         // -- Build the next request -----------------------------------------
-        std::string req = "GET " + dst.path + " HTTP/1.1\r\n"
+        std::string req = "GET " + sanitize_request_target(dst.path) + " HTTP/1.1\r\n"
                           "Host: " + dst.host_hdr + "\r\n"
                           "User-Agent: Mozilla/5.0\r\n"
                           "Accept: */*\r\n"
@@ -5160,8 +5094,49 @@ static std::vector<u8> capture_fallback(const std::string            &ip,
     return {};
 }
 
+// Follow the first SPA-style client-side redirect (JS location / meta-refresh) found
+// in the fingerprints. Same safety rules as real redirects: scheme must be http(s),
+// no hops onto internal addresses from a public target, one hop only.
+static bool follow_spa_location(const std::string &ip, int port, bool is_ssl,
+                                int timeout_sec, bool verbose,
+                                std::vector<HttpFingerprint> &fps)
+{
+    std::string loc;
+    for (const auto &fp : fps) {
+        if (!fp.is_redirect && !fp.spa_locations.empty()) { loc = fp.spa_locations[0]; break; }
+    }
+    if (loc.empty() || loc.size() > 2048) return false;
+    if (loc[0] != '/' && loc.rfind("http://", 0) != 0 && loc.rfind("https://", 0) != 0 &&
+        loc.rfind("HTTP://", 0) != 0 && loc.rfind("HTTPS://", 0) != 0)
+        return false;   // javascript:, data:, bare words, ...
+
+    ParsedUrl dst = parse_redirect_url(loc, ip, port, is_ssl ? "https" : "http");
+    if (dst.host.empty() || dst.port <= 0) return false;
+    if (dst.host != ip && is_lan_ip(dst.host) && !is_lan_ip(ip)) {
+        vlog::fail(verbose, "spa-follow: refusing internal address " + dst.host, 2);
+        return false;
+    }
+    const bool dst_ssl = (dst.scheme == "https");
+    if (dst.host == ip && dst.port == port && dst_ssl == is_ssl && dst.path == "/") return false; // same page
+
+    vlog::line(verbose, "spa-follow: " + loc + " -> " + dst.scheme + "://" + dst.host + ":" +
+               std::to_string(dst.port) + dst.path, 1);
+    std::string req = "GET " + sanitize_request_target(dst.path) + " HTTP/1.1\r\n"
+                      "Host: " + dst.host_hdr + "\r\n"
+                      "User-Agent: " + std::string(kDefaultUserAgent) + "\r\n"
+                      "Accept: */*\r\n"
+                      "Connection: close\r\n\r\n";
+    std::vector<u8> payload(req.begin(), req.end());
+    std::vector<u8> resp;
+    TlsCertInfo cert;
+    if (dst_ssl) resp = capture_ssl(dst.host, dst.port, timeout_sec, &payload, verbose, &cert, 0, dst.sni);
+    else         resp = capture_tcp(dst.host, dst.port, timeout_sec, &payload, verbose);
+    if (resp.empty()) return false;
+    fps.push_back(make_http_fingerprint(resp, std::string(dst_ssl ? "ssl-" : "") + "spa-follow", dst_ssl, cert));
+    return true;
+}
+
 struct Args {
-    std::string probes_file = "/usr/share/nmap/nmap-service-probes";
     // Raw target string (argv[1]) — kept for display only
     std::string target_raw;
     // Resolved fields (filled by parse_target + main)
@@ -5215,6 +5190,10 @@ static int probe_read_timeout(const AllProbes &probes, int port,
 int run_version_probe(AllProbes &probes, const std::string &target_ip,
                        uint16_t target_port, const VersionDetectOptions &opts)
 {
+    if (opts.reactor_threads) {
+        static std::once_flag reactor_cfg_once;
+        std::call_once(reactor_cfg_once, [&] { async_io::configure_shared_reactor(opts.reactor_threads); });
+    }
     Args args;
     args.hostname       = target_ip;
     args.port           = target_port;
@@ -5236,10 +5215,19 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
     args.tls_key        = opts.tls_key;
     args.tls_sni        = opts.tls_sni;
     args.host_override  = opts.host_override;
+    args.path           = opts.request_path.empty() ? "/" : opts.request_path;
+    if (args.path.front() != '/') args.path.insert(args.path.begin(), '/');
+    // Reject CR/LF/whitespace: the path is written into a raw HTTP request line.
+    for (char &c : args.path) if (c == '\r' || c == '\n' || c == ' ' || (unsigned char)c < 0x20) c = '_';
+    args.target_raw     = target_ip + ":" + std::to_string(target_port);
+    args.scheme         = opts.force_https ? "https" : opts.force_http ? "http" : "";
     std::string effective_host;
     {
-        std::lock_guard<std::mutex> lk(g_probe_setup_mu);
-
+        g_tuning.max_response_bytes  = opts.max_response_bytes;
+        g_tuning.ciphers_tls12       = opts.tls_ciphers_tls12;
+        g_tuning.ciphersuites_tls13  = opts.tls_ciphersuites_tls13;
+        g_tuning.min_connect_ms      = opts.min_connect_ms;
+        g_tls_config = TlsConfig{};
         g_verbose = args.verbose;
 
         g_tls_config.ca_file     = args.tls_ca_file;
@@ -5295,9 +5283,11 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
     vlog::kv(g_verbose, "Timeouts", "connect=" + std::to_string(args.connect_timeout) + "s  read=" +
               std::to_string(args.timeout) + "s  idle=" + std::to_string(std::max(2, args.timeout / 2)) + "s");
 
-    ProbeFileInfo pfi = parse_probe_file_info(args.probes_file);
+    const ProbeFileInfo pfi = build_probe_file_info(probes);
 
     std::vector<u8>              response;
+    std::string                  response_probe;      // probe whose payload produced `response` (match hint)
+    long                         null_close_ms = -1;  // NULL probe: peer closed with no data after this many ms
     std::string                  method_label;
     int                          proto_int = IPPROTO_TCP;
     std::vector<HttpFingerprint> http_fps;
@@ -5436,7 +5426,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                 }
             }
         } else {
-            if (args.verbose) {
+            {   // Always run: the result changes behaviour (is_ssl), so it must not depend on --verbose
                 int precheck_to = std::min(2, args.connect_timeout > 0 ? args.connect_timeout : 2);
                 vlog::line(g_verbose, "port " + std::to_string(args.port) + " not declared as sslports -- "
                            "running diagnostic TLS pre-check (timeout=" + std::to_string(precheck_to) +
@@ -5454,7 +5444,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
         std::set<std::string>     seen;
 
         auto add_attempt = [&](const std::string &name, const u8 *ps, int pslen) {
-            if (seen.count(name)) return; seen.insert(name);
+            if (!seen.insert(name).second) return;
             ProbeAttempt pa; pa.name = name;
             if (ps && pslen > 0) pa.payload.assign(ps, ps + pslen);
             attempts.push_back(std::move(pa));
@@ -5611,6 +5601,8 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                 r = capture_tcp(ip, args.port, probe_first_byte_to, pl, args.verbose,
                                 args.connect_timeout);
             }
+            if (!is_ssl && pa.payload.empty() && r.empty() && g_last_tcp.eof_no_data)
+                null_close_ms = g_last_tcp.elapsed_ms;
 
             bool switched_to_ssl_midstream = false;
             if (!r.empty()) {
@@ -5690,7 +5682,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                    "falling back to GET / HTTP/1.1", 2);
 
                         const std::string &probe_host = g_hostname.empty() ? ip : g_hostname;
-                        std::string get_req = "GET / HTTP/1.1\r\n"
+                        std::string get_req = "GET " + sanitize_request_target(g_target_path) + " HTTP/1.1\r\n"
                                              "Host: " + probe_host + "\r\n"
                                              "User-Agent: " + std::string(kDefaultUserAgent) + "\r\n"
                                              "Accept: */*\r\n"
@@ -5780,7 +5772,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                                        pa.name + "' got " + std::to_string(code) + " over SSL; probe may "
                                        "have sent Host-less request -> retrying with proper Host: header GET "
                                        "over SSL", 2);
-                            std::string get_req_ssl = make_get_request("/", ip, args.port, is_ssl);
+                            std::string get_req_ssl = make_get_request(g_target_path, ip, args.port, is_ssl);
                             std::vector<u8> get_payload_ssl(get_req_ssl.begin(), get_req_ssl.end());
 
                             TlsCertInfo ssl_retry_cert;
@@ -5839,6 +5831,7 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
                 vlog::ok(g_verbose, "probe #" + std::to_string(attempt_idx) + " '" + pa.name + "' got " +
                          std::to_string(r.size()) + " bytes -- using this response", 1);
                 response     = std::move(r);
+                response_probe = pa.name;
                 method_label = is_ssl ? "ssl/" + pa.name : pa.name;
                 goto capture_done;
             }
@@ -5854,6 +5847,19 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
 
     capture_done:
     if (response.empty()) {
+        if (!args.udp && null_close_ms >= 0) {
+            MatchContext mctx;
+            mctx.closed_without_data = true;
+            mctx.elapsed_ms = null_close_ms;
+            ProbeEngine wrap_engine(&probes, args.intensity);
+            ScanResult wr = wrap_engine.matchResponse((u16)args.port, IPPROTO_TCP, ServiceTunnel::NONE,
+                                                      nullptr, 0, mctx);
+            if (wr.state == ProbeState::FINISHED_TCPWRAPPED) {
+                std::lock_guard<std::mutex> lk(g_stdout_mu);
+                std::cout << std::left << std::setw(7) << target_port << ": tcpwrapped\n";
+                return 0;
+            }
+        }
         fprintf(stdout, "%-7d: No response\n", args.port);
         return 1;
     }
@@ -5918,9 +5924,11 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
         vlog::line(g_verbose, "overriding Exclude for port " + std::to_string(args.port), 1);
     }
 
+    MatchContext match_ctx;
+    if (!response_probe.empty()) match_ctx.probe_name = response_probe.c_str();
     ScanResult result = engine.matchResponse(
         (u16)args.port, proto_int, tunnel,
-        response.data(), (int)response.size());
+        response.data(), (int)response.size(), match_ctx);
 
     if (http_fps.empty() && !response.empty()) {
         HttpFingerprint fp = make_http_fingerprint(response, "final-response", final_ssl);
@@ -5943,6 +5951,9 @@ int run_version_probe(AllProbes &probes, const std::string &target_ip,
             }
         }
     }
+
+    if (!args.udp && !response.empty() && !terminate_flag)
+        follow_spa_location(ip, args.port, final_ssl, read_to, args.verbose, http_fps);
 
     bool confirmed_websocket = false;
     for (const auto &fp : http_fps) {
