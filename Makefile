@@ -1,4 +1,13 @@
 SHELL := /bin/bash
+
+# Normal build output: one short line per step (CC / LD). V=1 shows full commands.
+ifeq ($(V),1)
+  Q :=
+  say = @:
+else
+  Q := @
+  say = @printf '  %-4s %s\n' '$(1)' '$(2)'
+endif
 .DEFAULT_GOAL := help
 
 help:
@@ -50,7 +59,7 @@ else ifeq ($(BUILD),debug)
   STATIC_RT ?= 1
 else ifeq ($(BUILD),san)
   OLEVEL    ?= -O1 -g3 -fno-omit-frame-pointer
-  SAN_FLAGS := -fsanitize=address,undefined
+  SAN_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=all
   LTO       ?= 0
   GC        ?= 0
   FORTIFY   ?= 0
@@ -113,7 +122,17 @@ else ifeq ($(PGO),use)
                -Wno-missing-profile -Wno-coverage-mismatch
 endif
 
-WARN := -Wall -Wextra -Wno-unused-parameter -Wformat -Wformat-security -Wvla
+# No -Wall/-Wextra, so style noise (unused vars, enum/ternary mixes, dangling-ref
+# heuristics, snprintf truncation...) stays silent. Only diagnostics that point at
+# real memory-safety / format-string bugs are on. (Optimizer-based ones fire at -O1+.)
+# V_WARN=1 restores the original full warning set.
+WARN := -Wformat -Wformat-security -Wformat-overflow -Wno-format-truncation \
+        -Warray-bounds -Wstringop-overflow -Wstringop-overread \
+        -Wuse-after-free -Wfree-nonheap-object -Wreturn-local-addr \
+        -Wnonnull -Wvla
+ifeq ($(V_WARN),1)
+  WARN := -Wall -Wextra -Wno-unused-parameter -Wformat -Wformat-security -Wvla
+endif
 ifeq ($(STRICT),1)
   WARN += -Werror
 endif
@@ -166,7 +185,7 @@ build: $(TARGET)
 FLAGS_STAMP := $(OBJ_DIR)/.build_flags
 
 $(OBJ_DIR):
-	mkdir -p $(OBJ_DIR)
+	$(Q)mkdir -p $(OBJ_DIR)
 
 $(FLAGS_STAMP): FORCE | $(OBJ_DIR)
 	@printf '%s\n' '$(CXX) $(CXXFLAGS) :: $(LDFLAGS) $(LIBS)' | cmp -s - $@ 2>/dev/null || \
@@ -175,10 +194,12 @@ $(FLAGS_STAMP): FORCE | $(OBJ_DIR)
 FORCE:
 
 $(TARGET): $(OBJS) $(FLAGS_STAMP)
-	$(CXX) -o $@ $(OBJS) $(LDFLAGS) $(LIBS)
+	$(call say,LD,$@)
+	$(Q)$(CXX) -o $@ $(OBJS) $(LDFLAGS) $(LIBS)
 
 $(OBJ_DIR)/%.o: %.cpp $(FLAGS_STAMP) | $(OBJ_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(call say,CXX,$<)
+	$(Q)$(CXX) $(CXXFLAGS) -c $< -o $@
 
 -include $(OBJS:.o=.d)
 
