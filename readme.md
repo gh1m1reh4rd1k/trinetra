@@ -1,39 +1,39 @@
+<div align="center">
+
 # Trinetra
 
-> A low-level, high-performance TCP scanner and service fingerprinter
-> built on Linux `io_uring`.
+**A low-level, high-performance TCP scanner and service fingerprinter built on Linux `io_uring`.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)]()
-[![Kernel](https://img.shields.io/badge/kernel-6.12%2B-critical.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey.svg)]()
+[![Kernel](https://img.shields.io/badge/Kernel-6.12%2B-critical.svg)]()
 [![C++](https://img.shields.io/badge/C%2B%2B-20-blue.svg)]()
+
+</div>
 
 ---
 
-## What is Trinetra?
+## Overview
 
 Trinetra is a from-scratch, raw-packet TCP scanner that leverages Linux
 `io_uring` for batched asynchronous I/O. It is designed as a
 **learning-first** tool: the implementation comes first, and the theory
 follows by observing real packet behavior. Trinetra provides deep,
-low-level control over every header and option it sends making it a
+low-level control over every header and option it sends, making it a
 practical lab for understanding networking internals, protocol
 behavior, and kernel I/O subsystems.
 
 ---
 
-## ⚠️ Disclaimer
-
-Trinetra performs **raw packet manipulation** and may crash or
-destabilize target TCP/IP stacks. It is intended **strictly** for:
-
-- Educational purposes
-- Home labs
-- Authorized penetration testing / red-team engagements
-
-**Do not use Trinetra against systems you do not own or have explicit
-written permission to test.** You are responsible for complying with
-all applicable laws.
+> [!WARNING]
+> **Trinetra performs raw packet manipulation and may crash or destabilize
+> target TCP/IP stacks.** It is intended **strictly** for educational
+> purposes, home labs, and authorized penetration testing / red-team
+> engagements.
+>
+> **Do not use Trinetra against systems you do not own or have explicit
+> written permission to test.** You are responsible for complying with all
+> applicable laws.
 
 ---
 
@@ -127,17 +127,21 @@ all applicable laws.
 | Capabilities (if not root) | `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_SYS_ADMIN` | For raw sockets and `unshare(CLONE_NEWNET)` |
 
 **Runtime libraries installed by the setup script:**
-- [`liburing`](https://github.com/axboe/liburing): built from source
-- [`concurrentqueue`](https://github.com/cameron314/concurrentqueue): headers
-- `libcurl4-openssl-dev`, `libssl-dev` / `openssl`
-- `nlohmann-json3-dev`
-- `libpugixml-dev`
-- `libpcre2-dev`
-- `zlib1g-dev`
-- `stunnel4` (Debian/Ubuntu) or `stunnel` (Arch)
 
-> ⚠️ **Kernel 6.12 or newer is mandatory.** The installer will refuse
-> to continue on older kernels.
+| Library | Source |
+|---|---|
+| [`liburing`](https://github.com/axboe/liburing) | Built from source |
+| [`concurrentqueue`](https://github.com/cameron314/concurrentqueue) | Headers |
+| `libcurl4-openssl-dev`, `libssl-dev` / `openssl` | Package manager |
+| `nlohmann-json3-dev` | Package manager |
+| `libpugixml-dev` | Package manager |
+| `libpcre2-dev` | Package manager |
+| `zlib1g-dev` | Package manager |
+| `stunnel4` (Debian/Ubuntu) or `stunnel` (Arch) | Package manager |
+
+> [!IMPORTANT]
+> **Kernel 6.12 or newer is mandatory.** The installer will refuse to
+> continue on older kernels.
 
 ---
 
@@ -149,9 +153,11 @@ The included `setup.sh` handles OS detection, kernel check, dependency
 installation, `liburing` build, header installation, data-file
 placement, and the final build + install.
 
-    git clone https://github.com/gh1m1reh4rd1k/trinetra.git
-    cd trinetra
-    sudo ./setup.sh
+```bash
+git clone https://github.com/gh1m1reh4rd1k/trinetra.git
+cd trinetra
+sudo ./setup.sh
+```
 
 The script will:
 
@@ -169,8 +175,10 @@ The script will:
 
 If you already have all dependencies installed:
 
-    make -j"$(nproc)"
-    sudo make install
+```bash
+make -j"$(nproc)"
+sudo make install
+```
 
 ---
 
@@ -182,84 +190,101 @@ If you already have all dependencies installed:
 
 ### Basic TCP scans
 
-    # Default SYN scan over a /24
-    sudo shiv 192.168.1.0/24 -p 1-1024
+```bash
+# Default SYN scan over a /24
+sudo shiv 192.168.1.0/24 -p 1-1024
 
-    # Xmas scan on selected ports
-    sudo shiv 10.0.0.5 -p 80,443,8080 -sX
+# Xmas scan on selected ports
+sudo shiv 10.0.0.5 -p 80,443,8080 -sX
 
-    # Full 4-way handshake scan inside an isolated namespace
-    sudo shiv 10.0.0.5 -p 80,443 -G 
+# Full 4-way handshake scan inside an isolated namespace
+sudo shiv 10.0.0.5 -p 80,443 -G
 
-    # Scan inside an isolated namespace
-    sudo shiv --split 192.168.1.254 -p 443,22
+# Scan inside an isolated namespace
+sudo shiv --split 192.168.1.254 -p 443,22
+```
 
 ### Service / version detection
 
-    # HTTP/TLS-aware version detection
-    sudo shiv example.com -p 1-10000 -sV
+```bash
+# HTTP/TLS-aware version detection
+sudo shiv example.com -p 1-10000 -sV
 
-    # Force HTTPS probe with strict TLS verification
-    sudo shiv example.com -p 443 -sV --force-https --tls-verify
+# Force HTTPS probe with strict TLS verification
+sudo shiv example.com -p 443 -sV --force-https --tls-verify
 
-    # UDP service probing
-    sudo shiv 10.0.0.1 -p 53,123,161 -sV --udp
+# UDP service probing
+sudo shiv 10.0.0.1 -p 53,123,161 -sV --udp
+```
 
 ### Host discovery
 
-    # ICMP host discovery
-    sudo shiv -sn 192.168.1.0/24
+```bash
+# ICMP host discovery
+sudo shiv -sn 192.168.1.0/24
 
-    # Discover, then only scan hosts that responded
-    sudo shiv -sn -sS -Pn 192.168.1.0/24
+# Discover, then only scan hosts that responded
+sudo shiv -sn -sS -Pn 192.168.1.0/24
+```
 
 ### Enumeration
 
-    # Shodan InternetDB + DNS enumeration on a domain
-    sudo shiv example.com --enum shodan,dns
+```bash
+# Shodan InternetDB + DNS enumeration on a domain
+sudo shiv example.com --enum shodan,dns
 
-    # SecurityTrails subdomain lookup
-    sudo shiv example.com --enum trail:<api-key>
+# SecurityTrails subdomain lookup
+sudo shiv example.com --enum trail:<api-key>
+```
 
 ### Discovery (ASN / country / reverse IP)
 
-    # List ASNs and orgs for a country
-    sudo shiv --cn nepal
+```bash
+# List ASNs and orgs for a country
+sudo shiv --cn nepal
 
-    # Fetch all public IPv4 ranges for a country
-    sudo shiv --country nepal --ipv4 -o np.txt
+# Fetch all public IPv4 ranges for a country
+sudo shiv --country nepal --ipv4 -o np.txt
 
-    # Reverse-lookup domains on an IP
-    sudo shiv --ip 103.48.88.33
+# Reverse-lookup domains on an IP
+sudo shiv --ip 103.48.88.33
 
-    # Routes announced by an ASN
-    sudo shiv --asn AS45353 --ipv6
+# Routes announced by an ASN
+sudo shiv --asn AS45353 --ipv6
+```
 
 ### Passive discovery
 
-    # Watch the wire until Ctrl-C
-    sudo shiv --netradar
+```bash
+# Watch the wire until Ctrl-C
+sudo shiv --netradar
 
-    # Capture for 30 seconds on a specific interface
-    sudo shiv --netradar --time 30s --interface eth0
+# Capture for 30 seconds on a specific interface
+sudo shiv --netradar --time 30s --interface eth0
+```
 
 ### Traceroute
 
-    sudo shiv 8.8.8.8 --traceroute
+```bash
+sudo shiv 8.8.8.8 --traceroute
 
-    sudo shiv scanme.nmap.org --traceroute
+sudo shiv scanme.nmap.org --traceroute
+```
 
 ### Server mode
 
-    # Start LAN control panel (prints a ready-to-use HTTPS link)
-    sudo shiv --server
+```bash
+# Start LAN control panel (prints a ready-to-use HTTPS link)
+sudo shiv --server
 
-    # Custom port and fixed token
-    sudo shiv --server --server-port 9443 --server-token <token>
+# Custom port and fixed token
+sudo shiv --server --server-port 9443 --server-token <token>
+```
 
 > For the full flag reference: pacing, IP/TCP header crafting, IPv6
 > extension-header control, buffer management, debug modes, and more,
-> see [`https://github.com/gh1m1reh4rd1k/trinetra/wiki/standard_documentation`](https://github.com/gh1m1reh4rd1k/trinetra/wiki/standard_documentation) (or run `shiv --help`)
+> see the [standard documentation](https://github.com/gh1m1reh4rd1k/trinetra/wiki/standard_documentation)
+> or run `shiv --help`.
 
 ---
 
@@ -317,28 +342,13 @@ two are unified, use whichever name your build actually produces:
 
 ## Troubleshooting
 
-**"Shiv's minimum requirement kernel version is 6.12"**
-Your kernel is too old. Upgrade to 6.12+ and reboot. On Debian/Ubuntu,
-consider the HWE or mainline kernels; on Arch, `linux` or `linux-lts`
-(current LTS is fine).
-
-**"Missing source files: ..."**
-`setup.sh` expects the data files (`mac-vendors.txt`, `ports.txt`,
-`signatures.conf`, `shiv_split.conf`, and the `ranges/*.txt` files) to
-be present in the repo root. Make sure you cloned the full repository
-and are running the script from the project root.
-
-**"This script requires sudo privileges"**
-Run with `sudo ./setup.sh`. For manual runs, either be root or grant
-the binary `CAP_NET_RAW` / `CAP_NET_ADMIN` / `CAP_SYS_ADMIN`.
-
-**"UDP scan doesn't seem to work standalone"**
-UDP probing is only available through service detection: `-sV --udp`.
-There is no standalone `-sU` mode yet.
-
-**"`--handshake` / `--isolate` / `--version` are unknown flags"**
-Those aren't real flags. Use `-G` for state-machine handshake,
-`--split` for namespace isolation, and `-sV` for version detection.
+| Symptom | Cause & Fix |
+|---|---|
+| **"Shiv's minimum requirement kernel version is 6.12"** | Your kernel is too old. Upgrade to 6.12+ and reboot. On Debian/Ubuntu, consider HWE or mainline kernels; on Arch, `linux` or `linux-lts` (current LTS is fine). |
+| **"Missing source files: ..."** | `setup.sh` expects `mac-vendors.txt`, `ports.txt`, `signatures.conf`, `shiv_split.conf`, and the `ranges/*.txt` files in the repo root. Clone the full repository and run the script from the project root. |
+| **"This script requires sudo privileges"** | Run with `sudo ./setup.sh`. For manual runs, either be root or grant the binary `CAP_NET_RAW` / `CAP_NET_ADMIN` / `CAP_SYS_ADMIN`. |
+| **"UDP scan doesn't seem to work standalone"** | UDP probing is only available through service detection: `-sV --udp`. There is no standalone `-sU` mode yet. |
+| **`--handshake` / `--isolate` / `--version` are unknown flags** | Those aren't real flags. Use `-G` for state-machine handshake, `--split` for namespace isolation, and `-sV` for version detection. |
 
 ---
 
