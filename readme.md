@@ -200,10 +200,12 @@ behavior, and kernel I/O subsystems.
 <br>
 
 - **`--server`**
-  - Start Trinetra as a LAN control panel
+  - Start Trinetra as a web console
   - Accessible over HTTPS
+  - Multi device access
   - TLS handled automatically via `stunnel`
   - Configurable port: `--server-port`, default 8443
+  - Generate number of server consoles: `--count 5`
   - Configurable auth token: `--server-token`
 
 </details>
